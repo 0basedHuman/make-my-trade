@@ -1,0 +1,75 @@
+{
+  "scan_time_pt": "06:42",
+  "market_regime": {
+    "label": "bullish",
+    "confidence": 68,
+    "reason": "Broad index tone is constructive and leading growth names are holding key levels."
+  },
+  "daily_summary": {
+    "action_bias": "long_calls",
+    "notes": "Prefer selective bullish setups with strong confirmation and liquid chains."
+  },
+  "candidates": [
+    {
+      "ticker": "NVDA",
+      "direction": "call",
+      "status": "entry_ready",
+      "score": 78,
+      "regime_fit": 82,
+      "thesis": {
+        "trend_structure": "Daily and hourly EMA alignment are bullish and price is holding above daily 20 EMA.",
+        "catalyst_sentiment": "AI sector sentiment is positive with supportive demand narrative.",
+        "volume_participation": "Relative volume is above baseline and price is not drifting on weak participation.",
+        "technical_confirmation": "Price is near prior day high and premarket high with VWAP support nearby.",
+        "fundamental_context": "Large-cap AI leadership remains supportive over the short horizon."
+      },
+      "levels": {
+        "premarket_high": 121.5,
+        "premarket_low": 119.9,
+        "prior_day_high": 121.55,
+        "prior_day_low": 118.7,
+        "vwap": 121.1,
+        "key_support": [121.1, 119.9],
+        "key_resistance": [121.5, 121.55]
+      },
+      "targets": {
+        "conservative_underlying_target": 122.2,
+        "base_underlying_target": 123.0,
+        "stretch_underlying_target": 124.2
+      },
+      "contract_selection": {
+        "selected": true,
+        "type": "call",
+        "expiration_dte": 10,
+        "target_delta_range": "0.35-0.55",
+        "strike_logic": "Use a near-the-money to modestly out-of-the-money strike with delta near 0.41.",
+        "liquidity_check": "pass",
+        "reason": "Spread, open interest, and option volume are acceptable for paper execution."
+      },
+      "entry_trigger": {
+        "type": "breakout_stop_limit",
+        "underlying_trigger_price": 121.56,
+        "explanation": "Trigger above premarket and prior day high to confirm buyers are reclaiming control.",
+        "invalidation": "Do not enter if price rejects immediately back below VWAP and loses 121.10."
+      },
+      "risk_plan": {
+        "initial_stop_loss_pct": 10,
+        "first_profit_zone_pct": "7-12",
+        "breakeven_shift_trigger_pct": 8,
+        "trail_activation_pct": "10-12",
+        "trailing_method": "premium_pct",
+        "trailing_value": "4-6% premium"
+      },
+      "hold_overnight_rule": {
+        "allowed": true,
+        "reason": "Holding is acceptable if price closes strong above breakout and no contradictory news appears."
+      },
+      "daily_review_rule": {
+        "next_action_if_open": "hold",
+        "reason": "Hold while structure remains intact and DTE remains within acceptable range."
+      },
+      "final_decision": "place_trigger_only"
+    }
+  ],
+  "open_positions_review": []
+}

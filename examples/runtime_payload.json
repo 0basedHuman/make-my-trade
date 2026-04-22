@@ -1,0 +1,41 @@
+{
+  "scan_time_pt": "06:42",
+  "market_context": {
+    "spx_trend": "bullish",
+    "qqq_trend": "mixed",
+    "macro_news_bias": "neutral",
+    "breadth_tone": "moderately_positive"
+  },
+  "open_positions": [],
+  "candidates": [
+    {
+      "ticker": "NVDA",
+      "price": 121.42,
+      "daily_20_ema": 118.10,
+      "daily_50_ema": 114.88,
+      "hourly_8_ema": 120.95,
+      "hourly_21_ema": 119.80,
+      "vwap": 121.10,
+      "premarket_high": 121.50,
+      "premarket_low": 119.90,
+      "prior_day_high": 121.55,
+      "prior_day_low": 118.70,
+      "relative_volume": 1.42,
+      "sentiment": "positive",
+      "catalyst": "sector strength and positive AI demand tone",
+      "options": [
+        {
+          "type": "call",
+          "strike": 123,
+          "dte": 10,
+          "delta": 0.41,
+          "bid": 2.10,
+          "ask": 2.18,
+          "spread_pct": 3.7,
+          "open_interest": 8421,
+          "option_volume": 3140
+        }
+      ]
+    }
+  ]
+}

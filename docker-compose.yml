@@ -1,0 +1,116 @@
+# docker-compose.yml
+#
+# Purpose:  Starts all infrastructure MakeMyTrade depends on before Go code runs.
+# Services: Postgres+TimescaleDB (primary DB), Redis (cache/pubsub),
+#           Temporal (workflow orchestrator), Temporal UI (observability).
+#
+# Image choices:
+#   Redis:    cgr.dev/chainguard/redis  — hardened distroless, minimal CVE surface
+#   Postgres: timescale/timescaledb     — required for TimescaleDB hypertables
+#   Temporal: temporalio/auto-setup    — no Chainguard alternative exists
+#
+# All images have native ARM64 builds — no Rosetta emulation on M1 Mac.
+#
+# Commands:
+#   Start:        docker compose up -d
+#   Stop:         docker compose down
+#   Logs:         docker compose logs -f <service>
+#   Destroy data: docker compose down -v   ← WARNING: deletes all DB data
+
+services:
+
+  # ── Postgres + TimescaleDB ────────────────────────────────────────────────
+  # Primary database for all MakeMyTrade data.
+  # TimescaleDB adds time-series partitioning used by price_bars and
+  # news_items hypertables. The migration enables it with:
+  #   CREATE EXTENSION IF NOT EXISTS timescaledb;
+  # Credentials here must match DB_URL in .env exactly.
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: makemytrade-postgres
+    environment:
+      POSTGRES_DB: makemytrade
+      POSTGRES_USER: makemytrade
+      POSTGRES_PASSWORD: makemytrade_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready exits 0 when Postgres is accepting connections.
+      # Temporal's depends_on waits for this before starting.
+      test: ["CMD-SHELL", "pg_isready -U makemytrade -d makemytrade"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Redis (Chainguard hardened image) ─────────────────────────────────────
+  # Chainguard images are distroless — no shell, no package manager,
+  # minimal attack surface, aggressively patched for CVEs.
+  # Used for:
+  #   1. Hot signal cache — SignalBundle per symbol, 4-hour TTL
+  #   2. Pub/sub — Temporal pushes updates, browser UI subscribes
+  # Redis is NOT a system of record. All signals also persist in Postgres.
+  redis:
+    image: cgr.dev/chainguard/redis:latest
+    container_name: makemytrade-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Temporal server ───────────────────────────────────────────────────────
+  # Orchestrates all background workflows: DailyResearchCycle,
+  # NightlyBacktest, PaperTradeShadow, WeeklyStrategyReview, RepairWorkflow.
+  # Stores its own workflow state in a separate internal schema inside
+  # the same Postgres instance (auto-setup creates it automatically).
+  # Go worker (cmd/worker/main.go) connects to Temporal at port 7233.
+  #
+  # depends_on with service_healthy prevents Temporal from starting before
+  # Postgres is ready — without this, Temporal crashes and restart-loops.
+  temporal:
+    image: temporalio/auto-setup:latest
+    container_name: makemytrade-temporal
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=makemytrade
+      - POSTGRES_PWD=makemytrade_secret
+      - POSTGRES_SEEDS=postgres
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Temporal Web UI ───────────────────────────────────────────────────────
+  # Browser dashboard at http://localhost:8088
+  # Shows every workflow run, every activity, every state transition,
+  # and every error with full stack trace.
+  temporal-ui:
+    image: temporalio/ui:latest
+    container_name: makemytrade-temporal-ui
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8088:8080"
+    depends_on:
+      - temporal
+    restart: unless-stopped
+
+# ── Named volumes ─────────────────────────────────────────────────────────
+# Docker manages storage location on your Mac.
+# Data survives container restarts and docker compose down.
+# Only destroyed with: docker compose down -v
+volumes:
+  postgres_data:
+  redis_data:

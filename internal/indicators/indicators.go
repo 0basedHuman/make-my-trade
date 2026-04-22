@@ -1,0 +1,666 @@
+// internal/indicators/indicators.go
+//
+// WHAT: Pure math functions that turn a slice of daily price/volume data into
+//       the technical indicator values the strategy engine uses.
+//
+// WHY:  All technical analysis must be deterministic and code-owned.
+//       No black-box library — each function is explicit and auditable.
+//
+// HOW:  Functions operate on []float64 slices (oldest first, newest last).
+//       They return the last computed value for the strategy engine to compare
+//       against thresholds. All require at least (period) input bars.
+//
+// WHAT BREAKS: If the caller passes fewer bars than the period, the function
+//              returns 0 and ok=false. The strategy engine treats ok=false as
+//              insufficient data and skips the symbol.
+//
+// VERIFY: go test ./internal/indicators/ — unit tests in indicators_test.go
+
+package indicators
+
+import "math"
+
+// Bar is a single OHLCV day bar. All fields are float64 for math convenience.
+type Bar struct {
+	Open   float64
+	High   float64
+	Low    float64
+	Close  float64
+	Volume float64
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EMA — Exponential Moving Average
+// ──────────────────────────────────────────────────────────────────────────────
+
+// EMASlice computes EMA over the full slice and returns the full result slice.
+// The first (period-1) values are seeded from SMA and then smoothed forward.
+// Oldest bar = index 0, newest = index len-1.
+func EMASlice(values []float64, period int) []float64 {
+	if len(values) < period {
+		return nil
+	}
+	result := make([]float64, len(values))
+	k := 2.0 / float64(period+1)
+
+	// Seed with simple average of first `period` values
+	var sum float64
+	for i := 0; i < period; i++ {
+		sum += values[i]
+	}
+	result[period-1] = sum / float64(period)
+
+	// Smooth forward
+	for i := period; i < len(values); i++ {
+		result[i] = values[i]*k + result[i-1]*(1-k)
+	}
+	return result
+}
+
+// EMALast returns only the most recent EMA value.
+func EMALast(values []float64, period int) (float64, bool) {
+	s := EMASlice(values, period)
+	if s == nil {
+		return 0, false
+	}
+	return s[len(s)-1], true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MACD — Moving Average Convergence Divergence
+// ──────────────────────────────────────────────────────────────────────────────
+
+// MACDResult holds the three MACD components.
+type MACDResult struct {
+	MACD      float64 // fast EMA - slow EMA
+	Signal    float64 // 9-day EMA of MACD line
+	Histogram float64 // MACD - Signal (positive = bullish momentum)
+}
+
+// MACDLast computes MACD(12,26,9) and returns the latest values.
+// Needs at least 35 bars (26 for slow EMA + 9 for signal).
+func MACDLast(closes []float64) (MACDResult, bool) {
+	if len(closes) < 35 {
+		return MACDResult{}, false
+	}
+	fast := EMASlice(closes, 12)
+	slow := EMASlice(closes, 26)
+	if fast == nil || slow == nil {
+		return MACDResult{}, false
+	}
+
+	// MACD line = fast EMA - slow EMA (valid from index 25 onward)
+	macdLine := make([]float64, len(closes))
+	for i := 25; i < len(closes); i++ {
+		macdLine[i] = fast[i] - slow[i]
+	}
+
+	// Signal = 9-EMA of MACD line (only the valid portion)
+	valid := macdLine[25:]
+	if len(valid) < 9 {
+		return MACDResult{}, false
+	}
+	signalSlice := EMASlice(valid, 9)
+	if signalSlice == nil {
+		return MACDResult{}, false
+	}
+
+	macdVal := macdLine[len(macdLine)-1]
+	signalVal := signalSlice[len(signalSlice)-1]
+	return MACDResult{
+		MACD:      macdVal,
+		Signal:    signalVal,
+		Histogram: macdVal - signalVal,
+	}, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RSI — Relative Strength Index
+// ──────────────────────────────────────────────────────────────────────────────
+
+// RSILast computes RSI(14) and returns the latest value.
+// Needs at least 15 bars.
+func RSILast(closes []float64, period int) (float64, bool) {
+	if period <= 0 {
+		period = 14
+	}
+	if len(closes) < period+1 {
+		return 0, false
+	}
+
+	var gainSum, lossSum float64
+	for i := 1; i <= period; i++ {
+		diff := closes[i] - closes[i-1]
+		if diff > 0 {
+			gainSum += diff
+		} else {
+			lossSum += -diff
+		}
+	}
+	avgGain := gainSum / float64(period)
+	avgLoss := lossSum / float64(period)
+
+	for i := period + 1; i < len(closes); i++ {
+		diff := closes[i] - closes[i-1]
+		if diff > 0 {
+			avgGain = (avgGain*float64(period-1) + diff) / float64(period)
+			avgLoss = (avgLoss * float64(period-1)) / float64(period)
+		} else {
+			avgGain = (avgGain * float64(period-1)) / float64(period)
+			avgLoss = (avgLoss*float64(period-1) + (-diff)) / float64(period)
+		}
+	}
+
+	if avgLoss == 0 {
+		return 100, true
+	}
+	rs := avgGain / avgLoss
+	return 100 - (100 / (1 + rs)), true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Volume Ratio
+// ──────────────────────────────────────────────────────────────────────────────
+
+// VolumeRatioLast returns (last bar volume) / (avg of prior period bars).
+// period=20 is the standard lookback for "20-day average volume".
+func VolumeRatioLast(volumes []float64, period int) (float64, bool) {
+	if len(volumes) < period+1 {
+		return 0, false
+	}
+	n := len(volumes)
+	var avg float64
+	for i := n - 1 - period; i < n-1; i++ {
+		avg += volumes[i]
+	}
+	avg /= float64(period)
+	if avg == 0 {
+		return 0, false
+	}
+	return volumes[n-1] / avg, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Rate of Change (ROC)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ROCLast computes the N-day rate of change: (close[-1] - close[-N-1]) / close[-N-1] * 100
+func ROCLast(closes []float64, period int) (float64, bool) {
+	n := len(closes)
+	if n < period+1 {
+		return 0, false
+	}
+	base := closes[n-1-period]
+	if base == 0 {
+		return 0, false
+	}
+	return (closes[n-1]-base) / base * 100, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ATR — Average True Range
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ATRLast returns the most recent ATR(period) value.
+func ATRLast(bars []Bar, period int) (float64, bool) {
+	if len(bars) < period+1 {
+		return 0, false
+	}
+	trValues := make([]float64, len(bars)-1)
+	for i := 1; i < len(bars); i++ {
+		hl := bars[i].High - bars[i].Low
+		hc := math.Abs(bars[i].High - bars[i-1].Close)
+		lc := math.Abs(bars[i].Low - bars[i-1].Close)
+		trValues[i-1] = math.Max(hl, math.Max(hc, lc))
+	}
+	// Simple average for first ATR, then Wilder smoothing
+	if len(trValues) < period {
+		return 0, false
+	}
+	var atr float64
+	for i := 0; i < period; i++ {
+		atr += trValues[i]
+	}
+	atr /= float64(period)
+	for i := period; i < len(trValues); i++ {
+		atr = (atr*float64(period-1) + trValues[i]) / float64(period)
+	}
+	return atr, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Pattern Detection Helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+// IsBullFlag detects a bull flag: sharp advance followed by shallow consolidation.
+// Returns (detected, confidence 0-1).
+func IsBullFlag(bars []Bar) (bool, float64) {
+	n := len(bars)
+	if n < 15 {
+		return false, 0
+	}
+
+	// Look for a "pole": 10%+ advance in last 3-5 bars ending ~8 bars ago
+	poleEnd := n - 8
+	poleStart := poleEnd - 5
+	if poleStart < 0 {
+		return false, 0
+	}
+
+	poleGain := (bars[poleEnd].Close - bars[poleStart].Close) / bars[poleStart].Close
+	if poleGain < 0.08 { // at least 8% pole
+		return false, 0
+	}
+
+	// "Flag": last 7 bars should be in a tight range declining on volume
+	flagHigh := bars[poleEnd].High
+	flagLow := bars[poleEnd].Low
+	var flagVolSum float64
+	for i := poleEnd + 1; i < n; i++ {
+		if bars[i].High > flagHigh {
+			flagHigh = bars[i].High
+		}
+		if bars[i].Low < flagLow {
+			flagLow = bars[i].Low
+		}
+		flagVolSum += bars[i].Volume
+	}
+	flagRange := (flagHigh - flagLow) / bars[poleEnd].Close
+	// Flag should not retrace more than 50% of pole, range should be tight
+	pullback := (bars[poleEnd].Close - bars[n-1].Close) / bars[poleEnd].Close
+	if pullback > poleGain*0.5 {
+		return false, 0
+	}
+
+	// Average pole volume
+	var poleVolSum float64
+	for i := poleStart; i <= poleEnd; i++ {
+		poleVolSum += bars[i].Volume
+	}
+	avgPoleVol := poleVolSum / float64(poleEnd-poleStart+1)
+	avgFlagVol := flagVolSum / float64(n-poleEnd-1)
+
+	if flagRange > 0.12 {
+		return false, 0
+	}
+
+	confidence := 0.5
+	if avgFlagVol < avgPoleVol*0.7 {
+		confidence += 0.2 // volume contracting in flag — bullish
+	}
+	if pullback < poleGain*0.3 {
+		confidence += 0.15 // shallow pullback
+	}
+	if poleGain > 0.15 {
+		confidence += 0.1 // strong pole
+	}
+	return true, math.Min(confidence, 0.95)
+}
+
+// IsTightBase detects price consolidation: range < 10% over last 10-15 bars.
+func IsTightBase(bars []Bar, lookback int) (bool, float64) {
+	if lookback <= 0 {
+		lookback = 12
+	}
+	n := len(bars)
+	if n < lookback {
+		return false, 0
+	}
+	slice := bars[n-lookback:]
+	hi := slice[0].High
+	lo := slice[0].Low
+	for _, b := range slice {
+		if b.High > hi {
+			hi = b.High
+		}
+		if b.Low < lo {
+			lo = b.Low
+		}
+	}
+	mid := (hi + lo) / 2
+	if mid == 0 {
+		return false, 0
+	}
+	rangeRatio := (hi - lo) / mid
+	if rangeRatio > 0.10 {
+		return false, 0
+	}
+
+	confidence := 0.5 + (0.10-rangeRatio)/0.10*0.35
+	return true, math.Min(confidence, 0.90)
+}
+
+// IsVCB detects Volume Contraction Breakout: ATR shrinking + price near resistance.
+func IsVCB(bars []Bar) (bool, float64) {
+	n := len(bars)
+	if n < 25 {
+		return false, 0
+	}
+
+	// Price near 20-bar high
+	hi20 := bars[n-20].High
+	for i := n - 20; i < n; i++ {
+		if bars[i].High > hi20 {
+			hi20 = bars[i].High
+		}
+	}
+	near := bars[n-1].Close >= hi20*0.98 // within 2% of high
+
+	// Volume contracting in last 5 vs prior 15
+	var vol5, vol15 float64
+	for i := n - 5; i < n; i++ {
+		vol5 += bars[i].Volume
+	}
+	for i := n - 20; i < n-5; i++ {
+		vol15 += bars[i].Volume
+	}
+	vol5Avg := vol5 / 5
+	vol15Avg := vol15 / 15
+	contracted := vol5Avg < vol15Avg*0.80
+
+	if !near || !contracted {
+		return false, 0
+	}
+	return true, 0.72
+}
+
+// RelativeStrength returns (stock 20d return - spy 20d return).
+// Positive means the stock is outperforming SPY.
+func RelativeStrength(stockCloses, spyCloses []float64) (float64, bool) {
+	stockROC, ok1 := ROCLast(stockCloses, 20)
+	spyROC, ok2 := ROCLast(spyCloses, 20)
+	if !ok1 || !ok2 {
+		return 0, false
+	}
+	return stockROC - spyROC, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Anti-Pattern Detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+// IsLateStageExtension detects a blow-off: price >15% above EMA20 with volume spike.
+func IsLateStageExtension(bars []Bar) bool {
+	n := len(bars)
+	if n < 25 {
+		return false
+	}
+	closes := make([]float64, n)
+	for i, b := range bars {
+		closes[i] = b.Close
+	}
+	ema20, ok := EMALast(closes, 20)
+	if !ok || ema20 == 0 {
+		return false
+	}
+	extension := (bars[n-1].Close - ema20) / ema20
+	if extension < 0.15 {
+		return false
+	}
+	// Check for volume spike in last 3 bars
+	var vol3, vol20 float64
+	for i := n - 3; i < n; i++ {
+		vol3 += bars[i].Volume
+	}
+	for i := n - 20; i < n; i++ {
+		vol20 += bars[i].Volume
+	}
+	avgVol3 := vol3 / 3
+	avgVol20 := vol20 / 20
+	return avgVol3 > avgVol20*2.5
+}
+
+// HasDistributionDays returns true if >= 3 of last 10 bars show high-volume selling.
+func HasDistributionDays(bars []Bar) bool {
+	n := len(bars)
+	if n < 15 {
+		return false
+	}
+	lookback := 10
+	slice := bars[n-lookback:]
+
+	// Compute 20-day average volume for context
+	var avgVol float64
+	start := n - 20
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < n; i++ {
+		avgVol += bars[i].Volume
+	}
+	avgVol /= float64(n - start)
+
+	distCount := 0
+	for _, b := range slice {
+		// Distribution day: high volume + close < open + close in lower half of range
+		isHighVol := b.Volume > avgVol*1.3
+		isDown := b.Close < b.Open
+		rangeMid := (b.High + b.Low) / 2
+		nearLow := b.Close < rangeMid
+		if isHighVol && isDown && nearLow {
+			distCount++
+		}
+	}
+	return distCount >= 3
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Closing Helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Closes extracts Close prices from a slice of bars.
+func Closes(bars []Bar) []float64 {
+	out := make([]float64, len(bars))
+	for i, b := range bars {
+		out[i] = b.Close
+	}
+	return out
+}
+
+// Volumes extracts Volume from a slice of bars.
+func Volumes(bars []Bar) []float64 {
+	out := make([]float64, len(bars))
+	for i, b := range bars {
+		out[i] = b.Volume
+	}
+	return out
+}
+
+// MaxClose returns the maximum close price in the last N bars.
+func MaxClose(closes []float64, n int) float64 {
+	if len(closes) < n {
+		n = len(closes)
+	}
+	max := closes[len(closes)-n]
+	for _, v := range closes[len(closes)-n:] {
+		if v > max {
+			max = v
+		}
+	}
+	return max
+}
+
+// MinClose returns the minimum close price in the last N bars.
+func MinClose(closes []float64, n int) float64 {
+	if len(closes) < n {
+		n = len(closes)
+	}
+	min := closes[len(closes)-n]
+	for _, v := range closes[len(closes)-n:] {
+		if v < min {
+			min = v
+		}
+	}
+	return min
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EMA Slope — rising / falling detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+// EMASlope returns the percentage change of EMA(period) over the last `lookback`
+// bars. Positive means the EMA is rising; negative means falling.
+// Returns (0, false) when there is insufficient data.
+func EMASlope(closes []float64, period, lookback int) (float64, bool) {
+	if len(closes) < period+lookback {
+		return 0, false
+	}
+	full := EMASlice(closes, period)
+	if full == nil {
+		return 0, false
+	}
+	n := len(full)
+	past := full[n-1-lookback]
+	if past == 0 {
+		return 0, false
+	}
+	return (full[n-1] - past) / past * 100, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Swing High / Low detection — structural support and resistance
+// ──────────────────────────────────────────────────────────────────────────────
+
+// SwingHighs returns the High values of bars that are local maxima within the
+// last `lookback` bars. A local maximum: bar[i].High > bar[i-1].High AND
+// bar[i].High > bar[i+1].High.
+func SwingHighs(bars []Bar, lookback int) []float64 {
+	n := len(bars)
+	if n < 3 {
+		return nil
+	}
+	start := n - lookback
+	if start < 1 {
+		start = 1
+	}
+	var highs []float64
+	for i := start; i < n-1; i++ {
+		if bars[i].High > bars[i-1].High && bars[i].High > bars[i+1].High {
+			highs = append(highs, bars[i].High)
+		}
+	}
+	return highs
+}
+
+// SwingLows returns the Low values of bars that are local minima within the
+// last `lookback` bars.
+func SwingLows(bars []Bar, lookback int) []float64 {
+	n := len(bars)
+	if n < 3 {
+		return nil
+	}
+	start := n - lookback
+	if start < 1 {
+		start = 1
+	}
+	var lows []float64
+	for i := start; i < n-1; i++ {
+		if bars[i].Low < bars[i-1].Low && bars[i].Low < bars[i+1].Low {
+			lows = append(lows, bars[i].Low)
+		}
+	}
+	return lows
+}
+
+// NearestResistance returns the nearest swing high above `currentPrice` within
+// the last `lookback` bars. Returns 0 if none is found.
+func NearestResistance(bars []Bar, currentPrice float64, lookback int) float64 {
+	nearest := 0.0
+	for _, h := range SwingHighs(bars, lookback) {
+		if h > currentPrice {
+			if nearest == 0 || h < nearest {
+				nearest = h
+			}
+		}
+	}
+	return nearest
+}
+
+// NearestSupport returns the nearest swing low below `currentPrice` within the
+// last `lookback` bars. Returns 0 if none is found.
+func NearestSupport(bars []Bar, currentPrice float64, lookback int) float64 {
+	nearest := 0.0
+	for _, l := range SwingLows(bars, lookback) {
+		if l < currentPrice {
+			if nearest == 0 || l > nearest {
+				nearest = l
+			}
+		}
+	}
+	return nearest
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ATR-based structure targets
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ATRTargetRange computes structure-based base and stretch price targets from
+// an ATR multiple. This replaces arbitrary percent targets.
+//
+//   Bullish: base = entry + 2.0×ATR,  stretch = entry + 3.5×ATR
+//   Bearish: base = entry − 2.0×ATR,  stretch = entry − 3.5×ATR
+//
+// Returns (0, 0, false) when ATR cannot be computed.
+func ATRTargetRange(bars []Bar, period int, entry float64, direction string) (base, stretch float64, ok bool) {
+	atr, atrOK := ATRLast(bars, period)
+	if !atrOK || atr == 0 {
+		return 0, 0, false
+	}
+	if direction == "bullish" || direction == "call" {
+		return entry + 2.0*atr, entry + 3.5*atr, true
+	}
+	// bearish / put
+	return entry - 2.0*atr, entry - 3.5*atr, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Bear flag detection (counterpart to IsBullFlag)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// IsBearFlag detects a bear flag: sharp decline followed by a shallow,
+// low-volume consolidation that does not recover more than 50% of the pole.
+func IsBearFlag(bars []Bar) bool {
+	n := len(bars)
+	if n < 15 {
+		return false
+	}
+	poleEnd := n - 8
+	poleStart := poleEnd - 5
+	if poleStart < 0 {
+		return false
+	}
+	// Pole: at least 8% decline
+	poleDecline := (bars[poleStart].Close - bars[poleEnd].Close) / bars[poleStart].Close
+	if poleDecline < 0.08 {
+		return false
+	}
+	// Flag: last bars have not recovered more than 50% of the decline
+	recovery := (bars[n-1].Close - bars[poleEnd].Close) / bars[poleEnd].Close
+	return recovery < poleDecline*0.5
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Higher-low / lower-high structure helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+// IsHigherLowContinuation returns true when the last three bar-level lows
+// within the recent `lookback` bars are sequentially higher (bullish structure).
+func IsHigherLowContinuation(bars []Bar, lookback int) bool {
+	lows := SwingLows(bars, lookback)
+	if len(lows) < 3 {
+		return false
+	}
+	last := lows[len(lows)-3:]
+	return last[1] > last[0] && last[2] > last[1]
+}
+
+// IsLowerHighBreakdown returns true when the last three bar-level highs within
+// the recent `lookback` bars are sequentially lower (bearish structure).
+func IsLowerHighBreakdown(bars []Bar, lookback int) bool {
+	highs := SwingHighs(bars, lookback)
+	if len(highs) < 3 {
+		return false
+	}
+	last := highs[len(highs)-3:]
+	return last[1] < last[0] && last[2] < last[1]
+}

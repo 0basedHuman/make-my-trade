@@ -1,0 +1,43 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Compiled Go binaries
+/bin/
+/makemytrade
+/server
+/worker
+
+# Runtime state (logs, PIDs)
+logs/
+*.log
+*.pid
+
+# Claude Code session data (may contain API responses)
+.claude/
+
+# Go test cache and coverage
+*.test
+*.out
+coverage.html
+
+# macOS noise
+.DS_Store
+.AppleDouble
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Dependency vendor directory (we use go modules, not vendor)
+vendor/
+
+# Temporary files
+tmp/
+*.tmp
+
+# Note: go.mod and go.sum are intentionally NOT ignored.
+# go.sum is the tamper-proof lockfile — it must be committed.

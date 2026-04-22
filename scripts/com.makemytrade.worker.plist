@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- Unique label — launchctl uses this to identify the service -->
+    <key>Label</key>
+    <string>com.makemytrade.worker</string>
+
+    <!-- The script to run -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/harsh/Documents/make-my-trade/scripts/keepalive.sh</string>
+    </array>
+
+    <!-- Working directory for the script -->
+    <key>WorkingDirectory</key>
+    <string>/Users/harsh/Documents/make-my-trade</string>
+
+    <!-- Start immediately when loaded (login) -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart automatically if the process exits for any reason -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Wait 15 s before restarting after a crash — avoids tight loops on boot -->
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <!-- Log files — tail these to see what the worker is doing -->
+    <key>StandardOutPath</key>
+    <string>/Users/harsh/Documents/make-my-trade/logs/worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/harsh/Documents/make-my-trade/logs/worker-error.log</string>
+
+    <!-- PATH must include Homebrew (M1) and Docker CLI locations -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/harsh</string>
+        <key>TMPDIR</key>
+        <string>/tmp</string>
+    </dict>
+
+</dict>
+</plist>

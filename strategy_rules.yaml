@@ -1,0 +1,197 @@
+version: 5
+
+# =========================================
+# MARKET REGIME HARD GATES
+# =========================================
+# VIX >= vix_max: ALL new entries blocked.
+# BTC 20d ROC < btc_roc20_min: bullish setups blocked.
+market_regime:
+  hard_rules:
+    vix_max: 24.0
+    btc_roc20_min: 0.0
+
+
+# =========================================
+# SETUP FAMILIES
+# Keys must match engine lookup: bullish_continuation,
+# bullish_momentum_breakout, bearish_continuation, bearish_momentum_breakdown
+# =========================================
+setup_families:
+
+  bullish_continuation:
+    description: "EMA20 > EMA100, MACD positive, trend safer entry"
+    pattern_score_min: 0
+    entry_rules:
+      volume_ratio_min: 1.2
+      rsi_min: 50
+      rsi_max: 74
+      entry_extension_max_pct: 10.0   # % price above EMA20 allowed
+
+  bullish_momentum_breakout:
+    description: "Price > EMA20, EMA20 slope up, breakout entry"
+    pattern_score_min: 0
+    entry_rules:
+      volume_ratio_min: 1.2           # reduced from 1.5 — market-hours volume varies
+      rsi_min: 45
+      rsi_max: 80
+      entry_extension_max_pct: 12.0   # momentum allows more extension
+
+  bearish_continuation:
+    description: "EMA20 < EMA100, MACD negative, trend safer entry"
+    pattern_score_min: 0
+    entry_rules:
+      volume_ratio_min: 1.2
+      rsi_min: 26
+      rsi_max: 50
+      entry_extension_max_pct: 10.0   # % price below EMA20 allowed
+
+  bearish_momentum_breakdown:
+    description: "Price < EMA20, EMA20 slope down, breakdown entry"
+    pattern_score_min: 0
+    entry_rules:
+      volume_ratio_min: 1.2
+      rsi_min: 20
+      rsi_max: 55
+      entry_extension_max_pct: 12.0
+
+
+# =========================================
+# TARGET MODEL + HOLD WINDOWS
+# Keys must match engine: target_model.bullish_continuation etc.
+# =========================================
+target_model:
+  use_arbitrary_percent_targets: false
+
+  bullish_continuation:
+    base_target_sources: ["nearest_resistance", "swing_high"]
+    stretch_target_sources: ["measured_move", "atr_extension"]
+    hold_window_days:
+      min: 5
+      base: 12
+      max: 20
+
+  bullish_momentum_breakout:
+    base_target_sources: ["nearest_resistance", "swing_high"]
+    stretch_target_sources: ["measured_move", "atr_extension"]
+    hold_window_days:
+      min: 2
+      base: 7
+      max: 10
+
+  bearish_continuation:
+    base_target_sources: ["nearest_support", "swing_low"]
+    stretch_target_sources: ["measured_move", "atr_extension"]
+    hold_window_days:
+      min: 5
+      base: 12
+      max: 20
+
+  bearish_momentum_breakdown:
+    base_target_sources: ["nearest_support", "swing_low"]
+    stretch_target_sources: ["measured_move", "atr_extension"]
+    hold_window_days:
+      min: 2
+      base: 7
+      max: 10
+
+
+# =========================================
+# OPTIONS TRANSLATION
+# =========================================
+options_translation:
+  enabled: true
+  by_setup_family:
+    bullish_continuation:
+      preferred_dte_min: 10
+      preferred_dte_max: 21
+      preferred_delta_min: 0.45
+      preferred_delta_max: 0.65
+    bullish_momentum_breakout:
+      preferred_dte_min: 7
+      preferred_dte_max: 14
+      preferred_delta_min: 0.45
+      preferred_delta_max: 0.70
+    bearish_continuation:
+      preferred_dte_min: 10
+      preferred_dte_max: 21
+      preferred_delta_min: 0.45
+      preferred_delta_max: 0.65
+    bearish_momentum_breakdown:
+      preferred_dte_min: 7
+      preferred_dte_max: 14
+      preferred_delta_min: 0.45
+      preferred_delta_max: 0.70
+  liquidity_filters:
+    min_open_interest: 100
+    min_option_volume: 10
+    max_bid_ask_spread_pct_of_mid: 10.0
+  hide_options_for_statuses:
+    - rejected
+    - structural_candidate
+    - entry_ready
+    - watch_only
+    - blocked_by_event
+
+
+# =========================================
+# EVENT BLOCKS
+# =========================================
+event_blocks:
+  earnings_blackout_days: 5
+  binary_event_blackout_days: 3
+  if_blocked_status: "blocked_by_event"
+
+
+# =========================================
+# STATE RULES
+# =========================================
+state_rules:
+  structural_candidate_is_watchlist_only: true
+  entry_ready_can_surface_preopen: true
+  confirmed_required_for_trade_output: true
+  confirmed_required_for_options_evaluation: true
+  hide_option_output_until_underlying_confirmed: true
+  blocked_by_event_overrides_entry_ready: true
+  blocked_by_event_overrides_confirmed: true
+
+
+# =========================================
+# OPEN CONFIRMATION
+# =========================================
+open_confirmation:
+  enabled: true
+  confirmation_window_minutes: 10
+  min_true_signals_to_confirm: 3
+  checks:
+    breakout_or_reclaim_holds: true
+    opening_range_close_above_midpoint_for_calls: true
+    opening_range_close_below_midpoint_for_puts: true
+    no_rejection_wick_for_calls: true
+    no_reversal_tail_for_puts: true
+    opening_volume_support: true
+    market_open_alignment: true
+
+
+# =========================================
+# SCORING VISIBILITY
+# =========================================
+scoring:
+  show_score_only_for:
+    - entry_ready
+    - confirmed
+    - options_ready
+    - options_confirmed
+  hide_score_for:
+    - rejected
+    - structural_candidate
+    - watch_only
+    - blocked_by_event
+
+
+# =========================================
+# DAILY OUTPUT
+# =========================================
+daily_output:
+  allow_zero_trade_day: true
+  no_trade_day_when_no_confirmed: true
+  no_trade_day_message: "No symbols reached confirmed status. Watchlist candidates may still exist."

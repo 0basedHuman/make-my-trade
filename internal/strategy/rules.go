@@ -1,23 +1,20 @@
 // internal/strategy/rules.go
 //
-// WHAT: Go struct hierarchy that mirrors strategy_rules.yaml, plus a loader.
+// WHAT: Go struct hierarchy that mirrors strategy_rules.yaml v6, plus loader.
 //
-// WHY:  All strategy thresholds, family definitions, pattern scores, and
+// WHY:  All strategy thresholds, family definitions, scoring weights, and
 //       liquidity filters live in strategy_rules.yaml as the single source of
-//       truth. This file parses that YAML at startup so the engine and handler
-//       can reference named fields rather than magic constants.
+//       truth. This file parses that YAML at startup so the engine, handler,
+//       and confirmation evaluator can reference typed fields rather than
+//       magic constants.
 //
-// HOW:  LoadRules("strategy_rules.yaml") is called once at startup and the
-//       resulting *Rules is passed to strategy.NewEngine() and used in the
-//       handler to build filterChainQuality thresholds.
+// HOW:  LoadRules("strategy_rules.yaml") is called once at startup. The returned
+//       *Rules is passed to strategy.NewEngine() and used directly by handlers.
 //
-// WHAT BREAKS: If strategy_rules.yaml has a key that doesn't map to a struct
-//              field, yaml.v3 silently ignores it (no error). If a required
-//              numeric field is absent, it defaults to zero — which would
-//              disable the check. Always verify thresholds after editing YAML.
-//
-// VERIFY:  fmt.Printf("%+v\n", rules.MarketRegime.HardRules)
-//          should print {VIXMax:24 BTCRoc20Min:0}
+// WHAT BREAKS: yaml.v3 silently ignores unknown keys (no error). A missing
+//              numeric field defaults to zero — which disables that check.
+//              Always verify thresholds after editing YAML with:
+//              fmt.Printf("%+v\n", rules.Families["bullish_continuation"].Scoring)
 
 package strategy
 
@@ -28,90 +25,199 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Rules is the decoded form of strategy_rules.yaml.
-// All mutable strategy parameters come from here — never from hardcoded constants.
+// Rules is the decoded form of strategy_rules.yaml v6.
 type Rules struct {
-	Version     int    `yaml:"version"`
-	Name        string `yaml:"name"`
-	Description string `yaml:"description"`
+	Version int `yaml:"version"`
 
-	MarketRegime        MarketRegimeConfig        `yaml:"market_regime"`
-	HardQualifiers      HardQualifiersConfig      `yaml:"hard_qualifiers"`
-	SetupFamilies       map[string]SetupFamilyConfig `yaml:"setup_families"`
-	PatternScoreConfig  PatternScoreConfig        `yaml:"pattern_scores"`
-	AntiPatternConfig   AntiPatternConfig         `yaml:"anti_patterns"`
-	TargetModelConfig   TargetModelConfig         `yaml:"target_model"`
-	OptionsTranslation  OptionsTranslationConfig  `yaml:"options_translation"`
-	ReasonCodes         []string                  `yaml:"reason_codes"`
+	Global    GlobalConfig    `yaml:"global"`
+	Regime    RegimeConfig    `yaml:"regime"`
+	Penalties PenaltiesConfig `yaml:"penalties"`
 
-	// v3: lifecycle + classification + UI config
-	StateRules          StateRulesConfig          `yaml:"state_rules"`
-	EventBlocks         EventBlocksConfig         `yaml:"event_blocks"`
-	ClassificationLogic ClassificationLogicConfig `yaml:"classification_logic"`
-	TargetOutput        TargetOutputConfig        `yaml:"target_output"`
-	Scoring             ScoringConfig             `yaml:"scoring"`
-	UIRules             UIRulesConfig             `yaml:"ui_rules"`
-	DailyOutput         DailyOutputConfig         `yaml:"daily_output"`
-	OpenConfirmation    OpenConfirmationConfig    `yaml:"open_confirmation"`
+	// Per-family complete policy (preconditions + scoring + options + hold).
+	Families map[string]FamilyConfig `yaml:"families"`
+
+	PatternScoreConfig PatternScoreConfig `yaml:"pattern_scores"`
+	AntiPatternConfig  AntiPatternConfig  `yaml:"anti_patterns"`
+	EventBlocks        EventBlocksConfig  `yaml:"event_blocks"`
+	StateRules         StateRulesConfig   `yaml:"state_rules"`
+
+	// Kept at top-level for handlers.go/activities.go backward compatibility.
+	// Per-family DTE/delta bands live in Families[*].Options.
+	OptionsTranslation OptionsTranslationConfig `yaml:"options_translation"`
+
+	OpenConfirmation OpenConfirmationConfig `yaml:"open_confirmation"`
+	Scoring          ScoringConfig          `yaml:"scoring"`
+	DailyOutput      DailyOutputConfig      `yaml:"daily_output"`
 }
 
-// ── Market regime ─────────────────────────────────────────────────────────────
+// ── Global ────────────────────────────────────────────────────────────────────
 
-type MarketRegimeConfig struct {
-	HardRules MarketRegimeHardRules `yaml:"hard_rules"`
+// GlobalConfig holds feature computation windows and data quality gates.
+type GlobalConfig struct {
+	FeatureWindows FeatureWindowsConfig `yaml:"feature_windows"`
+	DataQuality    DataQualityConfig    `yaml:"data_quality"`
 }
 
-// MarketRegimeHardRules contains the absolute regime gates.
-// VIXMax: if VIX >= this, all new entries are blocked.
-// BTCRoc20Min: if BTC 20d ROC < this, bullish setups are blocked.
-type MarketRegimeHardRules struct {
+// FeatureWindowsConfig enumerates all indicator periods the engine uses.
+// Changing these here changes what the engine computes.
+type FeatureWindowsConfig struct {
+	EMAShort         int `yaml:"ema_short"`
+	EMAMedium        int `yaml:"ema_medium"`
+	EMALong          int `yaml:"ema_long"`
+	RSIPeriod        int `yaml:"rsi_period"`
+	MACDFast         int `yaml:"macd_fast"`
+	MACDSlow         int `yaml:"macd_slow"`
+	MACDSignal       int `yaml:"macd_signal"`
+	ATRPeriod        int `yaml:"atr_period"`
+	VolumeAvgPeriod  int `yaml:"volume_avg_period"`
+	EMASlopeLookback int `yaml:"ema_slope_lookback"`
+}
+
+// DataQualityConfig holds minimum bar requirements before scoring begins.
+type DataQualityConfig struct {
+	MinBarsRequired int `yaml:"min_bars_required"`
+}
+
+// ── Regime ────────────────────────────────────────────────────────────────────
+
+// RegimeConfig holds universal market guardrails applied before family scoring.
+type RegimeConfig struct {
+	HardBlocks RegimeHardBlocks `yaml:"hard_blocks"`
+}
+
+// RegimeHardBlocks are absolute gates. Failing either blocks all families.
+type RegimeHardBlocks struct {
 	VIXMax      float64 `yaml:"vix_max"`
 	BTCRoc20Min float64 `yaml:"btc_roc20_min"`
 }
 
-// ── Hard qualifiers ───────────────────────────────────────────────────────────
+// ── Penalties ─────────────────────────────────────────────────────────────────
 
-type HardQualifiersConfig struct {
-	Common HardQualifiersCommon `yaml:"common"`
+// PenaltiesConfig holds score deductions applied after weighted family scoring.
+// Values are on the 0-100 score scale.
+type PenaltiesConfig struct {
+	LateStageExtension     float64 `yaml:"late_stage_extension"`
+	DistributionSevere     float64 `yaml:"distribution_severe"`
+	RSIOverextendedBullish float64 `yaml:"rsi_overextended_bullish"`
+	RSIOversoldBearish     float64 `yaml:"rsi_oversold_bearish"`
 }
 
-type HardQualifiersCommon struct {
-	VolumeRatioMin          float64 `yaml:"volume_ratio_min"`
-	RewardRiskMin           float64 `yaml:"reward_risk_min"`
-	EntryExtensionMaxPct    float64 `yaml:"entry_extension_max_pct"`
-	EarningsBlackoutDays    int     `yaml:"earnings_blackout_days"`
-	BinaryEventBlackoutDays int     `yaml:"binary_event_blackout_days"`
+// ── Family config (one block per family in YAML) ──────────────────────────────
+
+// FamilyConfig is the complete per-family policy block.
+// All strategy parameters for a family live here — no split across sections.
+type FamilyConfig struct {
+	Direction   string `yaml:"direction"`   // "bullish" | "bearish"
+	OptionType  string `yaml:"option_type"` // "call" | "put"
+	Description string `yaml:"description"`
+
+	Preconditions   FamilyPreconditions   `yaml:"preconditions"`
+	Scoring         FamilyScoringConfig   `yaml:"scoring"`
+	RSI             FamilyRSIBands        `yaml:"rsi"`
+	ExtensionPct    FamilyExtensionBands  `yaml:"extension_pct"`
+	Volume          FamilyVolumeBands     `yaml:"volume"`
+	EMAGapPct       FamilyEMAGapBands     `yaml:"ema_gap_pct"`
+	EntryConditions FamilyEntryConditions `yaml:"entry_conditions"`
+	Options         FamilyOptionsBand     `yaml:"options"`
+	HoldWindow      HoldWindow            `yaml:"hold_window"`
 }
 
-// ── Setup families ────────────────────────────────────────────────────────────
-
-// SetupFamilyConfig mirrors one entry under setup_families in the YAML.
-// StructuralRules uses map[string]interface{} because the YAML values are
-// heterogeneous (bool, float, etc.) and names vary per family.
-type SetupFamilyConfig struct {
-	Direction            string                 `yaml:"direction"`
-	OptionType           string                 `yaml:"option_type"`
-	Description          string                 `yaml:"description"`
-	StructuralRules      map[string]interface{} `yaml:"structural_rules"`
-	EntryRules           FamilyEntryRules       `yaml:"entry_rules"`
-	PatternScoreMin      int                    `yaml:"pattern_score_min"`
-	PreferredOptionStyle string                 `yaml:"preferred_option_style"`
+// FamilyPreconditions are binary gates. All flagged true must pass.
+// One failure → family skipped entirely (not scored).
+type FamilyPreconditions struct {
+	// Bullish continuation
+	EMA20AboveEMA50  bool `yaml:"ema20_above_ema50"`
+	EMA20AboveEMA100 bool `yaml:"ema20_above_ema100"`
+	CloseAboveEMA20  bool `yaml:"close_above_ema20"`
+	MACDHistPositive bool `yaml:"macd_histogram_positive"`
+	BTCNotNegative   bool `yaml:"btc_regime_not_negative"`
+	// Bearish continuation
+	EMA20BelowEMA50  bool `yaml:"ema20_below_ema50"`
+	EMA20BelowEMA100 bool `yaml:"ema20_below_ema100"`
+	CloseBelowEMA20  bool `yaml:"close_below_ema20"`
+	MACDHistNegative bool `yaml:"macd_histogram_negative"`
+	// Momentum families
+	EMA20SlopePositive bool `yaml:"ema20_slope_positive"`
+	EMA20SlopeNegative bool `yaml:"ema20_slope_negative"`
 }
 
-// FamilyEntryRules holds the per-family entry filter thresholds.
-type FamilyEntryRules struct {
-	VolumeRatioMin        float64 `yaml:"volume_ratio_min"`
-	StrongVolumeExpansion bool    `yaml:"strong_volume_expansion"`
-	RSIMin                float64 `yaml:"rsi_min"`
-	RSIMax                float64 `yaml:"rsi_max"`
-	RewardRiskMin         float64 `yaml:"reward_risk_min"`
-	EntryExtensionMaxPct  float64 `yaml:"entry_extension_max_pct"`
+// FamilyScoringConfig holds the 5 dimension weights and promotion thresholds.
+type FamilyScoringConfig struct {
+	Weights    ScoringWeights    `yaml:"weights"`
+	Thresholds ScoringThresholds `yaml:"thresholds"`
 }
 
-// ── Pattern scores ────────────────────────────────────────────────────────────
+// ScoringWeights must sum to 100. Engine scores each dimension 0.0-1.0.
+type ScoringWeights struct {
+	TrendStructure      int `yaml:"trend_structure"`
+	MomentumAlignment   int `yaml:"momentum_alignment"`
+	VolumeParticipation int `yaml:"volume_participation"`
+	EntryQuality        int `yaml:"entry_quality"`
+	PatternStrength     int `yaml:"pattern_strength"`
+}
+
+// ScoringThresholds are minimum scores for each lifecycle status.
+type ScoringThresholds struct {
+	StructuralCandidate float64 `yaml:"structural_candidate"`
+	EntryReady          float64 `yaml:"entry_ready"`
+}
+
+// FamilyRSIBands defines ideal and acceptable RSI ranges for scoring.
+type FamilyRSIBands struct {
+	IdealMin      float64 `yaml:"ideal_min"`
+	IdealMax      float64 `yaml:"ideal_max"`
+	AcceptableMin float64 `yaml:"acceptable_min"`
+	AcceptableMax float64 `yaml:"acceptable_max"`
+}
+
+// FamilyExtensionBands defines how far price may be from EMA20.
+// extension_pct = abs(close - EMA20) / EMA20 * 100
+type FamilyExtensionBands struct {
+	IdealMax      float64 `yaml:"ideal_max"`      // full entry_quality score
+	AcceptableMax float64 `yaml:"acceptable_max"` // half score
+	HardReject    float64 `yaml:"hard_reject"`    // zero entry_quality score
+}
+
+// FamilyVolumeBands defines relative volume thresholds for scoring.
+type FamilyVolumeBands struct {
+	StrongMin   float64 `yaml:"strong_min"`   // full volume score
+	AdequateMin float64 `yaml:"adequate_min"` // partial score
+}
+
+// FamilyEMAGapBands defines EMA20-EMA50 separation quality thresholds.
+type FamilyEMAGapBands struct {
+	StrongMin   float64 `yaml:"strong_min"`
+	AdequateMin float64 `yaml:"adequate_min"`
+}
+
+// FamilyEntryConditions are hard binary checks evaluated AFTER scoring.
+// Even if score >= entry_ready threshold, all must pass for entry_ready status.
+// Failing any → structural_candidate (never rejected by entry conditions alone).
+type FamilyEntryConditions struct {
+	VolumeMin       float64 `yaml:"volume_min"`
+	RSIMin          float64 `yaml:"rsi_min"`
+	RSIMax          float64 `yaml:"rsi_max"`
+	ExtensionMaxPct float64 `yaml:"extension_max_pct"`
+}
+
+// FamilyOptionsBand holds DTE and delta target bands for contract selection.
+type FamilyOptionsBand struct {
+	DTEMin   int     `yaml:"dte_min"`
+	DTEMax   int     `yaml:"dte_max"`
+	DeltaMin float64 `yaml:"delta_min"`
+	DeltaMax float64 `yaml:"delta_max"`
+}
+
+// HoldWindow is the trade duration range in calendar days.
+type HoldWindow struct {
+	Min  int `yaml:"min"`
+	Base int `yaml:"base"`
+	Max  int `yaml:"max"`
+}
+
+// ── Pattern scores ─────────────────────────────────────────────────────────────
 
 // PatternScoreConfig maps pattern names → integer point values.
-// Used by the engine to sum a candidate's integer pattern score.
 type PatternScoreConfig struct {
 	Bullish map[string]int `yaml:"bullish"`
 	Bearish map[string]int `yaml:"bearish"`
@@ -119,234 +225,99 @@ type PatternScoreConfig struct {
 
 // ── Anti-patterns ─────────────────────────────────────────────────────────────
 
+// AntiPatternConfig lists names that trigger penalties from PenaltiesConfig.
 type AntiPatternConfig struct {
 	BullishReject []string `yaml:"bullish_reject"`
 	BearishReject []string `yaml:"bearish_reject"`
 }
 
-// ── Target model ──────────────────────────────────────────────────────────────
+// ── Event blocks ──────────────────────────────────────────────────────────────
 
-type TargetModelConfig struct {
-	UseArbitraryPercentTargets bool              `yaml:"use_arbitrary_percent_targets"`
-	BullishContinuation        FamilyTargetModel `yaml:"bullish_continuation"`
-	BullishMomentumBreakout    FamilyTargetModel `yaml:"bullish_momentum_breakout"`
-	BearishContinuation        FamilyTargetModel `yaml:"bearish_continuation"`
-	BearishMomentumBreakdown   FamilyTargetModel `yaml:"bearish_momentum_breakdown"`
+// EventBlocksConfig defines earnings/binary-event blackout windows.
+type EventBlocksConfig struct {
+	EarningsBlackoutDays    int    `yaml:"earnings_blackout_days"`
+	BinaryEventBlackoutDays int    `yaml:"binary_event_blackout_days"`
+	IfBlockedStatus         string `yaml:"if_blocked_status"`
 }
 
-type FamilyTargetModel struct {
-	BaseTargetSources    []string   `yaml:"base_target_sources"`
-	StretchTargetSources []string   `yaml:"stretch_target_sources"`
-	HoldWindowDays       HoldWindow `yaml:"hold_window_days"`
+// ── State rules ───────────────────────────────────────────────────────────────
+
+// StateRulesConfig contains lifecycle flags read by engine and handlers.
+type StateRulesConfig struct {
+	StructuralCandidateIsWatchlistOnly    bool `yaml:"structural_candidate_is_watchlist_only"`
+	EntryReadyCanSurfacePreopen           bool `yaml:"entry_ready_can_surface_preopen"`
+	ConfirmedRequiredForTradeOutput       bool `yaml:"confirmed_required_for_trade_output"`
+	BlockedByEventOverridesEntryReady     bool `yaml:"blocked_by_event_overrides_entry_ready"`
+	BlockedByEventOverridesConfirmed      bool `yaml:"blocked_by_event_overrides_confirmed"`
 }
 
-// HoldWindow holds the hold duration range for a family (in calendar days).
-type HoldWindow struct {
-	Min  int `yaml:"min"`
-	Base int `yaml:"base"`
-	Max  int `yaml:"max"`
-}
+// ── Options translation (handlers.go compat) ──────────────────────────────────
 
-// ── Options translation ───────────────────────────────────────────────────────
-
+// OptionsTranslationConfig holds liquidity filters and status visibility rules.
+// The top-level section is kept for handlers.go backward compatibility.
+// Per-family DTE/delta bands now live in FamilyConfig.Options.
 type OptionsTranslationConfig struct {
-	Enabled               bool                         `yaml:"enabled"`
-	BySetupFamily         map[string]OptionsFamilySpec `yaml:"by_setup_family"`
-	LiquidityFilters      LiquidityFilters             `yaml:"liquidity_filters"`
-	HideOptionsForStatuses []string                    `yaml:"hide_options_for_statuses"`
+	LiquidityFilters       LiquidityFilters `yaml:"liquidity_filters"`
+	HideOptionsForStatuses []string         `yaml:"hide_options_for_statuses"`
 }
 
-// OptionsFamilySpec holds preferred DTE and delta for one setup family.
-type OptionsFamilySpec struct {
-	PreferredDTEMin     int      `yaml:"preferred_dte_min"`
-	PreferredDTEMax     int      `yaml:"preferred_dte_max"`
-	PreferredDeltaMin   float64  `yaml:"preferred_delta_min"`
-	PreferredDeltaMax   float64  `yaml:"preferred_delta_max"`
-	PreferredStructures []string `yaml:"preferred_structures"`
-}
-
-// LiquidityFilters are the app-side chain quality thresholds.
-// Contracts that fail these are stripped before being sent to Claude.
+// LiquidityFilters are the app-side chain quality thresholds applied before
+// contract selection. Contracts failing these are stripped before Claude sees them.
 type LiquidityFilters struct {
 	MinOpenInterest         int     `yaml:"min_open_interest"`
 	MinOptionVolume         int     `yaml:"min_option_volume"`
 	MaxBidAskSpreadPctOfMid float64 `yaml:"max_bid_ask_spread_pct_of_mid"`
 }
 
-// ── v3: Lifecycle state, event blocks, classification, scoring, UI ────────────
+// ── Open confirmation ─────────────────────────────────────────────────────────
 
-// StateRulesConfig maps to state_rules in strategy_rules.yaml.
-// These flags drive the lifecycle state machine — status promotion and demotion
-// rules are read from here, not hardcoded in the engine.
-type StateRulesConfig struct {
-	StructuralCandidateIsWatchlistOnly         bool `yaml:"structural_candidate_is_watchlist_only"`
-	EntryReadyCanSurfacePreopen                bool `yaml:"entry_ready_can_surface_preopen"`
-	ConfirmedRequiredForTradeOutput            bool `yaml:"confirmed_required_for_trade_output"`
-	ConfirmedRequiredForOptionsEvaluation      bool `yaml:"confirmed_required_for_options_evaluation"`
-	HideOptionOutputUntilUnderlyingConfirmed   bool `yaml:"hide_option_output_until_underlying_confirmed"`
-	BlockedByEventOverridesEntryReady          bool `yaml:"blocked_by_event_overrides_entry_ready"`
-	BlockedByEventOverridesConfirmed           bool `yaml:"blocked_by_event_overrides_confirmed"`
+// OpenConfirmationConfig maps to open_confirmation in strategy_rules.yaml.
+type OpenConfirmationConfig struct {
+	Enabled                   bool               `yaml:"enabled"`
+	ConfirmationWindowMinutes int                `yaml:"confirmation_window_minutes"`
+	MinTrueSignalsToConfirm   int                `yaml:"min_true_signals_to_confirm"`
+	Checks                    ConfirmationChecks `yaml:"checks"`
+	AutoReject                AutoRejectChecks   `yaml:"auto_reject"`
 }
 
-// EventBlocksConfig maps to event_blocks in strategy_rules.yaml.
-// IfBlockedStatus is the status to assign when a symbol is blocked by an event.
-type EventBlocksConfig struct {
-	EarningsBlackoutDays    int    `yaml:"earnings_blackout_days"`
-	BinaryEventBlackoutDays int    `yaml:"binary_event_blackout_days"`
-	IfBlockedStatus         string `yaml:"if_blocked_status"` // "blocked_by_event"
+// ConfirmationChecks mirrors the checks sub-block.
+type ConfirmationChecks struct {
+	BreakoutOrReclaimHolds                 bool `yaml:"breakout_or_reclaim_holds"`
+	OpeningRangeCloseAboveMidpointForCalls bool `yaml:"opening_range_close_above_midpoint_for_calls"`
+	OpeningRangeCloseBelowMidpointForPuts  bool `yaml:"opening_range_close_below_midpoint_for_puts"`
+	NoRejectionWickForCalls                bool `yaml:"no_rejection_wick_for_calls"`
+	NoReversalTailForPuts                  bool `yaml:"no_reversal_tail_for_puts"`
+	OpeningVolumeSupport                   bool `yaml:"opening_volume_support"`
+	MarketOpenAlignment                    bool `yaml:"market_open_alignment"`
 }
 
-// ClassificationLogicConfig maps to classification_logic in strategy_rules.yaml.
-// These lists are informational — the engine still drives classification but
-// they document the criteria so Claude and the UI match.
-type ClassificationLogicConfig struct {
-	RejectedIfAny             []string `yaml:"rejected_if_any"`
-	StructuralCandidateIfAll  []string `yaml:"structural_candidate_if_all"`
-	RemainStructuralIfAny     []string `yaml:"remain_structural_candidate_if_any"`
-	EntryReadyIfAll           []string `yaml:"entry_ready_if_all"`
-	ConfirmedIfAll            []string `yaml:"confirmed_if_all"`
+// AutoRejectChecks mirrors the auto_reject sub-block.
+type AutoRejectChecks struct {
+	DecisiveLevelLoss       bool `yaml:"decisive_level_loss"`
+	WeakFirst10mClose       bool `yaml:"weak_first_10m_close"`
+	HardOpenReversal        bool `yaml:"hard_open_reversal"`
+	BroadMarketRiskoffShock bool `yaml:"broad_market_riskoff_shock"`
+	DownsideRejectionVolume bool `yaml:"downside_rejection_volume"`
 }
 
-// TargetOutputConfig maps to target_output in strategy_rules.yaml.
-// Controls which statuses receive price targets in the output.
-type TargetOutputConfig struct {
-	EmitTargetsFor                      []string `yaml:"emit_targets_for"`
-	MarkStructuralTargetsAsWatchlistOnly bool     `yaml:"mark_structural_targets_as_watchlist_only"`
-	LabelTargets                        struct {
-		Base    string `yaml:"base"`
-		Stretch string `yaml:"stretch"`
-	} `yaml:"label_targets"`
-	DoNotTreatStretchAsBaseCase bool `yaml:"do_not_treat_stretch_as_base_case"`
-}
+// ── Scoring visibility ────────────────────────────────────────────────────────
 
-// ScoringConfig maps to scoring in strategy_rules.yaml.
-// Controls which statuses expose a numeric score in the UI.
+// ScoringConfig controls which lifecycle statuses expose a numeric score in the UI.
 type ScoringConfig struct {
 	ShowScoreOnlyFor []string `yaml:"show_score_only_for"`
 	HideScoreFor     []string `yaml:"hide_score_for"`
 }
 
-// UIStatusRule is one status-section entry under ui_rules.
-type UIStatusRule struct {
-	Label                   string `yaml:"label"`
-	ShowTradeButton         bool   `yaml:"show_trade_button"`
-	ShowOptionOutput        bool   `yaml:"show_option_output"`
-	ShowReasonWhatIsMissing bool   `yaml:"show_reason_what_is_missing"`
-}
-
-// UIRulesConfig maps to ui_rules in strategy_rules.yaml.
-type UIRulesConfig struct {
-	Sections            []string     `yaml:"sections"`
-	StructuralCandidate UIStatusRule `yaml:"structural_candidate"`
-	BlockedByEvent      UIStatusRule `yaml:"blocked_by_event"`
-	EntryReady          UIStatusRule `yaml:"entry_ready"`
-	Confirmed           UIStatusRule `yaml:"confirmed"`
-}
+// ── Daily output ──────────────────────────────────────────────────────────────
 
 // DailyOutputConfig maps to daily_output in strategy_rules.yaml.
 type DailyOutputConfig struct {
-	AllowZeroTradeDay        bool     `yaml:"allow_zero_trade_day"`
-	RequireReasonCodes       bool     `yaml:"require_reason_codes"`
-	Sections                 []string `yaml:"sections"`
-	NoTradeDayWhenNoConfirmed bool    `yaml:"no_trade_day_when_no_confirmed"`
-	NoTradeDayMessage        string   `yaml:"no_trade_day_message"`
+	AllowZeroTradeDay         bool   `yaml:"allow_zero_trade_day"`
+	NoTradeDayWhenNoConfirmed bool   `yaml:"no_trade_day_when_no_confirmed"`
+	NoTradeDayMessage         string `yaml:"no_trade_day_message"`
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// FamilyTargetFor returns the target model for the named setup family.
-func (r *Rules) FamilyTargetFor(family string) (FamilyTargetModel, bool) {
-	switch family {
-	case "bullish_continuation":
-		return r.TargetModelConfig.BullishContinuation, true
-	case "bullish_momentum_breakout":
-		return r.TargetModelConfig.BullishMomentumBreakout, true
-	case "bearish_continuation":
-		return r.TargetModelConfig.BearishContinuation, true
-	case "bearish_momentum_breakdown":
-		return r.TargetModelConfig.BearishMomentumBreakdown, true
-	}
-	return FamilyTargetModel{}, false
-}
-
-// OptionsFamilySpecFor returns the options translation spec for the named family.
-func (r *Rules) OptionsFamilySpecFor(family string) (OptionsFamilySpec, bool) {
-	spec, ok := r.OptionsTranslation.BySetupFamily[family]
-	return spec, ok
-}
-
-// ShouldHideScore returns true if a candidate with the given status must not show a score
-// in the UI, per scoring.hide_score_for in strategy_rules.yaml.
-func (r *Rules) ShouldHideScore(status string) bool {
-	for _, s := range r.Scoring.HideScoreFor {
-		if s == status {
-			return true
-		}
-	}
-	return false
-}
-
-// ShouldHideOptions returns true if options contract output must be suppressed for the
-// given candidate status, per options_translation.hide_options_for_statuses.
-func (r *Rules) ShouldHideOptions(status string) bool {
-	for _, s := range r.OptionsTranslation.HideOptionsForStatuses {
-		if s == status {
-			return true
-		}
-	}
-	return false
-}
-
-// BlockedByEventStatus returns the status to assign when an event blackout fires.
-// Defaults to "blocked_by_event" if the YAML field is unset.
-func (r *Rules) BlockedByEventStatus() string {
-	if r.EventBlocks.IfBlockedStatus != "" {
-		return r.EventBlocks.IfBlockedStatus
-	}
-	return "blocked_by_event"
-}
-
-// NoTradeDayMessage returns the configured no-trade message, falling back to a default.
-func (r *Rules) NoTradeDayMessage() string {
-	if r.DailyOutput.NoTradeDayMessage != "" {
-		return r.DailyOutput.NoTradeDayMessage
-	}
-	return "No symbols reached confirmed status. Watchlist candidates may still exist."
-}
-
-// ── Open confirmation ─────────────────────────────────────────────────────────
-
-// OpenConfirmationConfig maps to open_confirmation in strategy_rules.yaml.
-// Controls how the first-10-minute opening window promotes entry_ready → confirmed.
-type OpenConfirmationConfig struct {
-	Enabled                   bool                 `yaml:"enabled"`
-	ConfirmationWindowMinutes int                  `yaml:"confirmation_window_minutes"`
-	MinTrueSignalsToConfirm   int                  `yaml:"min_true_signals_to_confirm"`
-	Checks                    ConfirmationChecks   `yaml:"checks"`
-	AutoReject                AutoRejectChecks     `yaml:"auto_reject"`
-}
-
-// ConfirmationChecks mirrors the checks sub-block.
-// Each bool records whether that check is active in the YAML.
-// The confirmation evaluator reads these to decide which signals count.
-type ConfirmationChecks struct {
-	BreakoutOrReclaimHolds                  bool `yaml:"breakout_or_reclaim_holds"`
-	OpeningRangeCloseAboveMidpointForCalls  bool `yaml:"opening_range_close_above_midpoint_for_calls"`
-	OpeningRangeCloseBelowMidpointForPuts   bool `yaml:"opening_range_close_below_midpoint_for_puts"`
-	NoRejectionWickForCalls                 bool `yaml:"no_rejection_wick_for_calls"`
-	NoReversalTailForPuts                   bool `yaml:"no_reversal_tail_for_puts"`
-	OpeningVolumeSupport                    bool `yaml:"opening_volume_support"`
-	MarketOpenAlignment                     bool `yaml:"market_open_alignment"`
-}
-
-// AutoRejectChecks mirrors the auto_reject sub-block.
-type AutoRejectChecks struct {
-	DecisiveLevelLoss        bool `yaml:"decisive_level_loss"`
-	WeakFirst10mClose        bool `yaml:"weak_first_10m_close"`
-	HardOpenReversal         bool `yaml:"hard_open_reversal"`
-	BroadMarketRiskoffShock  bool `yaml:"broad_market_riskoff_shock"`
-	DownsideRejectionVolume  bool `yaml:"downside_rejection_volume"`
-}
+// ── Loader ────────────────────────────────────────────────────────────────────
 
 // LoadRules parses strategy_rules.yaml from the given path.
 func LoadRules(path string) (*Rules, error) {
@@ -361,85 +332,228 @@ func LoadRules(path string) (*Rules, error) {
 	return &r, nil
 }
 
+// ── Accessor helpers ──────────────────────────────────────────────────────────
+
+// FamilyFor returns the config for the named setup family.
+func (r *Rules) FamilyFor(family string) (FamilyConfig, bool) {
+	cfg, ok := r.Families[family]
+	return cfg, ok
+}
+
+// BlockedByEventStatus returns the status for event-blackout candidates.
+func (r *Rules) BlockedByEventStatus() string {
+	if r.EventBlocks.IfBlockedStatus != "" {
+		return r.EventBlocks.IfBlockedStatus
+	}
+	return "blocked_by_event"
+}
+
+// ShouldHideScore returns true if the given status must not show a score in the UI.
+func (r *Rules) ShouldHideScore(status string) bool {
+	for _, s := range r.Scoring.HideScoreFor {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+// ShouldHideOptions returns true if option output must be suppressed for the status.
+func (r *Rules) ShouldHideOptions(status string) bool {
+	for _, s := range r.OptionsTranslation.HideOptionsForStatuses {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+// NoTradeDayMessage returns the configured no-trade message.
+func (r *Rules) NoTradeDayMessage() string {
+	if r.DailyOutput.NoTradeDayMessage != "" {
+		return r.DailyOutput.NoTradeDayMessage
+	}
+	return "No symbols reached confirmed status. Watchlist candidates may still exist."
+}
+
+// MinBarsRequired returns the data quality threshold (with safe default).
+func (r *Rules) MinBarsRequired() int {
+	if r.Global.DataQuality.MinBarsRequired > 0 {
+		return r.Global.DataQuality.MinBarsRequired
+	}
+	return 35
+}
+
+// ── DefaultRules ─────────────────────────────────────────────────────────────
+
 // DefaultRules returns safe fallback values used when YAML cannot be loaded.
-// All thresholds match the hard values in strategy_rules.yaml v3.
+// Thresholds match strategy_rules.yaml v6.
 func DefaultRules() *Rules {
-	return &Rules{
-		MarketRegime: MarketRegimeConfig{
-			HardRules: MarketRegimeHardRules{VIXMax: 24.0, BTCRoc20Min: 0.0},
+	bullContFamily := FamilyConfig{
+		Direction: "bullish", OptionType: "call",
+		Preconditions: FamilyPreconditions{
+			EMA20AboveEMA50: true, EMA20AboveEMA100: true,
+			CloseAboveEMA20: true, MACDHistPositive: true, BTCNotNegative: true,
 		},
-		HardQualifiers: HardQualifiersConfig{
-			Common: HardQualifiersCommon{
-				VolumeRatioMin:          1.2,
-				RewardRiskMin:           2.0,
-				EntryExtensionMaxPct:    6.0,
-				EarningsBlackoutDays:    5,
-				BinaryEventBlackoutDays: 3,
+		Scoring: FamilyScoringConfig{
+			Weights: ScoringWeights{
+				TrendStructure: 30, MomentumAlignment: 25,
+				VolumeParticipation: 20, EntryQuality: 15, PatternStrength: 10,
 			},
+			Thresholds: ScoringThresholds{StructuralCandidate: 45, EntryReady: 65},
+		},
+		RSI:          FamilyRSIBands{IdealMin: 55, IdealMax: 68, AcceptableMin: 50, AcceptableMax: 74},
+		ExtensionPct: FamilyExtensionBands{IdealMax: 5.0, AcceptableMax: 10.0, HardReject: 15.0},
+		Volume:       FamilyVolumeBands{StrongMin: 1.5, AdequateMin: 1.2},
+		EMAGapPct:    FamilyEMAGapBands{StrongMin: 3.0, AdequateMin: 0.5},
+		EntryConditions: FamilyEntryConditions{
+			VolumeMin: 1.2, RSIMin: 50, RSIMax: 74, ExtensionMaxPct: 10.0,
+		},
+		Options:    FamilyOptionsBand{DTEMin: 10, DTEMax: 21, DeltaMin: 0.45, DeltaMax: 0.65},
+		HoldWindow: HoldWindow{Min: 5, Base: 12, Max: 20},
+	}
+	bullMomFamily := FamilyConfig{
+		Direction: "bullish", OptionType: "call",
+		Preconditions: FamilyPreconditions{
+			CloseAboveEMA20: true, EMA20SlopePositive: true, BTCNotNegative: true,
+		},
+		Scoring: FamilyScoringConfig{
+			Weights: ScoringWeights{
+				TrendStructure: 20, MomentumAlignment: 30,
+				VolumeParticipation: 25, EntryQuality: 15, PatternStrength: 10,
+			},
+			Thresholds: ScoringThresholds{StructuralCandidate: 45, EntryReady: 68},
+		},
+		RSI:          FamilyRSIBands{IdealMin: 55, IdealMax: 72, AcceptableMin: 45, AcceptableMax: 80},
+		ExtensionPct: FamilyExtensionBands{IdealMax: 5.0, AcceptableMax: 12.0, HardReject: 18.0},
+		Volume:       FamilyVolumeBands{StrongMin: 2.0, AdequateMin: 1.5},
+		EMAGapPct:    FamilyEMAGapBands{StrongMin: 0.0, AdequateMin: 0.0},
+		EntryConditions: FamilyEntryConditions{
+			VolumeMin: 1.5, RSIMin: 45, RSIMax: 80, ExtensionMaxPct: 12.0,
+		},
+		Options:    FamilyOptionsBand{DTEMin: 7, DTEMax: 14, DeltaMin: 0.45, DeltaMax: 0.70},
+		HoldWindow: HoldWindow{Min: 2, Base: 7, Max: 10},
+	}
+	bearContFamily := FamilyConfig{
+		Direction: "bearish", OptionType: "put",
+		Preconditions: FamilyPreconditions{
+			EMA20BelowEMA50: true, EMA20BelowEMA100: true,
+			CloseBelowEMA20: true, MACDHistNegative: true,
+		},
+		Scoring: FamilyScoringConfig{
+			Weights: ScoringWeights{
+				TrendStructure: 30, MomentumAlignment: 25,
+				VolumeParticipation: 20, EntryQuality: 15, PatternStrength: 10,
+			},
+			Thresholds: ScoringThresholds{StructuralCandidate: 45, EntryReady: 65},
+		},
+		RSI:          FamilyRSIBands{IdealMin: 32, IdealMax: 45, AcceptableMin: 26, AcceptableMax: 50},
+		ExtensionPct: FamilyExtensionBands{IdealMax: 5.0, AcceptableMax: 10.0, HardReject: 15.0},
+		Volume:       FamilyVolumeBands{StrongMin: 1.5, AdequateMin: 1.2},
+		EMAGapPct:    FamilyEMAGapBands{StrongMin: 3.0, AdequateMin: 0.5},
+		EntryConditions: FamilyEntryConditions{
+			VolumeMin: 1.2, RSIMin: 26, RSIMax: 50, ExtensionMaxPct: 10.0,
+		},
+		Options:    FamilyOptionsBand{DTEMin: 10, DTEMax: 21, DeltaMin: 0.45, DeltaMax: 0.65},
+		HoldWindow: HoldWindow{Min: 5, Base: 12, Max: 20},
+	}
+	bearMomFamily := FamilyConfig{
+		Direction: "bearish", OptionType: "put",
+		Preconditions: FamilyPreconditions{
+			CloseBelowEMA20: true, EMA20SlopeNegative: true,
+		},
+		Scoring: FamilyScoringConfig{
+			Weights: ScoringWeights{
+				TrendStructure: 20, MomentumAlignment: 30,
+				VolumeParticipation: 25, EntryQuality: 15, PatternStrength: 10,
+			},
+			Thresholds: ScoringThresholds{StructuralCandidate: 45, EntryReady: 68},
+		},
+		RSI:          FamilyRSIBands{IdealMin: 28, IdealMax: 45, AcceptableMin: 20, AcceptableMax: 55},
+		ExtensionPct: FamilyExtensionBands{IdealMax: 5.0, AcceptableMax: 12.0, HardReject: 18.0},
+		Volume:       FamilyVolumeBands{StrongMin: 2.0, AdequateMin: 1.5},
+		EMAGapPct:    FamilyEMAGapBands{StrongMin: 0.0, AdequateMin: 0.0},
+		EntryConditions: FamilyEntryConditions{
+			VolumeMin: 1.5, RSIMin: 20, RSIMax: 55, ExtensionMaxPct: 12.0,
+		},
+		Options:    FamilyOptionsBand{DTEMin: 7, DTEMax: 14, DeltaMin: 0.45, DeltaMax: 0.70},
+		HoldWindow: HoldWindow{Min: 2, Base: 7, Max: 10},
+	}
+	return &Rules{
+		Version: 6,
+		Global: GlobalConfig{
+			FeatureWindows: FeatureWindowsConfig{
+				EMAShort: 20, EMAMedium: 50, EMALong: 100,
+				RSIPeriod: 14, MACDFast: 12, MACDSlow: 26, MACDSignal: 9,
+				ATRPeriod: 14, VolumeAvgPeriod: 20, EMASlopeLookback: 5,
+			},
+			DataQuality: DataQualityConfig{MinBarsRequired: 35},
+		},
+		Regime: RegimeConfig{
+			HardBlocks: RegimeHardBlocks{VIXMax: 24.0, BTCRoc20Min: 0.0},
+		},
+		Penalties: PenaltiesConfig{
+			LateStageExtension: 15, DistributionSevere: 20,
+			RSIOverextendedBullish: 10, RSIOversoldBearish: 10,
+		},
+		Families: map[string]FamilyConfig{
+			"bullish_continuation":      bullContFamily,
+			"bullish_momentum_breakout": bullMomFamily,
+			"bearish_continuation":      bearContFamily,
+			"bearish_momentum_breakdown": bearMomFamily,
+		},
+		PatternScoreConfig: PatternScoreConfig{
+			Bullish: map[string]int{
+				"bull_flag": 3, "tight_base": 3, "flat_base": 2,
+				"higher_low_continuation": 2, "volatility_contraction_breakout": 3,
+				"relative_strength_bullish": 2,
+			},
+			Bearish: map[string]int{
+				"bear_flag": 3, "lower_high_breakdown": 2,
+				"volatility_contraction_breakdown": 3, "relative_weakness_bearish": 2,
+			},
+		},
+		AntiPatternConfig: AntiPatternConfig{
+			BullishReject: []string{"late_stage_extension", "distribution_severe"},
+		},
+		EventBlocks: EventBlocksConfig{
+			EarningsBlackoutDays: 5, BinaryEventBlackoutDays: 3,
+			IfBlockedStatus: "blocked_by_event",
+		},
+		StateRules: StateRulesConfig{
+			StructuralCandidateIsWatchlistOnly:  true,
+			EntryReadyCanSurfacePreopen:         true,
+			ConfirmedRequiredForTradeOutput:     true,
+			BlockedByEventOverridesEntryReady:   true,
+			BlockedByEventOverridesConfirmed:    true,
 		},
 		OptionsTranslation: OptionsTranslationConfig{
 			LiquidityFilters: LiquidityFilters{
-				MinOpenInterest:         500,
-				MinOptionVolume:         100,
-				MaxBidAskSpreadPctOfMid: 5.0,
+				MinOpenInterest: 100, MinOptionVolume: 10, MaxBidAskSpreadPctOfMid: 10.0,
 			},
 			HideOptionsForStatuses: []string{
 				"rejected", "structural_candidate", "entry_ready", "watch_only", "blocked_by_event",
 			},
 		},
-		StateRules: StateRulesConfig{
-			StructuralCandidateIsWatchlistOnly:       true,
-			EntryReadyCanSurfacePreopen:              true,
-			ConfirmedRequiredForTradeOutput:          true,
-			ConfirmedRequiredForOptionsEvaluation:    true,
-			HideOptionOutputUntilUnderlyingConfirmed: true,
-			BlockedByEventOverridesEntryReady:        true,
-			BlockedByEventOverridesConfirmed:         true,
-		},
-		EventBlocks: EventBlocksConfig{
-			EarningsBlackoutDays:    5,
-			BinaryEventBlackoutDays: 3,
-			IfBlockedStatus:         "blocked_by_event",
-		},
-		Scoring: ScoringConfig{
-			ShowScoreOnlyFor: []string{"entry_ready", "confirmed", "options_ready", "options_confirmed"},
-			HideScoreFor:     []string{"rejected", "structural_candidate", "watch_only", "blocked_by_event"},
-		},
-		UIRules: UIRulesConfig{
-			Sections: []string{
-				"confirmed", "entry_ready", "structural_candidate",
-				"blocked_by_event", "watch_only", "no_trade_today_summary",
-			},
-			StructuralCandidate: UIStatusRule{Label: "WATCHLIST", ShowReasonWhatIsMissing: true},
-			BlockedByEvent:      UIStatusRule{Label: "BLOCKED BY EVENT", ShowReasonWhatIsMissing: true},
-			EntryReady:          UIStatusRule{Label: "PRE-OPEN CANDIDATE", ShowReasonWhatIsMissing: true},
-			Confirmed:           UIStatusRule{Label: "CONFIRMED", ShowTradeButton: true, ShowOptionOutput: true},
-		},
-		DailyOutput: DailyOutputConfig{
-			AllowZeroTradeDay:         true,
-			NoTradeDayWhenNoConfirmed: true,
-			NoTradeDayMessage:         "No symbols reached confirmed status. Watchlist candidates may still exist.",
-		},
 		OpenConfirmation: OpenConfirmationConfig{
-			Enabled:                   true,
-			ConfirmationWindowMinutes: 10,
-			MinTrueSignalsToConfirm:   3,
+			Enabled: true, ConfirmationWindowMinutes: 10, MinTrueSignalsToConfirm: 3,
 			Checks: ConfirmationChecks{
-				BreakoutOrReclaimHolds:                 true,
-				OpeningRangeCloseAboveMidpointForCalls: true,
-				OpeningRangeCloseBelowMidpointForPuts:  true,
-				NoRejectionWickForCalls:                true,
-				NoReversalTailForPuts:                  true,
-				OpeningVolumeSupport:                   true,
-				MarketOpenAlignment:                    true,
+				BreakoutOrReclaimHolds: true, OpeningRangeCloseAboveMidpointForCalls: true,
+				OpeningRangeCloseBelowMidpointForPuts: true, NoRejectionWickForCalls: true,
+				NoReversalTailForPuts: true, OpeningVolumeSupport: true, MarketOpenAlignment: true,
 			},
 			AutoReject: AutoRejectChecks{
-				DecisiveLevelLoss:       true,
-				WeakFirst10mClose:       true,
-				HardOpenReversal:        true,
-				BroadMarketRiskoffShock: true,
-				DownsideRejectionVolume: true,
+				DecisiveLevelLoss: true, WeakFirst10mClose: true, HardOpenReversal: true,
+				BroadMarketRiskoffShock: true, DownsideRejectionVolume: true,
 			},
+		},
+		Scoring: ScoringConfig{
+			ShowScoreOnlyFor: []string{"entry_ready", "confirmed"},
+			HideScoreFor:     []string{"rejected", "structural_candidate", "watch_only", "blocked_by_event"},
+		},
+		DailyOutput: DailyOutputConfig{
+			AllowZeroTradeDay: true, NoTradeDayWhenNoConfirmed: true,
+			NoTradeDayMessage: "No symbols reached confirmed status. Watchlist candidates may still exist.",
 		},
 	}
 }

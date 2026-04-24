@@ -1460,9 +1460,214 @@ func (h *Handler) placeAlpacaOptionOrder(ctx context.Context, posID, ticker, opt
 	if err := store.UpdatePositionAlpacaOrderID(ctx, h.pool, posID, orderID); err != nil {
 		log.Printf("alpaca order: save order ID %s: %v", ticker, err)
 	}
+	// Store OCC symbol and premium so daily review can compute option-level P&L.
+	if err := store.UpdatePositionOptionDetails(ctx, h.pool, posID, best.Symbol, limitPrice); err != nil {
+		log.Printf("alpaca order: save option details %s: %v", ticker, err)
+	}
 
 	log.Printf("alpaca order: confirmed %s symbol=%s order=%s limit=%.2f", ticker, best.Symbol, orderID, limitPrice)
 	return orderID
+}
+
+// RunPositionReview runs the position review immediately (same logic as the
+// Temporal activity at 20:45 UTC). Useful for manual triggers and testing.
+// POST /api/run-position-review
+func (h *Handler) RunPositionReview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx := r.Context()
+	loc, _ := time.LoadLocation("America/Los_Angeles")
+	now := time.Now().In(loc)
+	reviewDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+
+	positions, err := store.GetOpenPositionsForReview(ctx, h.pool)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load positions: %v", err))
+		return
+	}
+	if len(positions) == 0 {
+		writeJSON(w, map[string]any{"reviewed": 0, "exited": 0, "note": "no open positions"})
+		return
+	}
+
+	type enriched struct {
+		pos          store.ReviewablePosition
+		currentPrice float64
+		pnlPct       float64
+		daysHeld     int
+	}
+	var items []enriched
+	var posInputs []claudeclient.PositionInput
+
+	for _, p := range positions {
+		pnlPct := 0.0
+		currentPrice := 0.0
+
+		if p.OptionSymbol != "" && p.OptionPremium > 0 {
+			midPrice, midErr := h.alpaca.FetchOptionMidPrice(p.OptionSymbol)
+			if midErr != nil {
+				log.Printf("position-review: option mid %s (%s): %v — stock fallback", p.Ticker, p.OptionSymbol, midErr)
+				stockPrice, _ := h.alpaca.FetchLatestQuote(p.Ticker)
+				if stockPrice <= 0 {
+					stockPrice = p.EntryPrice
+				}
+				currentPrice = stockPrice
+				if p.EntryPrice > 0 {
+					move := (stockPrice - p.EntryPrice) / p.EntryPrice * 100.0
+					if p.OptionType == "put" {
+						pnlPct = -move
+					} else {
+						pnlPct = move
+					}
+				}
+			} else {
+				currentPrice = midPrice
+				pnlPct = (midPrice - p.OptionPremium) / p.OptionPremium * 100.0
+				log.Printf("position-review: option P&L %s %s: mid=%.2f premium=%.2f pnl=%.1f%%",
+					p.Ticker, p.OptionSymbol, midPrice, p.OptionPremium, pnlPct)
+			}
+		} else {
+			stockPrice, _ := h.alpaca.FetchLatestQuote(p.Ticker)
+			if stockPrice <= 0 {
+				stockPrice = p.EntryPrice
+			}
+			currentPrice = stockPrice
+			if p.EntryPrice > 0 {
+				move := (stockPrice - p.EntryPrice) / p.EntryPrice * 100.0
+				if p.OptionType == "put" {
+					pnlPct = -move
+				} else {
+					pnlPct = move
+				}
+			}
+		}
+
+		daysHeld := int(now.Sub(p.EntryDate.UTC()).Hours() / 24)
+		dte := 14 - daysHeld
+		if dte < 0 {
+			dte = 0
+		}
+		items = append(items, enriched{pos: p, currentPrice: currentPrice, pnlPct: pnlPct, daysHeld: daysHeld})
+		posInputs = append(posInputs, claudeclient.PositionInput{
+			Ticker:     p.Ticker,
+			OptionType: p.OptionType,
+			EntryPrice: p.OptionPremium,
+			CurrentPnL: pnlPct,
+			DTE:        dte,
+			Status:     "open",
+		})
+	}
+
+	vixLevel, _, _ := h.fred.FetchLatestVIX()
+	systemPrompt := claudeclient.BuildSystemPrompt()
+	claudeCli := claudeclient.NewClient(h.cfg.AnthropicAPIKey, "claude-sonnet-4-6", h.cfg.ClaudeMaxOutputTokens, systemPrompt)
+	payload := claudeclient.RuntimePayload{
+		ScanTimePT:    now.Format("15:04"),
+		MarketContext: claudeclient.MarketContext{VIX: vixLevel, MacroNewsBias: "neutral"},
+		OpenPositions: posInputs,
+		Candidates:    []claudeclient.CandidateInput{},
+	}
+	decision, claudeErr := claudeCli.DecideOptions(payload)
+	reviewByTicker := make(map[string]claudeclient.PositionReview)
+	if claudeErr != nil {
+		log.Printf("position-review: Claude error: %v — defaulting to HOLD", claudeErr)
+	} else {
+		for _, rv := range decision.OpenPositionReview {
+			reviewByTicker[rv.Ticker] = rv
+		}
+	}
+
+	type reviewResult struct {
+		Ticker  string  `json:"ticker"`
+		PnLPct  float64 `json:"pnl_pct"`
+		Action  string  `json:"action"`
+		Reason  string  `json:"reason"`
+		Exited  bool    `json:"exited"`
+	}
+	var results []reviewResult
+	exitedCount := 0
+
+	for _, e := range items {
+		p := e.pos
+		action := "HOLD"
+		rationale := "defaulted to HOLD"
+		if rv, ok := reviewByTicker[p.Ticker]; ok {
+			action = mapReviewAction(rv.Status)
+			rationale = rv.Reason
+		}
+		executed := false
+		if action == "EXIT" {
+			// Place sell order on Alpaca before marking closed in DB.
+			if p.OptionSymbol != "" {
+				sellPrice := e.currentPrice // option mid-price fetched above
+				if sellPrice <= 0 {
+					sellPrice, _ = h.alpaca.FetchOptionMidPrice(p.OptionSymbol)
+				}
+				if sellPrice > 0 {
+					orderID, sellErr := h.alpaca.SellOptionOrder(p.OptionSymbol, sellPrice)
+					if sellErr != nil {
+						log.Printf("position-review: alpaca sell %s (%s): %v", p.Ticker, p.OptionSymbol, sellErr)
+					} else {
+						log.Printf("position-review: alpaca sell order placed %s symbol=%s order=%s limit=%.2f",
+							p.Ticker, p.OptionSymbol, orderID, sellPrice)
+					}
+				}
+			}
+			if closeErr := store.ClosePosition(ctx, h.pool, p.ID, e.currentPrice, e.pnlPct, "review_exit"); closeErr != nil {
+				log.Printf("position-review: close %s: %v", p.Ticker, closeErr)
+			} else {
+				_ = store.InsertPositionEvent(ctx, h.pool, p.ID, p.Ticker, "position_closed",
+					e.currentPrice, map[string]any{"reason": "review_exit", "pnl_pct": e.pnlPct})
+				executed = true
+				exitedCount++
+				log.Printf("position-review: closed %s pnl=%.2f%%", p.Ticker, e.pnlPct)
+			}
+		}
+		_ = store.UpsertPositionReview(ctx, h.pool, store.PositionReviewInput{
+			PositionID:      p.ID,
+			Ticker:          p.Ticker,
+			ReviewDate:      reviewDate,
+			CurrentPrice:    e.currentPrice,
+			PnLPctToday:     e.pnlPct,
+			DaysHeld:        e.daysHeld,
+			SuggestedAction: action,
+			ActionRationale: rationale,
+			ActionExecuted:  executed,
+		})
+		results = append(results, reviewResult{
+			Ticker: p.Ticker,
+			PnLPct: e.pnlPct,
+			Action: action,
+			Reason: rationale,
+			Exited: executed,
+		})
+	}
+	writeJSON(w, map[string]any{
+		"reviewed": len(results),
+		"exited":   exitedCount,
+		"results":  results,
+	})
+}
+
+// mapReviewAction converts Claude's position status to a DB action.
+// partial_profit maps to EXIT: paper trades use 1 contract and cannot be split.
+func mapReviewAction(claudeStatus string) string {
+	switch claudeStatus {
+	case "hold":
+		return "HOLD"
+	case "tighten_trail":
+		return "HOLD_TIGHTEN_STOP"
+	case "partial_profit":
+		return "EXIT" // 1 contract = no partial; treat as full exit
+	case "exit_now":
+		return "EXIT"
+	case "exit_on_trigger":
+		return "WATCH_CLOSELY"
+	default:
+		return "HOLD"
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

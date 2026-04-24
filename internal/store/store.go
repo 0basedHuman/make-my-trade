@@ -534,6 +534,17 @@ func UpdatePositionAlpacaOrderID(ctx context.Context, pool *pgxpool.Pool, positi
 	return err
 }
 
+// UpdatePositionOptionDetails stores the OCC option symbol and premium paid.
+// Called alongside UpdatePositionAlpacaOrderID so the daily review can compute
+// correct option-level P&L instead of using the underlying stock price.
+func UpdatePositionOptionDetails(ctx context.Context, pool *pgxpool.Pool, positionID, optionSymbol string, premium float64) error {
+	_, err := pool.Exec(ctx,
+		`UPDATE paper_positions SET option_symbol=$2, option_premium=$3 WHERE id=$1`,
+		positionID, optionSymbol, premium,
+	)
+	return err
+}
+
 // InsertPositionEvent appends one lifecycle event to paper_position_events.
 // payload is serialised to JSONB; pass nil for an empty payload.
 func InsertPositionEvent(ctx context.Context, pool *pgxpool.Pool, positionID, ticker, eventType string, priceAtEvent float64, payload map[string]any) error {
@@ -600,16 +611,18 @@ ON CONFLICT (position_id, review_date) DO UPDATE SET
 	return err
 }
 
-// ReviewablePosition is a PaperPosition augmented with review-context fields
-// that are stored in the migration-004 columns (option_type, setup_family).
+// ReviewablePosition is a PaperPosition augmented with review-context fields.
+// option_symbol and option_premium (migration 000005) enable correct option P&L.
 type ReviewablePosition struct {
 	PaperPosition
-	OptionType  string
-	SetupFamily string
+	OptionType    string
+	SetupFamily   string
+	OptionSymbol  string  // OCC contract symbol, e.g. "RTX260508P00190000"; "" if not set
+	OptionPremium float64 // premium paid per contract in $; 0 if not set (old positions)
 }
 
-// GetOpenPositionsForReview returns open positions with option_type and
-// setup_family populated (added in migration 000004).
+// GetOpenPositionsForReview returns open positions with option_type, setup_family,
+// option_symbol, and option_premium populated (migrations 000004 + 000005).
 func GetOpenPositionsForReview(ctx context.Context, pool *pgxpool.Pool) ([]ReviewablePosition, error) {
 	rows, err := pool.Query(ctx, `
 SELECT id, ticker, status,
@@ -617,7 +630,8 @@ SELECT id, ticker, status,
        stop_loss, COALESCE(target1,0), COALESCE(target2,0),
        COALESCE(exit_price,0), COALESCE(realized_pnl_pct,0),
        opened_at, COALESCE(notes,''),
-       COALESCE(option_type,'call'), COALESCE(setup_family,'')
+       COALESCE(option_type,'call'), COALESCE(setup_family,''),
+       COALESCE(option_symbol,''), COALESCE(option_premium,0)
 FROM paper_positions WHERE status='open'
 ORDER BY opened_at DESC`)
 	if err != nil {
@@ -634,6 +648,7 @@ ORDER BY opened_at DESC`)
 			&p.ExitPrice, &p.RealizedPnLPct,
 			&p.OpenedAt, &p.Notes,
 			&p.OptionType, &p.SetupFamily,
+			&p.OptionSymbol, &p.OptionPremium,
 		); err != nil {
 			return nil, err
 		}

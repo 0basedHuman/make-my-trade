@@ -578,6 +578,104 @@ func (c *AlpacaClient) PlaceOptionOrder(symbol string, limitPrice float64) (stri
 	return result.ID, nil
 }
 
+// SellOptionOrder places a day limit sell order to close an existing option position.
+// Uses the current bid as the limit price (conservative — fills if bid is touched).
+// Returns the Alpaca order ID on success.
+func (c *AlpacaClient) SellOptionOrder(symbol string, limitPrice float64) (string, error) {
+	body := map[string]interface{}{
+		"symbol":        symbol,
+		"qty":           "1",
+		"side":          "sell",
+		"type":          "limit",
+		"time_in_force": "day",
+		"limit_price":   fmt.Sprintf("%.2f", limitPrice),
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	reqURL := fmt.Sprintf("%s/v2/orders", c.tradeURL)
+	req, err := http.NewRequest("POST", reqURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("APCA-API-KEY-ID", c.apiKey)
+	req.Header.Set("APCA-API-SECRET-KEY", c.secretKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("alpaca sell: %w", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		return "", fmt.Errorf("alpaca sell HTTP %d: %s", resp.StatusCode, truncateBody(respBody, 300))
+	}
+
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("alpaca sell decode: %w", err)
+	}
+	if result.ID == "" {
+		return "", fmt.Errorf("alpaca sell: empty order ID: %s", truncateBody(respBody, 200))
+	}
+	return result.ID, nil
+}
+
+// FetchOptionMidPrice returns the current bid/ask midpoint for a single OCC option
+// symbol (e.g. "RTX260508P00190000"). Used by RunPositionReviewActivity to compute
+// accurate option-level P&L instead of using the underlying stock price.
+//
+// Uses the generic multi-symbol snapshots endpoint (no underlying in path).
+// Returns 0 and an error if the contract has no quote data.
+func (c *AlpacaClient) FetchOptionMidPrice(occSymbol string) (float64, error) {
+	// Endpoint: /v1beta1/options/snapshots?symbols=<OCC>&feed=indicative
+	// The per-underlying path (/snapshots/{ticker}?symbols=...) is not supported.
+	reqURL := fmt.Sprintf("%s/v1beta1/options/snapshots?symbols=%s&feed=indicative",
+		c.dataURL, occSymbol)
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("APCA-API-KEY-ID", c.apiKey)
+	req.Header.Set("APCA-API-SECRET-KEY", c.secretKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("alpaca option quote HTTP %d: %s", resp.StatusCode, truncateBody(body, 100))
+	}
+
+	var result struct {
+		Snapshots map[string]alpacaOptionSnapshot `json:"snapshots"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, fmt.Errorf("alpaca option quote decode: %w", err)
+	}
+
+	snap, ok := result.Snapshots[occSymbol]
+	if !ok {
+		return 0, fmt.Errorf("alpaca option quote: symbol %q not in response", occSymbol)
+	}
+
+	bid := snap.Quote.Bid
+	ask := snap.Quote.Ask
+	if bid <= 0 && ask <= 0 {
+		return 0, fmt.Errorf("alpaca option quote: no bid/ask for %q", occSymbol)
+	}
+	if bid <= 0 {
+		return ask, nil
+	}
+	return (bid + ask) / 2.0, nil
+}
+
 // FetchLatestQuote returns the latest trade price for a symbol.
 // Used for position mark-to-market.
 func (c *AlpacaClient) FetchLatestQuote(ticker string) (float64, error) {

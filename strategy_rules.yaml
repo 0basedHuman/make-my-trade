@@ -1,126 +1,409 @@
-version: 5
+version: 6
 
-# =========================================
-# MARKET REGIME HARD GATES
-# =========================================
-# VIX >= vix_max: ALL new entries blocked.
-# BTC 20d ROC < btc_roc20_min: bullish setups blocked.
-market_regime:
-  hard_rules:
-    vix_max: 24.0
-    btc_roc20_min: 0.0
+# ============================================================
+# GLOBAL — feature computation windows and data quality gates.
+# Engine reads these; indicator periods are not hardcoded in Go.
+# ============================================================
+global:
+  feature_windows:
+    ema_short: 20
+    ema_medium: 50
+    ema_long: 100
+    rsi_period: 14
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    atr_period: 14
+    volume_avg_period: 20
+    ema_slope_lookback: 5      # bars used to measure EMA20 slope as % change
+  data_quality:
+    min_bars_required: 35      # minimum daily bars for MACD(12,26,9) + RSI(14) + ATR(14)
 
 
-# =========================================
-# SETUP FAMILIES
-# Keys must match engine lookup: bullish_continuation,
-# bullish_momentum_breakout, bearish_continuation, bearish_momentum_breakdown
-# =========================================
-setup_families:
+# ============================================================
+# REGIME — universal hard blocks checked before any family.
+# A failing regime check rejects ALL candidates immediately.
+# ============================================================
+regime:
+  hard_blocks:
+    vix_max: 24.0         # VIX >= this → all new entries blocked
+    btc_roc20_min: 0.0    # BTC 20d ROC < this → bullish families blocked
 
+
+# ============================================================
+# PENALTIES — subtracted from weighted score after scoring.
+# Values are points on the 0-100 scale.
+# Applied additively: a ticker can accumulate multiple penalties.
+# ============================================================
+penalties:
+  late_stage_extension: 15      # price > 2× ATR extended from EMA20
+  distribution_severe: 20       # 4+ distribution days in last 25 bars
+  rsi_overextended_bullish: 10  # RSI > 78 for bullish families (not a hard block)
+  rsi_oversold_bearish: 10      # RSI < 22 for bearish families
+
+
+# ============================================================
+# FAMILIES — one complete policy block per setup family.
+#
+# Structure per family:
+#   preconditions   → binary gates; ALL must pass or family is skipped
+#   scoring.weights → 5 dimensions summing to 100
+#   scoring.thresholds → minimum score per lifecycle status
+#   rsi / extension_pct / volume / ema_gap_pct → sub-thresholds
+#                     used by scoring dimension functions
+#   entry_conditions → hard checks that must ALSO pass for entry_ready
+#                      (score threshold alone is insufficient)
+#   options → DTE and delta target bands
+#   hold_window → trade duration guidance (days)
+# ============================================================
+families:
+
+  # ----------------------------------------------------------
+  # BULLISH CONTINUATION
+  # Thesis: established uptrend with all EMAs aligned bullishly.
+  # Safer entry — more confirmation required before triggering.
+  # ----------------------------------------------------------
   bullish_continuation:
-    description: "EMA20 > EMA100, MACD positive, trend safer entry"
-    pattern_score_min: 0
-    entry_rules:
-      volume_ratio_min: 1.2
+    direction: bullish
+    option_type: call
+    description: >
+      EMA20 > EMA50 > EMA100 with price above EMA20 and positive MACD.
+      Continuation of an established uptrend. Higher score bar reflects
+      that structure must be unambiguous before entry.
+
+    # All must be true — one false = family skipped, not scored.
+    preconditions:
+      ema20_above_ema50: true
+      ema20_above_ema100: true
+      close_above_ema20: true
+      macd_histogram_positive: true
+      btc_regime_not_negative: true   # BTC ROC >= 0
+
+    scoring:
+      # Weights sum to 100. Engine scores each dimension 0.0-1.0.
+      # Final score = sum(dimension_score × weight).
+      weights:
+        trend_structure: 30      # EMA stack depth and separation quality
+        momentum_alignment: 25   # MACD histogram magnitude + RSI position
+        volume_participation: 20 # relative volume vs thresholds
+        entry_quality: 15        # extension from EMA20 + RSI range tightness
+        pattern_strength: 10     # detected pattern bonus from pattern_scores
+
+      # Minimum score (0-100) to receive each lifecycle status.
+      # A ticker scoring below structural_candidate → rejected.
+      # A ticker scoring below entry_ready OR failing entry_conditions → structural_candidate.
+      thresholds:
+        structural_candidate: 45
+        entry_ready: 65
+
+    # Used by momentum_alignment dimension to score RSI position.
+    # ideal range → 1.0 score; acceptable range → 0.5; outside → 0.0.
+    rsi:
+      ideal_min: 55
+      ideal_max: 68
+      acceptable_min: 50
+      acceptable_max: 74
+
+    # Used by entry_quality dimension.
+    # extension_pct = (close - EMA20) / EMA20 * 100 (positive = above EMA20).
+    extension_pct:
+      ideal_max: 5.0        # <= ideal_max → full entry_quality score
+      acceptable_max: 10.0  # <= acceptable_max → half score
+      hard_reject: 15.0     # > hard_reject → entry_quality = 0
+
+    # Used by volume_participation dimension.
+    volume:
+      strong_min: 1.5       # >= strong → 1.0 score
+      adequate_min: 1.2     # >= adequate → 0.5 score; below → 0.2
+
+    # Used by trend_structure dimension.
+    # ema_gap_pct = (EMA20 - EMA50) / EMA50 * 100 (should be positive).
+    ema_gap_pct:
+      strong_min: 3.0       # >= strong → 1.0 trend score
+      adequate_min: 0.5     # >= adequate → 0.4-0.9 (interpolated)
+
+    # Hard conditions evaluated SEPARATELY from the score.
+    # Even if score >= entry_ready threshold, ALL of these must pass.
+    # Failing any → structural_candidate (never rejected — score still applies).
+    entry_conditions:
+      volume_min: 1.2
       rsi_min: 50
       rsi_max: 74
-      entry_extension_max_pct: 10.0   # % price above EMA20 allowed
+      extension_max_pct: 10.0
 
+    options:
+      dte_min: 10
+      dte_max: 21
+      delta_min: 0.45
+      delta_max: 0.65
+
+    hold_window:
+      min: 5
+      base: 12
+      max: 20
+
+
+  # ----------------------------------------------------------
+  # BULLISH MOMENTUM BREAKOUT
+  # Thesis: price breaking above EMA20 with slope confirming.
+  # Earlier entry — volume requirement is higher to compensate.
+  # ----------------------------------------------------------
   bullish_momentum_breakout:
-    description: "Price > EMA20, EMA20 slope up, breakout entry"
-    pattern_score_min: 0
-    entry_rules:
-      volume_ratio_min: 1.2           # reduced from 1.5 — market-hours volume varies
+    direction: bullish
+    option_type: call
+    description: >
+      Price above EMA20 with EMA20 slope rising. No EMA100 required —
+      early-stage or recovering names qualify. Higher entry_ready threshold
+      reflects the increased false-breakout risk without full trend alignment.
+
+    preconditions:
+      close_above_ema20: true
+      ema20_slope_positive: true
+      btc_regime_not_negative: true
+
+    scoring:
+      weights:
+        trend_structure: 20      # lighter — no EMA100 requirement
+        momentum_alignment: 30   # heavier — momentum IS the thesis
+        volume_participation: 25 # breakouts must have volume to be real
+        entry_quality: 15
+        pattern_strength: 10
+      thresholds:
+        structural_candidate: 45
+        entry_ready: 68          # higher bar: momentum setups are riskier
+
+    rsi:
+      ideal_min: 55
+      ideal_max: 72
+      acceptable_min: 45
+      acceptable_max: 80
+
+    extension_pct:
+      ideal_max: 5.0
+      acceptable_max: 12.0      # momentum allows more extension
+      hard_reject: 18.0
+
+    volume:
+      strong_min: 2.0           # breakouts need strong volume
+      adequate_min: 1.5
+
+    ema_gap_pct:                 # not meaningful without EMA50 requirement
+      strong_min: 0.0
+      adequate_min: 0.0
+
+    entry_conditions:
+      volume_min: 1.5            # higher bar for momentum
       rsi_min: 45
       rsi_max: 80
-      entry_extension_max_pct: 12.0   # momentum allows more extension
+      extension_max_pct: 12.0
 
+    options:
+      dte_min: 7
+      dte_max: 14
+      delta_min: 0.45
+      delta_max: 0.70
+
+    hold_window:
+      min: 2
+      base: 7
+      max: 10
+
+
+  # ----------------------------------------------------------
+  # BEARISH CONTINUATION
+  # Thesis: established downtrend with all EMAs aligned bearishly.
+  # Safer entry — full EMA stack required.
+  # ----------------------------------------------------------
   bearish_continuation:
-    description: "EMA20 < EMA100, MACD negative, trend safer entry"
-    pattern_score_min: 0
-    entry_rules:
-      volume_ratio_min: 1.2
+    direction: bearish
+    option_type: put
+    description: >
+      EMA20 < EMA50 < EMA100 with price below EMA20 and negative MACD.
+      Continuation of an established downtrend. BTC regime not required —
+      bearish setups can occur in mixed or negative crypto environments.
+
+    preconditions:
+      ema20_below_ema50: true
+      ema20_below_ema100: true
+      close_below_ema20: true
+      macd_histogram_negative: true
+
+    scoring:
+      weights:
+        trend_structure: 30
+        momentum_alignment: 25
+        volume_participation: 20
+        entry_quality: 15
+        pattern_strength: 10
+      thresholds:
+        structural_candidate: 45
+        entry_ready: 65
+
+    rsi:
+      ideal_min: 32             # bearish: ideal RSI is in the 32-45 range
+      ideal_max: 45
+      acceptable_min: 26
+      acceptable_max: 50
+
+    extension_pct:              # bearish: (EMA20 - close) / EMA20 * 100
+      ideal_max: 5.0
+      acceptable_max: 10.0
+      hard_reject: 15.0
+
+    volume:
+      strong_min: 1.5
+      adequate_min: 1.2
+
+    ema_gap_pct:                # |EMA20 - EMA50| / EMA50 * 100
+      strong_min: 3.0
+      adequate_min: 0.5
+
+    entry_conditions:
+      volume_min: 1.2
       rsi_min: 26
       rsi_max: 50
-      entry_extension_max_pct: 10.0   # % price below EMA20 allowed
+      extension_max_pct: 10.0
 
+    options:
+      dte_min: 10
+      dte_max: 21
+      delta_min: 0.45
+      delta_max: 0.65
+
+    hold_window:
+      min: 5
+      base: 12
+      max: 20
+
+
+  # ----------------------------------------------------------
+  # BEARISH MOMENTUM BREAKDOWN
+  # Thesis: price breaking below EMA20 with slope confirming.
+  # Earlier entry — higher volume and score requirements.
+  # ----------------------------------------------------------
   bearish_momentum_breakdown:
-    description: "Price < EMA20, EMA20 slope down, breakdown entry"
-    pattern_score_min: 0
-    entry_rules:
-      volume_ratio_min: 1.2
+    direction: bearish
+    option_type: put
+    description: >
+      Price below EMA20 with EMA20 slope falling. No EMA100 required.
+      Faster-moving setup with higher false-breakdown risk; higher score
+      threshold required to compensate.
+
+    preconditions:
+      close_below_ema20: true
+      ema20_slope_negative: true
+
+    scoring:
+      weights:
+        trend_structure: 20
+        momentum_alignment: 30
+        volume_participation: 25
+        entry_quality: 15
+        pattern_strength: 10
+      thresholds:
+        structural_candidate: 45
+        entry_ready: 68
+
+    rsi:
+      ideal_min: 28
+      ideal_max: 45
+      acceptable_min: 20
+      acceptable_max: 55
+
+    extension_pct:
+      ideal_max: 5.0
+      acceptable_max: 12.0
+      hard_reject: 18.0
+
+    volume:
+      strong_min: 2.0
+      adequate_min: 1.5
+
+    ema_gap_pct:
+      strong_min: 0.0
+      adequate_min: 0.0
+
+    entry_conditions:
+      volume_min: 1.5
       rsi_min: 20
       rsi_max: 55
-      entry_extension_max_pct: 12.0
+      extension_max_pct: 12.0
 
+    options:
+      dte_min: 7
+      dte_max: 14
+      delta_min: 0.45
+      delta_max: 0.70
 
-# =========================================
-# TARGET MODEL + HOLD WINDOWS
-# Keys must match engine: target_model.bullish_continuation etc.
-# =========================================
-target_model:
-  use_arbitrary_percent_targets: false
-
-  bullish_continuation:
-    base_target_sources: ["nearest_resistance", "swing_high"]
-    stretch_target_sources: ["measured_move", "atr_extension"]
-    hold_window_days:
-      min: 5
-      base: 12
-      max: 20
-
-  bullish_momentum_breakout:
-    base_target_sources: ["nearest_resistance", "swing_high"]
-    stretch_target_sources: ["measured_move", "atr_extension"]
-    hold_window_days:
-      min: 2
-      base: 7
-      max: 10
-
-  bearish_continuation:
-    base_target_sources: ["nearest_support", "swing_low"]
-    stretch_target_sources: ["measured_move", "atr_extension"]
-    hold_window_days:
-      min: 5
-      base: 12
-      max: 20
-
-  bearish_momentum_breakdown:
-    base_target_sources: ["nearest_support", "swing_low"]
-    stretch_target_sources: ["measured_move", "atr_extension"]
-    hold_window_days:
+    hold_window:
       min: 2
       base: 7
       max: 10
 
 
-# =========================================
+# ============================================================
+# PATTERN SCORES
+# Integer points per detected pattern; summed by the engine
+# to compute the pattern_strength scoring dimension.
+# Max useful sum ≈ 8 (normalized to 0-1 within the engine).
+# ============================================================
+pattern_scores:
+  bullish:
+    bull_flag: 3
+    tight_base: 3
+    flat_base: 2
+    higher_low_continuation: 2
+    volatility_contraction_breakout: 3
+    relative_strength_bullish: 2
+  bearish:
+    bear_flag: 3
+    lower_high_breakdown: 2
+    volatility_contraction_breakdown: 3
+    relative_weakness_bearish: 2
+
+
+# ============================================================
+# ANTI-PATTERNS
+# Presence triggers score penalty (from penalties section).
+# These are checked after scoring; they do NOT hard-block unless
+# the penalty drops the score below structural_candidate threshold.
+# ============================================================
+anti_patterns:
+  bullish_reject:
+    - late_stage_extension
+    - distribution_severe
+  bearish_reject: []
+
+
+# ============================================================
+# EVENT BLOCKS
+# Override lifecycle status after family scoring is complete.
+# Takes precedence over entry_ready and structural_candidate.
+# ============================================================
+event_blocks:
+  earnings_blackout_days: 5
+  binary_event_blackout_days: 3
+  if_blocked_status: "blocked_by_event"
+
+
+# ============================================================
+# STATE RULES
+# Declarative lifecycle flags read by engine and handlers.
+# ============================================================
+state_rules:
+  structural_candidate_is_watchlist_only: true
+  entry_ready_can_surface_preopen: true
+  confirmed_required_for_trade_output: true
+  blocked_by_event_overrides_entry_ready: true
+  blocked_by_event_overrides_confirmed: true
+
+
+# ============================================================
 # OPTIONS TRANSLATION
-# =========================================
+# Top-level section for handlers.go backward compatibility.
+# Per-family DTE/delta bands live in families[*].options above.
+# ============================================================
 options_translation:
-  enabled: true
-  by_setup_family:
-    bullish_continuation:
-      preferred_dte_min: 10
-      preferred_dte_max: 21
-      preferred_delta_min: 0.45
-      preferred_delta_max: 0.65
-    bullish_momentum_breakout:
-      preferred_dte_min: 7
-      preferred_dte_max: 14
-      preferred_delta_min: 0.45
-      preferred_delta_max: 0.70
-    bearish_continuation:
-      preferred_dte_min: 10
-      preferred_dte_max: 21
-      preferred_delta_min: 0.45
-      preferred_delta_max: 0.65
-    bearish_momentum_breakdown:
-      preferred_dte_min: 7
-      preferred_dte_max: 14
-      preferred_delta_min: 0.45
-      preferred_delta_max: 0.70
   liquidity_filters:
     min_open_interest: 100
     min_option_volume: 10
@@ -133,31 +416,10 @@ options_translation:
     - blocked_by_event
 
 
-# =========================================
-# EVENT BLOCKS
-# =========================================
-event_blocks:
-  earnings_blackout_days: 5
-  binary_event_blackout_days: 3
-  if_blocked_status: "blocked_by_event"
-
-
-# =========================================
-# STATE RULES
-# =========================================
-state_rules:
-  structural_candidate_is_watchlist_only: true
-  entry_ready_can_surface_preopen: true
-  confirmed_required_for_trade_output: true
-  confirmed_required_for_options_evaluation: true
-  hide_option_output_until_underlying_confirmed: true
-  blocked_by_event_overrides_entry_ready: true
-  blocked_by_event_overrides_confirmed: true
-
-
-# =========================================
+# ============================================================
 # OPEN CONFIRMATION
-# =========================================
+# First-10-minute signals that promote entry_ready → confirmed.
+# ============================================================
 open_confirmation:
   enabled: true
   confirmation_window_minutes: 10
@@ -170,17 +432,22 @@ open_confirmation:
     no_reversal_tail_for_puts: true
     opening_volume_support: true
     market_open_alignment: true
+  auto_reject:
+    decisive_level_loss: true
+    weak_first_10m_close: true
+    hard_open_reversal: true
+    broad_market_riskoff_shock: true
+    downside_rejection_volume: true
 
 
-# =========================================
+# ============================================================
 # SCORING VISIBILITY
-# =========================================
+# Controls whether a numeric score is shown in the UI.
+# ============================================================
 scoring:
   show_score_only_for:
     - entry_ready
     - confirmed
-    - options_ready
-    - options_confirmed
   hide_score_for:
     - rejected
     - structural_candidate
@@ -188,9 +455,9 @@ scoring:
     - blocked_by_event
 
 
-# =========================================
+# ============================================================
 # DAILY OUTPUT
-# =========================================
+# ============================================================
 daily_output:
   allow_zero_trade_day: true
   no_trade_day_when_no_confirmed: true

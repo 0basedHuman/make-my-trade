@@ -98,6 +98,7 @@ func main() {
 	// API
 	mux.HandleFunc("/api/run-analysis", h.RunAnalysis)
 	mux.HandleFunc("/api/run-confirmation", h.RunConfirmation)
+	mux.HandleFunc("/api/run-position-review", h.RunPositionReview)
 	mux.HandleFunc("/api/force-confirm", h.ForceConfirm)
 	mux.HandleFunc("/api/daily-analysis", h.DailyAnalysis)
 	mux.HandleFunc("/api/paper-positions", h.PaperPositions)

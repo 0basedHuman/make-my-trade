@@ -150,12 +150,13 @@ func main() {
 }
 
 // registerSchedules creates the four autonomous Temporal schedules.
-// All times are UTC; they map to America/Los_Angeles as:
+// All times are UTC. America/Los_Angeles offset depends on DST:
+//   PST (Nov–Mar): UTC-8   PDT (Mar–Nov): UTC-7
 //
-//	DailyResearchCycle:        14:00 UTC = 6:00 AM PST (weekdays)
-//	OpeningConfirmationCycle:  14:45 UTC = 6:45 AM PST (weekdays, after 10-min open)
-//	DailyPositionReview:       20:45 UTC = 12:45 PM PST (weekdays, before 1 PM PT close)
-//	WeeklyReviewCycle:         15:00 UTC = 7:00 AM PST (Sunday)
+//	DailyResearchCycle:        14:00 UTC = 6:00 AM PST / 7:00 AM PDT (weekdays)
+//	OpeningConfirmationCycle:  14:45 UTC = 6:45 AM PST / 7:45 AM PDT (weekdays)
+//	DailyPositionReview:       20:45 UTC = 12:45 PM PST / 1:45 PM PDT (weekdays)
+//	WeeklyReviewCycle:         15:00 UTC = 7:00 AM PST / 8:00 AM PDT (Sunday)
 //
 // Each call is idempotent: if a schedule already exists the error is logged and
 // the worker continues — the existing schedule is not touched.

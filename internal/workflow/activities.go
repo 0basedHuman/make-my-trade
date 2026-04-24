@@ -532,15 +532,65 @@ func (d *ActivityDeps) RunPositionReviewActivity(ctx context.Context) (string, e
 	var posInputs []claudeclient.PositionInput
 
 	for _, p := range positions {
-		currentPrice, quoteErr := d.Alpaca.FetchLatestQuote(p.Ticker)
-		if quoteErr != nil {
-			log.Printf("activity: quote %s: %v — using entry price", p.Ticker, quoteErr)
-			currentPrice = p.EntryPrice
-		}
+		// ── Compute option P&L ───────────────────────────────────────────────────
+		// Prefer option-level P&L (migration 000005): fetch current option mid-price
+		// and compare to premium paid. This is correct for both calls and puts:
+		//   (current_option_price - premium_paid) / premium_paid * 100
+		//
+		// Fallback for positions opened before migration 000005 (no option_symbol):
+		// use underlying stock price delta — directionally inverted for puts but
+		// better than nothing. These old positions should be exited naturally.
 		pnlPct := 0.0
-		if p.EntryPrice > 0 {
-			pnlPct = (currentPrice - p.EntryPrice) / p.EntryPrice * 100.0
+		currentPrice := 0.0 // used for exit records; option mid when available
+
+		if p.OptionSymbol != "" && p.OptionPremium > 0 {
+			// New path: option-level P&L.
+			midPrice, midErr := d.Alpaca.FetchOptionMidPrice(p.OptionSymbol)
+			if midErr != nil {
+				log.Printf("activity: option mid-price %s (%s): %v — using stock fallback",
+					p.Ticker, p.OptionSymbol, midErr)
+				// Fall through to stock fallback below.
+				stockPrice, quoteErr := d.Alpaca.FetchLatestQuote(p.Ticker)
+				if quoteErr != nil {
+					stockPrice = p.EntryPrice
+				}
+				currentPrice = stockPrice
+				// For puts: stock down = option up. Approximate via negative of stock move.
+				if p.EntryPrice > 0 {
+					stockMovePct := (stockPrice - p.EntryPrice) / p.EntryPrice * 100.0
+					if p.OptionType == "put" {
+						pnlPct = -stockMovePct
+					} else {
+						pnlPct = stockMovePct
+					}
+				}
+			} else {
+				currentPrice = midPrice
+				pnlPct = (midPrice - p.OptionPremium) / p.OptionPremium * 100.0
+				log.Printf("activity: option P&L %s %s: mid=%.2f premium=%.2f pnl=%.1f%%",
+					p.Ticker, p.OptionSymbol, midPrice, p.OptionPremium, pnlPct)
+			}
+		} else {
+			// Legacy path: no option tracking — use underlying stock price.
+			// Inverted for puts (stock falling = put winning).
+			stockPrice, quoteErr := d.Alpaca.FetchLatestQuote(p.Ticker)
+			if quoteErr != nil {
+				log.Printf("activity: quote %s: %v — using entry price", p.Ticker, quoteErr)
+				stockPrice = p.EntryPrice
+			}
+			currentPrice = stockPrice
+			if p.EntryPrice > 0 {
+				stockMovePct := (stockPrice - p.EntryPrice) / p.EntryPrice * 100.0
+				if p.OptionType == "put" {
+					pnlPct = -stockMovePct
+				} else {
+					pnlPct = stockMovePct
+				}
+			}
+			log.Printf("activity: legacy P&L %s %s: stock=%.2f entry=%.2f pnl=%.1f%% (no option_symbol)",
+				p.Ticker, p.OptionType, currentPrice, p.EntryPrice, pnlPct)
 		}
+
 		daysHeld := int(now.Sub(p.EntryDate).Hours() / 24)
 		dte := 14 - daysHeld
 		if dte < 0 {
@@ -551,7 +601,7 @@ func (d *ActivityDeps) RunPositionReviewActivity(ctx context.Context) (string, e
 		posInputs = append(posInputs, claudeclient.PositionInput{
 			Ticker:     p.Ticker,
 			OptionType: p.OptionType,
-			EntryPrice: p.EntryPrice,
+			EntryPrice: p.OptionPremium, // send premium to Claude, not underlying price
 			CurrentPnL: pnlPct,
 			DTE:        dte,
 			Status:     "open",
@@ -594,6 +644,22 @@ func (d *ActivityDeps) RunPositionReviewActivity(ctx context.Context) (string, e
 
 		executed := false
 		if action == "EXIT" {
+			// Place sell order on Alpaca before marking closed in DB.
+			if p.OptionSymbol != "" {
+				sellPrice := e.currentPrice // option mid-price from earlier fetch
+				if sellPrice <= 0 {
+					sellPrice, _ = d.Alpaca.FetchOptionMidPrice(p.OptionSymbol)
+				}
+				if sellPrice > 0 {
+					orderID, sellErr := d.Alpaca.SellOptionOrder(p.OptionSymbol, sellPrice)
+					if sellErr != nil {
+						log.Printf("activity: alpaca sell %s (%s): %v", p.Ticker, p.OptionSymbol, sellErr)
+					} else {
+						log.Printf("activity: alpaca sell order placed %s symbol=%s order=%s limit=%.2f",
+							p.Ticker, p.OptionSymbol, orderID, sellPrice)
+					}
+				}
+			}
 			if closeErr := store.ClosePosition(ctx, d.Pool, p.ID, e.currentPrice, e.pnlPct, "review_exit"); closeErr != nil {
 				log.Printf("activity: close position %s: %v", p.Ticker, closeErr)
 			} else {
@@ -629,6 +695,7 @@ func (d *ActivityDeps) RunPositionReviewActivity(ctx context.Context) (string, e
 
 // mapPositionAction converts Claude's position review status string to the
 // DB enum value used in position_reviews.suggested_action.
+// partial_profit maps to EXIT: paper trades use 1 contract — no partial exit possible.
 func mapPositionAction(claudeStatus string) string {
 	switch claudeStatus {
 	case "hold":
@@ -636,7 +703,7 @@ func mapPositionAction(claudeStatus string) string {
 	case "tighten_trail":
 		return "HOLD_TIGHTEN_STOP"
 	case "partial_profit":
-		return "PARTIAL_TAKE_PROFIT"
+		return "EXIT" // 1 contract = no partial; treat as full exit
 	case "exit_now":
 		return "EXIT"
 	case "exit_on_trigger":

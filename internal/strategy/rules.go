@@ -45,11 +45,12 @@ type Rules struct {
 	// Per-family DTE/delta bands live in Families[*].Options.
 	OptionsTranslation OptionsTranslationConfig `yaml:"options_translation"`
 
-	OpenConfirmation    OpenConfirmationConfig    `yaml:"open_confirmation"`
-	Scoring             ScoringConfig             `yaml:"scoring"`
-	DailyOutput         DailyOutputConfig         `yaml:"daily_output"`
-	TradeFrequency      TradeFrequencyConfig      `yaml:"trade_frequency"`
-	ClaudeConfirmation  ClaudeConfirmationConfig  `yaml:"claude_confirmation"`
+	OpenConfirmation   OpenConfirmationConfig   `yaml:"open_confirmation"`
+	Scoring            ScoringConfig            `yaml:"scoring"`
+	DailyOutput        DailyOutputConfig        `yaml:"daily_output"`
+	TradeFrequency     TradeFrequencyConfig     `yaml:"trade_frequency"`
+	ClaudeConfirmation ClaudeConfirmationConfig `yaml:"claude_confirmation"`
+	Schedule           ScheduleConfig           `yaml:"schedule"`
 }
 
 // ── Global ────────────────────────────────────────────────────────────────────
@@ -78,8 +79,8 @@ type FeatureWindowsConfig struct {
 	RealizedVolLong  int `yaml:"realized_vol_long"`  // realized vol lookback (long)
 	MomentumShort    int `yaml:"momentum_short"`     // vol-scaled momentum (short, ~63d)
 	MomentumLong     int `yaml:"momentum_long"`      // vol-scaled momentum (long, ~126d)
-	Entropy          int `yaml:"entropy"`             // Shannon entropy of returns
-	Bollinger        int `yaml:"bollinger"`           // Bollinger width window
+	Entropy          int `yaml:"entropy"`            // Shannon entropy of returns
+	Bollinger        int `yaml:"bollinger"`          // Bollinger width window
 }
 
 // DataQualityConfig holds minimum bar requirements before scoring begins.
@@ -253,11 +254,11 @@ type EventBlocksConfig struct {
 
 // StateRulesConfig contains lifecycle flags read by engine and handlers.
 type StateRulesConfig struct {
-	StructuralCandidateIsWatchlistOnly    bool `yaml:"structural_candidate_is_watchlist_only"`
-	EntryReadyCanSurfacePreopen           bool `yaml:"entry_ready_can_surface_preopen"`
-	ConfirmedRequiredForTradeOutput       bool `yaml:"confirmed_required_for_trade_output"`
-	BlockedByEventOverridesEntryReady     bool `yaml:"blocked_by_event_overrides_entry_ready"`
-	BlockedByEventOverridesConfirmed      bool `yaml:"blocked_by_event_overrides_confirmed"`
+	StructuralCandidateIsWatchlistOnly bool `yaml:"structural_candidate_is_watchlist_only"`
+	EntryReadyCanSurfacePreopen        bool `yaml:"entry_ready_can_surface_preopen"`
+	ConfirmedRequiredForTradeOutput    bool `yaml:"confirmed_required_for_trade_output"`
+	BlockedByEventOverridesEntryReady  bool `yaml:"blocked_by_event_overrides_entry_ready"`
+	BlockedByEventOverridesConfirmed   bool `yaml:"blocked_by_event_overrides_confirmed"`
 }
 
 // ── Options translation (handlers.go compat) ──────────────────────────────────
@@ -350,6 +351,21 @@ type ClaudeConfirmationConfig struct {
 	UseDeterministicOpeningEvidence    bool    `yaml:"use_deterministic_opening_evidence"`
 	DeterministicSignalsSoftMin        int     `yaml:"deterministic_signals_soft_min"`
 	DeterministicAutoRejectIsHardBlock bool    `yaml:"deterministic_auto_reject_is_hard_block"`
+}
+
+// ScheduleConfig holds the autonomous trading-day timeline.
+// Times are strings in "HH:MM" 24-hour PT local format.
+// The worker reads these at startup and converts to Temporal cron expressions
+// using TimeZoneName="America/Los_Angeles" so DST is handled automatically.
+type ScheduleConfig struct {
+	Timezone                  string `yaml:"timezone"`                    // IANA name, e.g. "America/Los_Angeles"
+	DailyScanTime             string `yaml:"daily_scan_time"`             // "06:25"
+	OpeningConfirmationTime   string `yaml:"opening_confirmation_time"`   // "06:42"
+	OpeningConfirmationCutoff string `yaml:"opening_confirmation_cutoff"` // "06:55"
+	FirstPositionReviewTime   string `yaml:"first_position_review_time"`  // "07:15"
+	ContinuationReviewTime    string `yaml:"continuation_review_time"`    // "07:45"
+	EndOfDayReviewTime        string `yaml:"end_of_day_review_time"`      // "12:45"
+	WeeklyReviewTime          string `yaml:"weekly_review_time"`          // "07:00"
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -535,9 +551,9 @@ func DefaultRules() *Rules {
 			RSIOverextendedBullish: 10, RSIOversoldBearish: 10,
 		},
 		Families: map[string]FamilyConfig{
-			"bullish_continuation":      bullContFamily,
-			"bullish_momentum_breakout": bullMomFamily,
-			"bearish_continuation":      bearContFamily,
+			"bullish_continuation":       bullContFamily,
+			"bullish_momentum_breakout":  bullMomFamily,
+			"bearish_continuation":       bearContFamily,
 			"bearish_momentum_breakdown": bearMomFamily,
 		},
 		PatternScoreConfig: PatternScoreConfig{
@@ -559,11 +575,11 @@ func DefaultRules() *Rules {
 			IfBlockedStatus: "blocked_by_event",
 		},
 		StateRules: StateRulesConfig{
-			StructuralCandidateIsWatchlistOnly:  true,
-			EntryReadyCanSurfacePreopen:         true,
-			ConfirmedRequiredForTradeOutput:     true,
-			BlockedByEventOverridesEntryReady:   true,
-			BlockedByEventOverridesConfirmed:    true,
+			StructuralCandidateIsWatchlistOnly: true,
+			EntryReadyCanSurfacePreopen:        true,
+			ConfirmedRequiredForTradeOutput:    true,
+			BlockedByEventOverridesEntryReady:  true,
+			BlockedByEventOverridesConfirmed:   true,
 		},
 		OptionsTranslation: OptionsTranslationConfig{
 			LiquidityFilters: LiquidityFilters{

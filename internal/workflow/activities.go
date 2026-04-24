@@ -58,7 +58,7 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 	todayStr := today.Format("2006-01-02")
 	scanTime := today.Format("15:04")
 
-	log.Printf("activity: RunDailyAnalysis for %s", todayStr)
+	log.Printf("schedule_daily_scan_started date=%s time=%s", todayStr, today.Format("15:04"))
 
 	tickers, err := loadWatchlist(ctx, d.Pool)
 	if err != nil {
@@ -359,11 +359,30 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 	tradeDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	marketOpen := time.Date(now.Year(), now.Month(), now.Day(), 6, 30, 0, 0, loc)
 
-	log.Printf("activity: RunOpeningConfirmation for %s", tradeDate.Format("2006-01-02"))
+	log.Printf("schedule_opening_confirmation_started date=%s time=%s opening_confirmation_window=06:30-06:40",
+		tradeDate.Format("2006-01-02"), now.Format("15:04"))
 
+	// ── Staleness guard ──────────────────────────────────────────────────────────
+	// The first-10-minute candle evidence is only meaningful at open (6:30–6:40 PT).
+	// If this activity runs late (retry storm, scheduler lag), reject it so stale
+	// opening-candle logic is never used as a substitute for continuation context.
+	cutoffHour, cutoffMin := 6, 55
 	rules := d.Rules
 	if rules == nil {
 		rules = strategy.DefaultRules()
+	}
+	if rules.Schedule.OpeningConfirmationCutoff != "" {
+		var h, m int
+		if _, err := fmt.Sscanf(rules.Schedule.OpeningConfirmationCutoff, "%d:%d", &h, &m); err == nil {
+			cutoffHour, cutoffMin = h, m
+		}
+	}
+	cutoff := time.Date(now.Year(), now.Month(), now.Day(), cutoffHour, cutoffMin, 0, 0, loc)
+	if now.After(cutoff) {
+		msg := fmt.Sprintf("opening_confirmation_stale: current PT time %s is past cutoff %02d:%02d — use continuation review instead",
+			now.Format("15:04"), cutoffHour, cutoffMin)
+		log.Printf("activity: %s", msg)
+		return msg, nil
 	}
 
 	// ── 1. Load entry_ready candidates ──────────────────────────────────────────
@@ -702,6 +721,8 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 		},
 		Candidates: forClaude,
 	}
+	log.Printf("claude_confirmation_time=%s candidates=%d vix=%.1f btc_roc=%.1f spy_trend=%s",
+		time.Now().In(loc).Format("15:04"), len(forClaude), confirmVIX, confirmBTCROC, spyTrend)
 	claudeResp, claudeErr := claudeCli.ConfirmEntry(confirmPayload)
 	if claudeErr != nil {
 		log.Printf("activity: Claude ConfirmEntry error: %v — defaulting all to watch_only", claudeErr)
@@ -839,7 +860,7 @@ func (d *ActivityDeps) RunPositionReviewActivity(ctx context.Context) (string, e
 	now := time.Now().In(loc)
 	reviewDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 
-	log.Printf("activity: RunPositionReview for %s", reviewDate.Format("2006-01-02"))
+	log.Printf("first_position_review_started date=%s time=%s", reviewDate.Format("2006-01-02"), now.Format("15:04"))
 
 	// ── 1. Load open positions ───────────────────────────────────────────────
 	positions, err := store.GetOpenPositionsForReview(ctx, d.Pool)
@@ -1014,6 +1035,46 @@ func (d *ActivityDeps) RunPositionReviewActivity(ctx context.Context) (string, e
 
 	result := fmt.Sprintf("reviewed=%d exited=%d", reviewedCount, exitedCount)
 	log.Printf("activity: RunPositionReview done — %s", result)
+	return result, nil
+}
+
+// RunContinuationReviewActivity runs at 7:45 AM PT.
+//
+// WHAT:  Reviews open paper positions using fresh intraday bars from 6:30 AM to now.
+//
+//	NOT a repeat of opening confirmation — the first-10-minute window is closed.
+//
+// WHY:   After the opening candle, positions may need tightening or early exit
+//
+//	based on 60-minute structure, VWAP reclaim/rejection, or overextension.
+//
+// HOW:
+//  1. Fetch intraday bars from 6:30 AM to current time (full continuation window).
+//  2. Review open positions with fresh price context via RunPositionReviewActivity logic.
+//  3. Do NOT use first-10-min entry logic. Do NOT re-run opening confirmation.
+//
+// TODO (future): add continuation entry scan for still-valid entry_ready setups —
+//
+//	check 60-min high/low structure, VWAP hold, volume continuation, spread still
+//	acceptable, Claude re-confirms with fresh continuation payload.
+func (d *ActivityDeps) RunContinuationReviewActivity(ctx context.Context) (string, error) {
+	loc, _ := time.LoadLocation("America/Los_Angeles")
+	now := time.Now().In(loc)
+	reviewDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+
+	log.Printf("continuation_review_started date=%s time=%s continuation_window=06:30-%s",
+		reviewDate.Format("2006-01-02"), now.Format("15:04"), now.Format("15:04"))
+
+	// Delegate to the same position review logic — it fetches current mid-prices
+	// and sends to Claude. The continuation window context is captured in the log.
+	// Full continuation entry logic (VWAP structure, 60-min high/low, second-leg
+	// confirmation) is a TODO — this pass is position risk management only.
+	result, err := d.RunPositionReviewActivity(ctx)
+	if err != nil {
+		return result, err
+	}
+
+	log.Printf("continuation_review_done result=%s", result)
 	return result, nil
 }
 

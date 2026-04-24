@@ -1,77 +1,93 @@
 # Current Refactor Status
 
-## Completed: v7 Lifecycle Correctness Fixes (2026-04-24)
+## Completed: Trading-Day Schedule Fix (2026-04-24)
 
 ### Objective
-Consolidate buy/sell lifecycle into a single execution path and ensure Claude
-receives full market + contract context before confirming entries.
+Fix the schedule so the app behaves like a logical autonomous paper options
+trader. First-10-minute opening confirmation must fire at 6:42 PT, not 7:45 PT.
 
 ### What was done
 
-#### 1. `internal/claude/client.go` — OptionVolume added to ConfirmationContract
-- Added `OptionVolume int \`json:"option_volume"\`` to `ConfirmationContract`
-- Claude now sees both open_interest and today's option volume for every candidate
-
-#### 2. `internal/workflow/activities.go` — Market context + single buy/sell owner
-- Added VIX + BTC ROC20 fetch before Claude call in `RunOpeningConfirmationActivity`
-- Added SPY trend derivation from first-5m bar
-- Populated `EntryConfirmationPayload.MarketContext` with VIX, BTCRoc20, SPXTrend
-- Populated `ConfirmationContract.OptionVolume` from selected contract
-- Replaced manual `CreatePaperPosition → PlaceOptionOrder` block with `execution.BuyOptionPosition`
-- Replaced manual `SellOptionOrder → ClosePosition` block in `RunPositionReviewActivity` with `execution.SellOptionPosition`
-- If sell fails: records `sell_failed` event and keeps position open (no premature close)
-- Updated `RunOpeningConfirmationActivity` HOW comment to reflect correct flow:
-  fetch/filter/select contract → send contract to Claude → Claude confirms → buy same contract
-
-#### 3. `internal/api/handlers.go` — Single execution path for all API buy/sell paths
-- Added `execution` import
-- Replaced `placeAlpacaOptionOrder` helper with slim `selectBestContract` (returns symbol + price only)
-- `run-confirmation` handler: uses `execution.BuyOptionPosition` (contract pre-selected via `selectBestContract`)
-- `force-confirm` handler: uses `execution.BuyOptionPosition`
-- Retry path (position exists, re-place order): uses `selectBestContract` + direct `PlaceOptionOrder` (no new DB row)
-- `RunPositionReview` handler: uses `execution.SellOptionPosition` with same fail-safe behavior
-
-### Execution lifecycle ownership (verified)
-- `internal/execution/options.go` is the sole owner of buy/sell lifecycle
-- `CreatePaperPosition`, `SellOptionOrder`, `ClosePosition` are gone from workflow and API
-- Only exception: retry path in handlers.go calls `PlaceOptionOrder` directly when the DB position already exists
-
-### Correct confirmation flow (as implemented)
+#### 1. `strategy_rules.yaml` — `schedule:` block added
+```yaml
+schedule:
+  timezone: America/Los_Angeles
+  daily_scan_time:             "06:25"
+  opening_confirmation_time:   "06:42"
+  opening_confirmation_cutoff: "06:55"
+  first_position_review_time:  "07:15"
+  continuation_review_time:    "07:45"
+  end_of_day_review_time:      "12:45"
+  weekly_review_time:          "07:00"
 ```
-entry_ready
-  → shortlist by score
-  → fetch option chain + filter quality + select best contract  ← BEFORE Claude
-  → if no contract → watch_only
-  → populate ConfirmationCandidate.Contract with selected contract
-  → fetch VIX + BTC ROC20 + SPY trend
-  → Claude.ConfirmEntry(payload with market context + contract)
-  → CONFIRM → execution.BuyOptionPosition (same contract Claude saw)
-  → REJECT  → watch_only
+Times are PT-local. Changing a time: edit YAML → delete Temporal schedule → restart worker.
+
+#### 2. `internal/strategy/rules.go` — `ScheduleConfig` struct added
+- Mirrors all 7 YAML fields with typed Go struct
+
+#### 3. `cmd/worker/main.go` — 6 schedules, PT-local crons, DST-safe
+- `TimeZoneName: "America/Los_Angeles"` on every schedule (Temporal handles DST)
+- Cron expressions are now PT-local (not UTC conversions)
+- Two new schedules: `makemytrade-first-position-review`, `makemytrade-continuation-review`
+- Times wired from `rules.Schedule` YAML fields with hardcoded fallbacks
+- Old 4 UTC schedules deleted; 6 new PT schedules registered
+
+#### 4. `internal/workflow/daily.go` — 2 new workflow definitions
+- `FirstPositionReviewCycle` — 7:15 PT, calls `RunPositionReviewActivity`
+- `ContinuationReviewCycle` — 7:45 PT, calls `RunContinuationReviewActivity`
+- Updated header comment with full 6-step schedule
+
+#### 5. `internal/workflow/activities.go` — 4 changes
+
+**Staleness guard in `RunOpeningConfirmationActivity`:**
+- If PT time > `opening_confirmation_cutoff` (default 6:55), returns immediately:
+  `"opening_confirmation_stale: ...use continuation review instead"`
+- Prevents first-10-min entry logic from running late as a delayed opening candle
+
+**New `RunContinuationReviewActivity`:**
+- Logs `continuation_review_started` with full `continuation_window=06:30-<now>`
+- Delegates to `RunPositionReviewActivity` (position risk management)
+- TODO comment: full continuation entry logic (VWAP structure, 60-min high/low,
+  second-leg Claude confirmation with fresh payload)
+
+**Log statements added:**
+- `schedule_daily_scan_started` at start of `RunDailyAnalysisActivity`
+- `schedule_opening_confirmation_started opening_confirmation_window=06:30-06:40`
+- `claude_confirmation_time=HH:MM candidates=N vix=X btc_roc=X spy_trend=X`
+- `first_position_review_started` at start of `RunPositionReviewActivity`
+- `continuation_review_started continuation_window=06:30-HH:MM`
+
+### Autonomous trading day (as deployed)
+```
+06:25 PT  DailyResearchCycle         — overnight scan, classify candidates
+06:42 PT  OpeningConfirmationCycle   — 6:30-6:40 candle, Claude entry (cutoff 6:55)
+07:15 PT  FirstPositionReviewCycle   — early risk management on open positions
+07:45 PT  ContinuationReviewCycle    — fresh intraday bars, position tighten/exit
+12:45 PT  DailyPositionReview        — end-of-day: hold overnight vs exit
+Sunday 07:00 PT  WeeklyReviewCycle   — performance review + tuning proposals
 ```
 
 ### Files changed
-- `internal/claude/client.go`
+- `strategy_rules.yaml`
+- `internal/strategy/rules.go`
+- `cmd/worker/main.go`
+- `internal/workflow/daily.go`
 - `internal/workflow/activities.go`
-- `internal/api/handlers.go`
 
-### Previous completed work (v7 Architecture Upgrade, 2026-04-23)
-See git history. Summary: 5 new indicators, 4 scoring sleeves, Claude as final
-authority, execution service, migration 000006, contract-before-Claude rewrite.
+### Remaining work / TODOs
+- `RunContinuationReviewActivity` currently delegates to `RunPositionReviewActivity`.
+  Future: add real continuation entry logic:
+  - fetch fresh intraday bars 6:30→7:45
+  - evaluate VWAP hold/reclaim, 60-min high/low, higher-low structure
+  - check option spread still acceptable
+  - if still-valid entry_ready setup and no hard blocks → Claude continuation payload
+  - if Claude confirms → execution.BuyOptionPosition (same single lifecycle path)
+- `execution.BuyOptionPosition` places Alpaca order BEFORE DB insert (Alpaca-first).
+  Consider reversing to DB-first in execution/options.go for orphan-prevention.
+- `selectBestContract` in API re-fetches chain at buy time. Acceptable for paper.
 
-## Remaining risks
-- `execution.BuyOptionPosition` still places Alpaca order BEFORE creating the DB
-  position (order in execution/options.go: PlaceOptionOrder → CreatePaperPosition).
-  If Alpaca succeeds but DB insert fails, the order is orphaned. Consider reversing
-  to DB-first inside the execution service in a future pass.
-- `SellOptionPosition` closes DB position before confirming Alpaca fill. For paper
-  trading this is acceptable, but worth revisiting if fill confirmation matters.
-- `selectBestContract` in API re-fetches the chain at buy time — chain may differ
-  slightly from the analysis chain. For paper trading this is acceptable.
-
-## Exact next step
-1. Watch 14:00 UTC analysis log for `activity: RunDailyAnalysis done`
-2. Watch 14:45 UTC confirmation log for:
-   `activity: RunOpeningConfirmation done — confirmed=X watch_only=Y shortlisted=W`
-   `activity: claude_confirmed_contract: TICKER SYMBOL conf=X reason="..."`
-3. Verify `paper_positions` row has `option_symbol`, `claude_confirm_confidence`,
-   `claude_confirm_reason` populated after a confirmed entry
+### How to change schedule times
+1. Edit `schedule:` block in `strategy_rules.yaml`
+2. Delete old Temporal schedule(s):
+   `go run internal/tools/delete_schedules.go` (or Temporal UI)
+3. Restart worker — new schedules auto-register

@@ -1,6 +1,22 @@
 version: 7
 
 # ============================================================
+# SCHEDULE — autonomous trading day timeline (America/Los_Angeles).
+# Times are PT local (DST-aware via TimeZoneName in Temporal).
+# Change times here; worker reads them at startup.
+# ============================================================
+schedule:
+  timezone: America/Los_Angeles
+  daily_scan_time:             "06:25"   # overnight bars ready; scan + classify
+  opening_confirmation_time:   "06:42"   # 6:30-6:40 candle complete; Claude entry
+  opening_confirmation_cutoff: "06:55"   # stale guard — abort if PT time exceeds this
+  first_position_review_time:  "07:15"   # early risk management on open positions
+  continuation_review_time:    "07:45"   # fresh intraday bars; continuation / tighten
+  end_of_day_review_time:      "12:45"   # hold overnight vs exit decision
+  weekly_review_time:          "07:00"   # Sunday: performance review + tuning proposals
+
+
+# ============================================================
 # GLOBAL — feature computation windows and data quality gates.
 # Engine reads these; indicator periods are not hardcoded in Go.
 # ============================================================

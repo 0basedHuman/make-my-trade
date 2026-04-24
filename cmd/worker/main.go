@@ -24,6 +24,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -33,13 +34,13 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
-	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/worker"
 	"github.com/yourname/makemytrade/config"
 	"github.com/yourname/makemytrade/internal/market"
 	"github.com/yourname/makemytrade/internal/store"
 	"github.com/yourname/makemytrade/internal/strategy"
 	wf "github.com/yourname/makemytrade/internal/workflow"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 )
 
 const TaskQueue = "makemytrade-main"
@@ -121,6 +122,8 @@ func main() {
 	// Register workflows
 	w.RegisterWorkflow(wf.DailyResearchCycle)
 	w.RegisterWorkflow(wf.OpeningConfirmationCycle)
+	w.RegisterWorkflow(wf.FirstPositionReviewCycle)
+	w.RegisterWorkflow(wf.ContinuationReviewCycle)
 	w.RegisterWorkflow(wf.DailyPositionReview)
 	w.RegisterWorkflow(wf.WeeklyReviewCycle)
 
@@ -128,6 +131,7 @@ func main() {
 	w.RegisterActivity(deps.RunDailyAnalysisActivity)
 	w.RegisterActivity(deps.RunOpeningConfirmationActivity)
 	w.RegisterActivity(deps.RunPositionReviewActivity)
+	w.RegisterActivity(deps.RunContinuationReviewActivity)
 	w.RegisterActivity(deps.RunWeeklyReviewActivity)
 
 	// ── 8. Start ──────────────────────────────────────────────────────────────
@@ -138,7 +142,7 @@ func main() {
 	log.Println("worker: polling — press Ctrl+C to stop")
 
 	// ── 9. Register Temporal schedules (idempotent — skip if already exist) ──
-	registerSchedules(ctx, temporalClient)
+	registerSchedules(ctx, temporalClient, workerRules)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, syscall.SIGINT, syscall.SIGTERM)
@@ -149,18 +153,44 @@ func main() {
 	log.Println("worker: stopped")
 }
 
-// registerSchedules creates the four autonomous Temporal schedules.
-// All times are UTC. America/Los_Angeles offset depends on DST:
-//   PST (Nov–Mar): UTC-8   PDT (Mar–Nov): UTC-7
+// registerSchedules creates the six autonomous Temporal schedules.
 //
-//	DailyResearchCycle:        14:00 UTC = 6:00 AM PST / 7:00 AM PDT (weekdays)
-//	OpeningConfirmationCycle:  14:45 UTC = 6:45 AM PST / 7:45 AM PDT (weekdays)
-//	DailyPositionReview:       20:45 UTC = 12:45 PM PST / 1:45 PM PDT (weekdays)
-//	WeeklyReviewCycle:         15:00 UTC = 7:00 AM PST / 8:00 AM PDT (Sunday)
+// All cron expressions are in America/Los_Angeles PT-local time.
+// Temporal handles DST automatically via TimeZoneName — no UTC conversion needed.
+//
+// Times are read from strategy_rules.yaml schedule: block. If the YAML value is
+// missing or unparseable, the hardcoded default is used and a warning is logged.
+//
+//	DailyResearchCycle         06:25 PT  weekdays  — overnight scan
+//	OpeningConfirmationCycle   06:42 PT  weekdays  — first-10-min entry (stale guard at 06:55)
+//	FirstPositionReviewCycle   07:15 PT  weekdays  — early risk management
+//	ContinuationReviewCycle    07:45 PT  weekdays  — fresh intraday review
+//	DailyPositionReview        12:45 PT  weekdays  — end-of-day: hold vs exit
+//	WeeklyReviewCycle          07:00 PT  Sunday    — performance + tuning proposals
 //
 // Each call is idempotent: if a schedule already exists the error is logged and
 // the worker continues — the existing schedule is not touched.
-func registerSchedules(ctx context.Context, tc client.Client) {
+//
+// TODO: to change a schedule time, update strategy_rules.yaml schedule: block,
+// delete the old Temporal schedule (Temporal UI or tctl), then restart the worker.
+func registerSchedules(ctx context.Context, tc client.Client, rules *strategy.Rules) {
+	const tz = "America/Los_Angeles"
+
+	// Helper: parse "HH:MM" from YAML or fall back to default "HH:MM".
+	parseCron := func(yamlTime, defaultTime, weekdays string) string {
+		t := defaultTime
+		if yamlTime != "" {
+			t = yamlTime
+		}
+		var h, m int
+		if _, err := fmt.Sscanf(t, "%d:%d", &h, &m); err != nil {
+			log.Printf("worker: schedule: could not parse %q — using default %s", t, defaultTime)
+			fmt.Sscanf(defaultTime, "%d:%d", &h, &m) //nolint:errcheck
+		}
+		return fmt.Sprintf("%d %d * * %s", m, h, weekdays)
+	}
+
+	sched := rules.Schedule
 	type schedSpec struct {
 		id       string
 		cron     string
@@ -170,25 +200,37 @@ func registerSchedules(ctx context.Context, tc client.Client) {
 	schedules := []schedSpec{
 		{
 			id:       "makemytrade-daily-research",
-			cron:     "0 14 * * 1-5",
+			cron:     parseCron(sched.DailyScanTime, "06:25", "1-5"),
 			workflow: wf.DailyResearchCycle,
 			wfID:     "daily-research-run",
 		},
 		{
 			id:       "makemytrade-open-confirmation",
-			cron:     "45 14 * * 1-5",
+			cron:     parseCron(sched.OpeningConfirmationTime, "06:42", "1-5"),
 			workflow: wf.OpeningConfirmationCycle,
 			wfID:     "open-confirmation-run",
 		},
 		{
+			id:       "makemytrade-first-position-review",
+			cron:     parseCron(sched.FirstPositionReviewTime, "07:15", "1-5"),
+			workflow: wf.FirstPositionReviewCycle,
+			wfID:     "first-position-review-run",
+		},
+		{
+			id:       "makemytrade-continuation-review",
+			cron:     parseCron(sched.ContinuationReviewTime, "07:45", "1-5"),
+			workflow: wf.ContinuationReviewCycle,
+			wfID:     "continuation-review-run",
+		},
+		{
 			id:       "makemytrade-position-review",
-			cron:     "45 20 * * 1-5",
+			cron:     parseCron(sched.EndOfDayReviewTime, "12:45", "1-5"),
 			workflow: wf.DailyPositionReview,
 			wfID:     "position-review-run",
 		},
 		{
 			id:       "makemytrade-weekly-review",
-			cron:     "0 15 * * 0",
+			cron:     parseCron(sched.WeeklyReviewTime, "07:00", "0"),
 			workflow: wf.WeeklyReviewCycle,
 			wfID:     "weekly-review-run",
 		},
@@ -200,7 +242,8 @@ func registerSchedules(ctx context.Context, tc client.Client) {
 			ID: s.id,
 			Spec: client.ScheduleSpec{
 				CronExpressions: []string{s.cron},
-				Jitter:          30 * time.Second, // spread load slightly
+				TimeZoneName:    tz,
+				Jitter:          20 * time.Second,
 			},
 			Action: &client.ScheduleWorkflowAction{
 				ID:        s.wfID,
@@ -212,7 +255,7 @@ func registerSchedules(ctx context.Context, tc client.Client) {
 			// "already exists" is expected on restarts — not fatal
 			log.Printf("worker: schedule %q: %v", s.id, err)
 		} else {
-			log.Printf("worker: schedule %q registered (%s UTC)", s.id, s.cron)
+			log.Printf("worker: schedule %q registered (%s %s)", s.id, s.cron, tz)
 		}
 	}
 }

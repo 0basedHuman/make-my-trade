@@ -429,19 +429,29 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 		return fmt.Sprintf("confirmed=0 watch_only=%d no_shortlisted=true", watchOnlyCount), nil
 	}
 
-	// ── 4-5. Deterministic evidence pass + hard block check ──────────────────────
+	// ── 4-5. Deterministic evidence + chain selection BEFORE Claude call ────────
+	// Contract must be selected before building the Claude payload so that Claude
+	// can evaluate the actual option: strike, DTE, delta, spread, premium.
+	// If no valid contract exists, the candidate is skipped (watch_only) — there
+	// is nothing to confirm without a tradable contract.
 	type candidateEvidence struct {
-		cand         store.Candidate
-		result       strategy.ConfirmationResult
-		hardBlocked  bool
-		payloadCand  claudeclient.ConfirmationCandidate
+		cand        store.Candidate
+		result      strategy.ConfirmationResult
+		hardBlocked bool
+		contract    *market.OptionContract // pre-selected contract (nil if none found)
+		limitPrice  float64
+		optionType  string
 	}
 
 	ccfg := rules.ClaudeConfirmation
+	lf := rules.OptionsTranslation.LiquidityFilters
+	todayStr := tradeDate.Format("2006-01-02")
+
 	var forClaude []claudeclient.ConfirmationCandidate
 	evidenceMap := make(map[string]candidateEvidence, len(shortlisted))
 
 	for _, c := range shortlisted {
+		// ── a. Deterministic opening signals (evidence only) ─────────────────────
 		result := strategy.EvaluateConfirmation(strategy.ConfirmationInput{
 			Ticker:        c.Ticker,
 			Direction:     c.Direction,
@@ -453,7 +463,7 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			SPYBars:       spyBars,
 		}, rules.OpenConfirmation)
 
-		// Persist confirmation evidence row regardless of outcome
+		// Always persist the confirmation evidence row
 		_ = store.UpsertTradeConfirmation(ctx, d.Pool, store.ConfirmationStoreInput{
 			CandidateID:       c.ID,
 			Ticker:            c.Ticker,
@@ -474,19 +484,86 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			First10Volume:     result.First10Volume,
 		})
 
-		// Hard block: auto_reject fired AND config says it's non-overridable
-		hardBlocked := result.AutoRejected && ccfg.DeterministicAutoRejectIsHardBlock
-		if hardBlocked {
+		// Hard block: auto_reject fired AND config says it is non-overridable
+		if result.AutoRejected && ccfg.DeterministicAutoRejectIsHardBlock {
 			log.Printf("activity: %s → watch_only (hard_block: %s)", c.Ticker, result.AutoRejectReason)
-			if err := store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only"); err != nil {
-				log.Printf("activity: update status %s: %v", c.Ticker, err)
-			}
+			_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only")
 			watchOnlyCount++
 			evidenceMap[c.Ticker] = candidateEvidence{cand: c, result: result, hardBlocked: true}
 			continue
 		}
 
-		// Build signal details list
+		// ── b. Fetch option chain and select best contract ───────────────────────
+		// Contract selection MUST happen before the Claude payload is built.
+		// Claude cannot make a real options confirmation without seeing the
+		// actual contract: symbol, strike, DTE, delta, spread, premium.
+		optionType := "call"
+		if c.Direction == "bearish" {
+			optionType = "put"
+		}
+
+		contracts, chainErr := d.Alpaca.FetchOptionChain(c.Ticker, c.ClosePrice, todayStr)
+		if chainErr != nil {
+			log.Printf("activity: %s → watch_only (chain_fetch_error: %v)", c.Ticker, chainErr)
+			_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only")
+			watchOnlyCount++
+			evidenceMap[c.Ticker] = candidateEvidence{cand: c, result: result, hardBlocked: false}
+			continue
+		}
+
+		qualified := market.FilterChainQuality(contracts,
+			lf.MinOpenInterest, lf.MinOptionVolume, lf.MaxBidAskSpreadPctOfMid)
+		best := market.SelectBestContract(qualified, optionType)
+		if best == nil {
+			log.Printf("activity: %s → watch_only (candidate_skipped_no_valid_contract: type=%s chain=%d qualified=%d)",
+				c.Ticker, optionType, len(contracts), len(qualified))
+			_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only")
+			watchOnlyCount++
+			evidenceMap[c.Ticker] = candidateEvidence{cand: c, result: result, hardBlocked: false}
+			continue
+		}
+
+		limitPrice := (best.Bid + best.Ask) / 2.0
+		if best.Bid <= 0 {
+			limitPrice = best.Ask
+		}
+
+		log.Printf("activity: contract_selected_before_claude: %s %s strike=%.2f dte=%d delta=%.3f mid=%.2f spread=%.1f%%",
+			c.Ticker, best.Symbol, best.Strike, best.DTE, best.Delta, limitPrice, best.SpreadPct)
+
+		// ── c. Build opening context from intraday bars ──────────────────────────
+		var oc claudeclient.OpeningContext
+		if bars := barsMap[c.Ticker]; len(bars) > 0 {
+			n := len(bars)
+			oc.First10mClose = bars[n-1].Close
+			if len(bars) >= 5 {
+				oc.First5mClose = bars[4].Close
+			}
+			var hi, lo, volSum float64
+			for _, b := range bars {
+				if hi == 0 || b.High > hi {
+					hi = b.High
+				}
+				if lo == 0 || b.Low < lo {
+					lo = b.Low
+				}
+				volSum += b.Volume
+			}
+			oc.OpeningRangeHigh = hi
+			oc.OpeningRangeLow = lo
+			oc.OpeningVolume = volSum / float64(n)
+			var vwapNumer float64
+			for _, b := range bars {
+				vwapNumer += b.Close * b.Volume
+			}
+			if volSum > 0 {
+				oc.VWAP = vwapNumer / volSum
+			}
+		}
+
+		// ── d. Build confirmation candidate with contract populated ──────────────
+		softMinMet := result.SignalsPassed >= ccfg.DeterministicSignalsSoftMin
+
 		var sigDetails []string
 		if result.SignalLevelHolds {
 			sigDetails = append(sigDetails, "level_holds")
@@ -504,63 +581,36 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			sigDetails = append(sigDetails, "market_ok")
 		}
 
-		// Build opening context from intraday bars
-		var oc claudeclient.OpeningContext
-		if bars := barsMap[c.Ticker]; len(bars) > 0 {
-			n := len(bars)
-			oc.First10mClose = bars[n-1].Close
-			if len(bars) >= 5 {
-				oc.First5mClose = bars[4].Close
-			}
-			var hi, lo float64
-			var volSum float64
-			for _, b := range bars {
-				if hi == 0 || b.High > hi {
-					hi = b.High
-				}
-				if lo == 0 || b.Low < lo {
-					lo = b.Low
-				}
-				volSum += b.Volume
-			}
-			oc.OpeningRangeHigh = hi
-			oc.OpeningRangeLow = lo
-			oc.OpeningVolume = volSum / float64(n)
-			// VWAP approximation: sum(close*vol)/sum(vol)
-			var vwapNumer float64
-			for _, b := range bars {
-				vwapNumer += b.Close * b.Volume
-			}
-			if volSum > 0 {
-				oc.VWAP = vwapNumer / volSum
-			}
-		}
-
-		optionType := "call"
-		if c.Direction == "bearish" {
-			optionType = "put"
-		}
-
-		softMinMet := result.SignalsPassed >= ccfg.DeterministicSignalsSoftMin
-
 		pc := claudeclient.ConfirmationCandidate{
 			Ticker:      c.Ticker,
 			SetupFamily: c.SetupFamily,
 			Direction:   optionType,
 			Daily: claudeclient.DailyContext{
-				Close:       c.ClosePrice,
-				EMA20:       c.EMA20,
-				EMA50:       0, // not stored in DB currently
-				EMA100:      c.EMA100,
-				RSI:         c.RSI14,
-				MACDHist:    c.MACDHist,
-				VolumeRatio: c.VolumeRatio,
-				FinalScore:  c.ClaudeConf,
-				PriorDayHigh: c.EntryHigh, // best proxy available in DB
+				Close:        c.ClosePrice,
+				EMA20:        c.EMA20,
+				EMA100:       c.EMA100,
+				RSI:          c.RSI14,
+				MACDHist:     c.MACDHist,
+				VolumeRatio:  c.VolumeRatio,
+				FinalScore:   c.ClaudeConf,
+				PriorDayHigh: c.EntryHigh,
 				PriorDayLow:  c.EntryLow,
 			},
 			Opening: oc,
+			// Contract is the selected option contract — critical for Claude's decision.
+			Contract: claudeclient.ConfirmationContract{
+				Symbol:       best.Symbol,
+				Type:         best.Type,
+				Strike:       best.Strike,
+				Expiration:   best.Expiration,
+				DTE:          best.DTE,
+				Delta:        best.Delta,
+				MidPrice:     limitPrice,
+				BidAskSpread: best.SpreadPct,
+				OpenInterest: best.OpenInterest,
+			},
 			Risk: claudeclient.RiskContext{
+				EntryPrice:       limitPrice,
 				StopLossPct:      c.StopLoss,
 				BaseTargetPct:    c.Target1,
 				StretchTargetPct: c.Target2,
@@ -568,7 +618,7 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			},
 			DeterministicSignals: claudeclient.DeterministicSignals{
 				TrueCount:    result.SignalsPassed,
-				TotalChecked: 5, // 5 standard signals
+				TotalChecked: 5,
 				SoftMinMet:   softMinMet,
 				Details:      sigDetails,
 			},
@@ -581,12 +631,18 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 		}
 
 		forClaude = append(forClaude, pc)
-		evidenceMap[c.Ticker] = candidateEvidence{cand: c, result: result, hardBlocked: false, payloadCand: pc}
+		evidenceMap[c.Ticker] = candidateEvidence{
+			cand:       c,
+			result:     result,
+			contract:   best,
+			limitPrice: limitPrice,
+			optionType: optionType,
+		}
 	}
 
 	if len(forClaude) == 0 {
-		log.Println("activity: all shortlisted candidates blocked — skipping Claude call")
-		return fmt.Sprintf("confirmed=0 watch_only=%d all_hard_blocked=true", watchOnlyCount), nil
+		log.Println("activity: all shortlisted candidates blocked or no valid contracts — skipping Claude call")
+		return fmt.Sprintf("confirmed=0 watch_only=%d all_blocked=true", watchOnlyCount), nil
 	}
 
 	// ── 6. Call Claude for final confirmation ────────────────────────────────────
@@ -603,9 +659,9 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 	claudeResp, claudeErr := claudeCli.ConfirmEntry(confirmPayload)
 	if claudeErr != nil {
 		log.Printf("activity: Claude ConfirmEntry error: %v — defaulting all to watch_only", claudeErr)
-		// Safe default: mark all as watch_only if Claude call fails
 		for _, c := range shortlisted {
-			if !evidenceMap[c.Ticker].hardBlocked {
+			ev := evidenceMap[c.Ticker]
+			if !ev.hardBlocked && ev.contract != nil {
 				_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only")
 				watchOnlyCount++
 			}
@@ -628,13 +684,10 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 		decisionMap[d2.Ticker] = d2
 	}
 
-	lf := rules.OptionsTranslation.LiquidityFilters
-	todayStr := tradeDate.Format("2006-01-02")
-
 	for _, c := range shortlisted {
 		ev, ok := evidenceMap[c.Ticker]
-		if !ok || ev.hardBlocked {
-			continue // already handled
+		if !ok || ev.hardBlocked || ev.contract == nil {
+			continue // already handled above
 		}
 
 		dec, hasDec := decisionMap[c.Ticker]
@@ -646,59 +699,35 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 				reason = fmt.Sprintf("claude_reject(conf=%.2f)", dec.Confidence)
 			}
 			log.Printf("activity: %s → watch_only (%s)", c.Ticker, reason)
-			if err := store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only"); err != nil {
-				log.Printf("activity: update status %s: %v", c.Ticker, err)
-			}
+			_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only")
 			watchOnlyCount++
 			continue
 		}
 
-		// Claude confirmed — promote to confirmed
-		log.Printf("activity: %s → confirmed (claude conf=%.2f reason=%s)",
-			c.Ticker, dec.Confidence, dec.Reason)
-
-		if err := store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "confirmed"); err != nil {
-			log.Printf("activity: update status %s: %v", c.Ticker, err)
+		// ── Claude confirmed — use the SAME contract Claude saw ──────────────────
+		best := ev.contract
+		limitPrice := ev.limitPrice
+		// If Claude suggests a price and it's within 20% of mid, prefer it
+		if hasDec && dec.LimitPrice > 0 && dec.LimitPrice < limitPrice*1.20 {
+			limitPrice = dec.LimitPrice
 		}
 
-		// Suppress if position already open for this ticker
+		log.Printf("activity: claude_confirmed_contract: %s %s conf=%.2f reason=%q limit=%.2f",
+			c.Ticker, best.Symbol, dec.Confidence, dec.Reason, limitPrice)
+
+		_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "confirmed")
+
+		// Suppress duplicate: don't open a second position if one is already open
 		if hasPos, _ := store.HasOpenPositionForTicker(ctx, d.Pool, c.Ticker); hasPos {
 			log.Printf("activity: %s already has open position — skipping buy", c.Ticker)
 			confirmedCount++
 			continue
 		}
 
-		// ── 7a. Fetch option chain and select best contract ──────────────────────
-		optionType := "call"
-		if c.Direction == "bearish" {
-			optionType = "put"
-		}
-		contracts, chainErr := d.Alpaca.FetchOptionChain(c.Ticker, c.ClosePrice, todayStr)
-		if chainErr != nil {
-			log.Printf("activity: fetch chain %s: %v — skipping buy", c.Ticker, chainErr)
-			confirmedCount++
-			continue
-		}
-
-		qualified := market.FilterChainQuality(contracts,
-			lf.MinOpenInterest, lf.MinOptionVolume, lf.MaxBidAskSpreadPctOfMid)
-		best := market.SelectBestContract(qualified, optionType)
-		if best == nil {
-			log.Printf("activity: no qualifying %s contract for %s — skipping buy", optionType, c.Ticker)
-			confirmedCount++
-			continue
-		}
-
-		limitPrice := (best.Bid + best.Ask) / 2.0
-		if best.Bid <= 0 {
-			limitPrice = best.Ask
-		}
-		// Use Claude's suggested limit price if provided and reasonable
-		if hasDec && dec.LimitPrice > 0 {
-			limitPrice = dec.LimitPrice
-		}
-
-		// ── 7b. Place buy via execution service ──────────────────────────────────
+		// ── 7b. Create DB position FIRST (idempotent), then place Alpaca order ───
+		// DB-first ensures that even if the Alpaca call succeeds but the process
+		// crashes, the next Temporal retry will find the position (ON CONFLICT)
+		// and skip re-buying. Alpaca order goes out after a confirmed DB record.
 		posID, posErr := store.CreatePaperPosition(ctx, d.Pool, store.PaperPositionInput{
 			CandidateID: c.ID,
 			Ticker:      c.Ticker,
@@ -708,7 +737,7 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			StopLoss:    c.StopLoss,
 			Target1:     c.Target1,
 			Target2:     c.Target2,
-			OptionType:  optionType,
+			OptionType:  ev.optionType,
 			SetupFamily: c.SetupFamily,
 		})
 		if posErr != nil {
@@ -717,19 +746,26 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			continue
 		}
 
+		// Save contract details before placing order so P&L tracking works
+		// even if the order call fails (we can still compute P&L from option mid)
+		_ = store.UpdatePositionOptionDetails(ctx, d.Pool, posID, best.Symbol, limitPrice)
+
 		orderID, orderErr := d.Alpaca.PlaceOptionOrder(best.Symbol, limitPrice)
 		if orderErr != nil {
 			log.Printf("activity: place option order %s: %v", c.Ticker, orderErr)
+			// Non-fatal: position in DB, can be manually reconciled
 		} else {
 			_ = store.UpdatePositionAlpacaOrderID(ctx, d.Pool, posID, orderID)
 		}
-		_ = store.UpdatePositionOptionDetails(ctx, d.Pool, posID, best.Symbol, limitPrice)
 
 		_ = store.InsertPositionEvent(ctx, d.Pool, posID, c.Ticker, "position_opened",
 			limitPrice, map[string]any{
 				"candidate_status": "confirmed",
 				"setup_family":     c.SetupFamily,
 				"contract":         best.Symbol,
+				"strike":           best.Strike,
+				"dte":              best.DTE,
+				"delta":            best.Delta,
 				"claude_conf":      dec.Confidence,
 				"claude_reason":    dec.Reason,
 			})

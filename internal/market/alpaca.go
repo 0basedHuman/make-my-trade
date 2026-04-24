@@ -223,6 +223,7 @@ type OptionContract struct {
 	Symbol       string  `json:"symbol"`        // OCC symbol, e.g. "RTX260501P00200000"
 	Type         string  `json:"type"`          // "call" or "put"
 	Strike       float64 `json:"strike"`
+	Expiration   string  `json:"expiration"`    // "YYYY-MM-DD"
 	DTE          int     `json:"dte"`
 	Delta        float64 `json:"delta"`
 	Bid          float64 `json:"bid"`
@@ -383,6 +384,7 @@ func (c *AlpacaClient) FetchOptionChain(ticker string, underlyingPrice float64, 
 			Symbol:       symKey,
 			Type:         optType,
 			Strike:       strike,
+			Expiration:   expStr,
 			DTE:          dte,
 			Delta:        delta,
 			Bid:          bid,

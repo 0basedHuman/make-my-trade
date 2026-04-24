@@ -370,6 +370,191 @@ func (c *Client) ReviewCandidates(vix, btc float64, regime string, candidates []
 	return resp, nil
 }
 
+// ── Entry confirmation payload (v7) ──────────────────────────────────────────
+//
+// Used at opening time: after deterministic signals are evaluated, we build a
+// rich EntryConfirmationPayload for each shortlisted candidate and send it to
+// Claude. Claude is the final authority — it can CONFIRM or REJECT.
+//
+// The payload combines:
+//   - Daily context: all technical indicators from overnight analysis
+//   - Opening context: first 5/10 min bars, VWAP, opening range
+//   - Selected contract: the best option contract from chain screening
+//   - Risk plan: stop, targets, R/R from ATR analysis
+//   - Hard blocks: any auto_reject signals fired (Claude cannot override these)
+//   - Deterministic signals: soft signals (evidence, not authority)
+
+// EntryConfirmationPayload is the input to Claude's ConfirmEntry call.
+type EntryConfirmationPayload struct {
+	// Broad market context at open
+	MarketContext MarketContext `json:"market_context"`
+
+	// All shortlisted candidates for this confirmation run
+	Candidates []ConfirmationCandidate `json:"candidates"`
+}
+
+// ConfirmationCandidate is one entry_ready ticker sent for opening confirmation.
+type ConfirmationCandidate struct {
+	Ticker      string `json:"ticker"`
+	SetupFamily string `json:"setup_family"` // e.g. "bullish_continuation"
+	Direction   string `json:"direction"`    // "call" | "put"
+
+	// Daily context — from overnight analysis
+	Daily DailyContext `json:"daily"`
+
+	// Opening context — from first 5-10 min bars
+	Opening OpeningContext `json:"opening"`
+
+	// Selected option contract
+	Contract ConfirmationContract `json:"contract"`
+
+	// Risk plan from ATR analysis
+	Risk RiskContext `json:"risk"`
+
+	// Deterministic opening evidence (soft signals — evidence, not authority)
+	DeterministicSignals DeterministicSignals `json:"deterministic_signals"`
+
+	// Hard blocks: if any fired, Claude MUST reject (these are non-overridable)
+	HardBlocks HardBlockSummary `json:"hard_blocks"`
+}
+
+// DailyContext holds all technical indicator values from overnight analysis.
+type DailyContext struct {
+	Close       float64 `json:"close"`
+	EMA20       float64 `json:"ema20"`
+	EMA50       float64 `json:"ema50"`
+	EMA100      float64 `json:"ema100"`
+	RSI         float64 `json:"rsi"`
+	MACDHist    float64 `json:"macd_hist"`
+	VolumeRatio float64 `json:"volume_ratio"`
+	ATR14       float64 `json:"atr14"`
+
+	// v7 extended indicators
+	RealVol20       float64 `json:"real_vol_20,omitempty"`       // realized vol, 20-day
+	VolScaledMom63  float64 `json:"vol_scaled_mom_63,omitempty"` // vol-normalized 63d momentum
+	Entropy30       float64 `json:"entropy_30,omitempty"`        // Shannon entropy of 30d returns
+	BollingerWidth  float64 `json:"bollinger_width,omitempty"`   // Bollinger band width
+	SqueezeRatio    float64 `json:"squeeze_ratio,omitempty"`     // Bollinger/Keltner ratio
+
+	FinalScore      float64 `json:"final_score"`  // engine's deterministic score
+	PriorDayHigh    float64 `json:"prior_day_high"`
+	PriorDayLow     float64 `json:"prior_day_low"`
+}
+
+// OpeningContext holds first 5/10 min bar data at market open.
+type OpeningContext struct {
+	VWAP             float64 `json:"vwap"`
+	OpeningRangeHigh float64 `json:"opening_range_high"` // first 10 min high
+	OpeningRangeLow  float64 `json:"opening_range_low"`  // first 10 min low
+	First5mClose     float64 `json:"first_5m_close"`
+	First10mClose    float64 `json:"first_10m_close"`
+	OpeningVolume    float64 `json:"opening_volume_ratio"` // first 10m vs avg 10m
+}
+
+// ConfirmationContract holds the pre-selected option contract details.
+type ConfirmationContract struct {
+	Symbol     string  `json:"symbol"`      // OCC symbol e.g. "SPY260620C00580000"
+	Type       string  `json:"type"`        // "call" | "put"
+	Strike     float64 `json:"strike"`
+	Expiration string  `json:"expiration"`  // "2026-06-20"
+	DTE        int     `json:"dte"`
+	Delta      float64 `json:"delta"`
+	MidPrice   float64 `json:"mid_price"`   // current option mid
+	BidAskSpread float64 `json:"bid_ask_spread_pct"` // spread as % of mid
+	OpenInterest int   `json:"open_interest"`
+}
+
+// RiskContext holds stop, target, and R/R from ATR analysis.
+type RiskContext struct {
+	EntryPrice    float64 `json:"entry_price"`    // option mid price to pay
+	StopLossPct   float64 `json:"stop_loss_pct"`  // stop as % of premium
+	BaseTargetPct float64 `json:"base_target_pct"` // base profit target as % of premium
+	StretchTargetPct float64 `json:"stretch_target_pct"` // stretch target
+	RRRatio       float64 `json:"rr_ratio"`        // reward/risk ratio
+}
+
+// DeterministicSignals is the output of the opening confirmation check.
+// Claude sees these as evidence to weigh — they are NOT the final decision.
+type DeterministicSignals struct {
+	TrueCount      int      `json:"true_count"`       // number of bullish signals
+	TotalChecked   int      `json:"total_checked"`
+	SoftMinMet     bool     `json:"soft_min_met"`     // >= deterministic_signals_soft_min
+	Details        []string `json:"details,omitempty"` // e.g. ["breakout_holds", "volume_support"]
+}
+
+// HardBlockSummary lists any auto_reject signals that fired.
+// If any are present, Claude MUST decline — these are hard blocks.
+type HardBlockSummary struct {
+	Fired   []string `json:"fired,omitempty"` // e.g. ["hard_open_reversal"]
+	IsClean bool     `json:"is_clean"`        // true = no hard blocks fired
+}
+
+// EntryConfirmationDecision is Claude's response per candidate in ConfirmEntry.
+type EntryConfirmationDecision struct {
+	Ticker     string  `json:"ticker"`
+	Decision   string  `json:"decision"`    // "CONFIRM" | "REJECT"
+	Confidence float64 `json:"confidence"`  // 0.0-1.0
+	Reason     string  `json:"reason"`      // ≤25 words
+
+	// Contract to use (Claude may refine but typically echoes input)
+	ContractSymbol string `json:"contract_symbol,omitempty"`
+	LimitPrice     float64 `json:"limit_price,omitempty"` // suggested entry premium
+}
+
+// EntryConfirmationResponse is Claude's full response for a ConfirmEntry call.
+type EntryConfirmationResponse struct {
+	Regime    string                      `json:"regime"`    // "bullish" | "bearish" | "mixed"
+	Decisions []EntryConfirmationDecision `json:"decisions"`
+}
+
+// confirmEntrySystemPrompt is the system prompt for the ConfirmEntry endpoint.
+const confirmEntrySystemPrompt = `You are a paper-trade options entry confirmation engine.
+
+At market open you receive shortlisted candidates that passed overnight analysis (entry_ready status).
+You must decide whether to CONFIRM or REJECT each entry based on opening price action and the evidence provided.
+
+Rules:
+- Hard blocks (hard_blocks.fired is non-empty): ALWAYS REJECT. These are non-overridable.
+- If deterministic_signals.soft_min_met is false: weigh carefully — lean toward REJECT unless opening context is exceptional.
+- Confidence must be >= 0.65 to CONFIRM. If uncertain, REJECT.
+- Only LONG calls or LONG puts — no spreads, no short options.
+- Paper trading only — no live money.
+- You may confirm 0, 1, or multiple candidates. No minimum. Empty trades are valid.
+
+Output ONLY raw JSON (no fences, no prose):
+{"regime":"bullish|bearish|mixed","decisions":[{"ticker":"AAPL","decision":"CONFIRM|REJECT","confidence":0.80,"reason":"<25 words","contract_symbol":"AAPL260620C00200000","limit_price":3.50}]}
+
+Every input candidate must appear in output. Be conservative — one bad entry costs more than a missed opportunity.`
+
+// ConfirmEntry sends shortlisted entry_ready candidates to Claude for final
+// opening confirmation. Returns per-ticker CONFIRM/REJECT decisions.
+// Claude is the final authority; deterministic signals are evidence only.
+func (c *Client) ConfirmEntry(payload EntryConfirmationPayload) (EntryConfirmationResponse, error) {
+	b, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return EntryConfirmationResponse{}, fmt.Errorf("claude confirm-entry: marshal: %w", err)
+	}
+
+	log.Printf("claude confirm-entry: sending %d candidates", len(payload.Candidates))
+
+	raw, err := c.callAPIWithSystem(string(b), confirmEntrySystemPrompt)
+	if err != nil {
+		return EntryConfirmationResponse{}, fmt.Errorf("claude confirm-entry: API: %w", err)
+	}
+
+	log.Printf("claude confirm-entry: response length=%d chars", len(raw))
+	jsonStr := extractJSON(raw)
+	if jsonStr == "" {
+		return EntryConfirmationResponse{}, fmt.Errorf("claude confirm-entry: no JSON (raw: %s)", truncate(raw, 200))
+	}
+
+	var resp EntryConfirmationResponse
+	if err := json.Unmarshal([]byte(jsonStr), &resp); err != nil {
+		return EntryConfirmationResponse{}, fmt.Errorf("claude confirm-entry: unmarshal: %w (raw: %s)", err, truncate(jsonStr, 200))
+	}
+	return resp, nil
+}
+
 // ── Main API methods ──────────────────────────────────────────────────────────
 
 // DecideOptions is the primary method for the options engine.

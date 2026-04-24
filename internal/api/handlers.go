@@ -110,6 +110,7 @@ type CandidateResponse struct {
 	// Options fields are populated ONLY for confirmed status; hidden for all others
 	// per options_translation.hide_options_for_statuses in strategy_rules.yaml.
 	DecisionStatus string   `json:"decision_status"`    // rejected | structural_candidate | entry_ready | confirmed | blocked_by_event | watch_only
+	StatusLabel    string   `json:"status_label"`       // human-readable display label for the UI
 	OptionsStatus  string   `json:"options_status"`     // options_not_allowed | options_ready | options_confirmed | options_hidden_until_confirmed
 	Direction      string   `json:"direction"`          // call | put | none
 	Score          int      `json:"score"`              // 0 when hidden per scoring.hide_score_for
@@ -992,24 +993,30 @@ func (h *Handler) loadWatchlist(ctx context.Context) ([]string, error) {
 }
 
 // filterChainQuality applies the liquidity_filters from strategy_rules.yaml.
-// Thresholds come from the YAML rather than hardcoded constants.
-// Contracts that fail are removed before being sent to Claude.
+// Delegates to market.FilterChainQuality so both handlers and activities share logic.
 func filterChainQuality(contracts []market.OptionContract, lf strategy.LiquidityFilters) []market.OptionContract {
-	var qualified []market.OptionContract
-	for _, c := range contracts {
-		if c.SpreadPct > lf.MaxBidAskSpreadPctOfMid {
-			continue
-		}
-		// Skip OI filter when OI=0 — indicative feed doesn't provide OI; use volume.
-		if lf.MinOpenInterest > 0 && c.OpenInterest > 0 && c.OpenInterest < lf.MinOpenInterest {
-			continue
-		}
-		if lf.MinOptionVolume > 0 && c.OptionVolume < lf.MinOptionVolume {
-			continue
-		}
-		qualified = append(qualified, c)
+	return market.FilterChainQuality(contracts, lf.MinOpenInterest, lf.MinOptionVolume, lf.MaxBidAskSpreadPctOfMid)
+}
+
+// candidateStatusLabel returns a human-readable UI label for a lifecycle status.
+// Used in status_label field of CandidateResponse.
+func candidateStatusLabel(status string) string {
+	switch status {
+	case "entry_ready":
+		return "WAITING FOR CLAUDE CONFIRMATION"
+	case "confirmed":
+		return "PAPER POSITION OPEN"
+	case "structural_candidate":
+		return "WATCHLIST"
+	case "watch_only":
+		return "WATCH ONLY"
+	case "blocked_by_event":
+		return "BLOCKED (EVENT)"
+	case "rejected":
+		return "REJECTED"
+	default:
+		return strings.ToUpper(status)
 	}
-	return qualified
 }
 
 func toCandidateResponse(a strategy.SymbolAnalysis) CandidateResponse {
@@ -1032,6 +1039,7 @@ func toCandidateResponse(a strategy.SymbolAnalysis) CandidateResponse {
 		BaseTarget:    a.BaseTarget,
 		StretchTarget: a.StretchTarget,
 		DecisionStatus: a.CandidateStatus,
+		StatusLabel:    candidateStatusLabel(a.CandidateStatus),
 	}
 	cr.Gates.Trend = GateDetail{Passed: a.GateTrend.Passed, Reason: a.GateTrend.Reason, Value: a.GateTrend.Value}
 	cr.Gates.Momentum = GateDetail{Passed: a.GateMomentum.Passed, Reason: a.GateMomentum.Reason, Value: a.GateMomentum.Value}
@@ -1045,6 +1053,7 @@ func toCandidateResponse(a strategy.SymbolAnalysis) CandidateResponse {
 // applyDecisionToResponse merges a Claude CandidateDecision into a CandidateResponse.
 func applyDecisionToResponse(cr *CandidateResponse, d *claudeclient.CandidateDecision) {
 	cr.DecisionStatus = d.Status
+	cr.StatusLabel = candidateStatusLabel(d.Status)
 	cr.Direction = d.Direction
 	cr.Score = d.Score
 	cr.FinalDecision = d.FinalDecision
@@ -1355,6 +1364,8 @@ func buildAnalysisResponseFromDB(candidates []store.Candidate, summary *store.Da
 			}
 			cr.FinalDecision = c.ClaudeAction
 		}
+		// Always ensure status_label reflects the authoritative DecisionStatus.
+		cr.StatusLabel = candidateStatusLabel(cr.DecisionStatus)
 
 		// Direction: if not set from Claude rationale, derive from DB direction col or family.
 		if cr.Direction == "" || cr.Direction == "none" {

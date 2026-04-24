@@ -505,6 +505,32 @@ func (c *AlpacaClient) fetchIntradayBatch(tickers []string, start, end time.Time
 	return result, nil
 }
 
+// FilterChainQuality applies liquidity quality filters to an option chain.
+// Contracts that fail any threshold are removed.
+// Pass zero for any threshold you don't want to apply.
+//
+// Parameters match strategy_rules.yaml options_translation.liquidity_filters:
+//   minOI        — minimum open interest (0 = skip check)
+//   minVolume    — minimum option volume (0 = skip check)
+//   maxSpreadPct — maximum bid-ask spread as % of mid (0 = skip check)
+func FilterChainQuality(contracts []OptionContract, minOI, minVolume int, maxSpreadPct float64) []OptionContract {
+	var qualified []OptionContract
+	for _, c := range contracts {
+		if maxSpreadPct > 0 && c.SpreadPct > maxSpreadPct {
+			continue
+		}
+		// Skip OI check when OI=0 — indicative feed may not return OI.
+		if minOI > 0 && c.OpenInterest > 0 && c.OpenInterest < minOI {
+			continue
+		}
+		if minVolume > 0 && c.OptionVolume < minVolume {
+			continue
+		}
+		qualified = append(qualified, c)
+	}
+	return qualified
+}
+
 // SelectBestContract picks the best option contract for the given direction ("call" or "put").
 // Prefers the contract with |delta| closest to 0.50 (high-quality near-ATM).
 // Returns nil if no contracts match the direction.

@@ -323,24 +323,26 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 }
 
 // RunOpeningConfirmationActivity evaluates the first 10 minutes of trading for
-// every entry_ready candidate. It promotes qualifying candidates to "confirmed"
-// and marks the rest "watch_only".
+// every entry_ready candidate. v7: Claude is the final authority at opening time.
 //
 // WHAT:  Runs after 6:40 AM PT on the trade date, once opening bars are available.
 // WHY:   Separates structural setup quality (overnight analysis) from live open
-//        behavior. A candidate can look perfect on daily bars but stall at the
-//        open; this step catches that before options are surfaced.
+//        behavior. Deterministic signals provide evidence; Claude makes the call.
 // HOW:
 //   1. Load entry_ready candidates for today.
 //   2. Fetch 1-min bars (6:30–6:40 AM PT) for all tickers + SPY in one batch.
-//   3. For each candidate, call strategy.EvaluateConfirmation() (pure, no I/O).
-//   4. Update candidate_status in trade_candidates.
-//   5. Write a row to trade_confirmations.
-//   6. Update daily_summaries.candidates_confirmed.
+//   3. Shortlist top N by score (strategy.TradeFrequency config).
+//   4. For each shortlisted candidate: run deterministic confirmation as evidence.
+//   5. If hard block fired → mark watch_only directly (Claude cannot override).
+//   6. Build EntryConfirmationPayload and call Claude.ConfirmEntry.
+//   7. For Claude CONFIRM (confidence >= min): fetch chain, place buy, create position.
+//   8. For Claude REJECT → watch_only.
+//   9. Non-shortlisted entry_ready → watch_only (didn't pass score bar).
+//  10. Update daily_summaries.candidates_confirmed.
 //
-// WHAT BREAKS: If bars are unavailable for a ticker, EvaluateConfirmation returns
-//   watch_only with auto_reject_reason="no_intraday_bars_available". The row is
-//   still persisted so the UI shows the reason.
+// WHAT BREAKS: If bars are unavailable, deterministic signals default to failing.
+//   Claude sees this in the evidence and will likely reject. The system is safe
+//   to the conservative side when data is absent.
 func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (string, error) {
 	loc, _ := time.LoadLocation("America/Los_Angeles")
 	now := time.Now().In(loc)
@@ -348,6 +350,11 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 	marketOpen := time.Date(now.Year(), now.Month(), now.Day(), 6, 30, 0, 0, loc)
 
 	log.Printf("activity: RunOpeningConfirmation for %s", tradeDate.Format("2006-01-02"))
+
+	rules := d.Rules
+	if rules == nil {
+		rules = strategy.DefaultRules()
+	}
 
 	// ── 1. Load entry_ready candidates ──────────────────────────────────────────
 	candidates, err := store.GetEntryReadyCandidates(ctx, d.Pool, tradeDate)
@@ -363,14 +370,9 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 	for _, c := range candidates {
 		tickers = append(tickers, c.Ticker)
 	}
-	// SPY always fetched for market_open_alignment signal
 	tickers = append(tickers, "SPY")
 
 	// ── 2. Fetch 1-min bars: 6:30–6:40 AM PT ────────────────────────────────────
-	rules := d.Rules
-	if rules == nil {
-		rules = strategy.DefaultRules()
-	}
 	windowMinutes := rules.OpenConfirmation.ConfirmationWindowMinutes
 	if windowMinutes <= 0 {
 		windowMinutes = 10
@@ -379,16 +381,67 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 	barsMap, fetchErr := d.Alpaca.FetchIntradayBars(tickers, marketOpen, windowMinutes)
 	if fetchErr != nil {
 		log.Printf("activity: intraday bars error: %v", fetchErr)
-		// Continue with empty map — each candidate will get watch_only/no_bars
 		barsMap = make(map[string][]indicators.Bar)
 	}
 	spyBars := barsMap["SPY"]
 
-	// ── 3. Evaluate each candidate ───────────────────────────────────────────────
-	confirmedCount := 0
-	watchOnlyCount := 0
-
+	// ── 3. Shortlist by score ────────────────────────────────────────────────────
+	// ClaudeConf (stored 0-100) is the proxy for the overnight deterministic score.
+	tf := rules.TradeFrequency
+	maxShortlist := tf.MaxEntryReadyToConfirm
+	if maxShortlist <= 0 {
+		maxShortlist = 5
+	}
+	minScore := tf.MinEntryReadyScore
+	if minScore <= 0 {
+		minScore = 65
+	}
+	// candidates already ordered by claude_confidence DESC from store
+	var shortlisted []store.Candidate
 	for _, c := range candidates {
+		if c.ClaudeConf >= minScore {
+			shortlisted = append(shortlisted, c)
+		}
+		if len(shortlisted) >= maxShortlist {
+			break
+		}
+	}
+
+	// Candidates that didn't make the shortlist → watch_only immediately
+	shortlistedIDs := make(map[string]bool, len(shortlisted))
+	for _, c := range shortlisted {
+		shortlistedIDs[c.ID] = true
+	}
+	watchOnlyCount := 0
+	for _, c := range candidates {
+		if !shortlistedIDs[c.ID] {
+			if err := store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only"); err != nil {
+				log.Printf("activity: mark watch_only %s: %v", c.Ticker, err)
+			}
+			watchOnlyCount++
+			log.Printf("activity: %s → watch_only (below shortlist score bar %.0f, score=%.0f)",
+				c.Ticker, minScore, c.ClaudeConf)
+		}
+	}
+
+	if len(shortlisted) == 0 {
+		log.Println("activity: no candidates passed shortlist score bar")
+		return fmt.Sprintf("confirmed=0 watch_only=%d no_shortlisted=true", watchOnlyCount), nil
+	}
+
+	// ── 4-5. Deterministic evidence pass + hard block check ──────────────────────
+	type candidateEvidence struct {
+		cand         store.Candidate
+		result       strategy.ConfirmationResult
+		hardBlocked  bool
+		payloadCand  claudeclient.ConfirmationCandidate
+	}
+
+	ccfg := rules.ClaudeConfirmation
+	var forClaude []claudeclient.ConfirmationCandidate
+	evidenceMap := make(map[string]candidateEvidence, len(shortlisted))
+
+	for _, c := range shortlisted {
 		result := strategy.EvaluateConfirmation(strategy.ConfirmationInput{
 			Ticker:        c.Ticker,
 			Direction:     c.Direction,
@@ -400,94 +453,301 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			SPYBars:       spyBars,
 		}, rules.OpenConfirmation)
 
-		log.Printf("activity: %s → %s (signals=%d auto_reject=%v reason=%s)",
-			c.Ticker, result.Status, result.SignalsPassed, result.AutoRejected, result.AutoRejectReason)
-
-		// ── 4. Update candidate_status ───────────────────────────────────────────
-		if updateErr := store.UpdateCandidateStatus(ctx, d.Pool, c.ID, result.Status); updateErr != nil {
-			log.Printf("activity: update status %s: %v", c.Ticker, updateErr)
-		}
-
-		// ── 5. Persist confirmation row ──────────────────────────────────────────
-		confirmErr := store.UpsertTradeConfirmation(ctx, d.Pool, store.ConfirmationStoreInput{
-			CandidateID:      c.ID,
-			Ticker:           c.Ticker,
-			TradeDate:        tradeDate,
-			Status:           result.Status,
-			SignalLevelHolds: result.SignalLevelHolds,
-			SignalOpenRange:  result.SignalOpenRange,
+		// Persist confirmation evidence row regardless of outcome
+		_ = store.UpsertTradeConfirmation(ctx, d.Pool, store.ConfirmationStoreInput{
+			CandidateID:       c.ID,
+			Ticker:            c.Ticker,
+			TradeDate:         tradeDate,
+			Status:            result.Status,
+			SignalLevelHolds:  result.SignalLevelHolds,
+			SignalOpenRange:   result.SignalOpenRange,
 			SignalNoRejection: result.SignalNoRejection,
-			SignalVolumeOK:   result.SignalVolumeOK,
-			SignalMarketOK:   result.SignalMarketOK,
-			SignalsPassed:    result.SignalsPassed,
-			AutoRejected:     result.AutoRejected,
-			AutoRejectReason: result.AutoRejectReason,
-			OpenPrice:        result.OpenPrice,
-			First10High:      result.First10High,
-			First10Low:       result.First10Low,
-			First10Close:     result.First10Close,
-			First10Volume:    result.First10Volume,
+			SignalVolumeOK:    result.SignalVolumeOK,
+			SignalMarketOK:    result.SignalMarketOK,
+			SignalsPassed:     result.SignalsPassed,
+			AutoRejected:      result.AutoRejected,
+			AutoRejectReason:  result.AutoRejectReason,
+			OpenPrice:         result.OpenPrice,
+			First10High:       result.First10High,
+			First10Low:        result.First10Low,
+			First10Close:      result.First10Close,
+			First10Volume:     result.First10Volume,
 		})
-		if confirmErr != nil {
-			log.Printf("activity: persist confirmation %s: %v", c.Ticker, confirmErr)
-		}
 
-		switch result.Status {
-		case "confirmed":
-			confirmedCount++
-
-			// ── 7. Auto paper entry ──────────────────────────────────────────────
-			// Use first10_close as entry price (opening candle close); fall back to
-			// entryHigh from the overnight analysis if intraday data was unavailable.
-			entryPrice := result.First10Close
-			if entryPrice <= 0 {
-				entryPrice = c.EntryHigh
+		// Hard block: auto_reject fired AND config says it's non-overridable
+		hardBlocked := result.AutoRejected && ccfg.DeterministicAutoRejectIsHardBlock
+		if hardBlocked {
+			log.Printf("activity: %s → watch_only (hard_block: %s)", c.Ticker, result.AutoRejectReason)
+			if err := store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only"); err != nil {
+				log.Printf("activity: update status %s: %v", c.Ticker, err)
 			}
-			optionType := "call"
-			if c.Direction == "bearish" {
-				optionType = "put"
-			}
-			posID, posErr := store.CreatePaperPosition(ctx, d.Pool, store.PaperPositionInput{
-				CandidateID: c.ID,
-				Ticker:      c.Ticker,
-				EntryPrice:  entryPrice,
-				EntryDate:   tradeDate,
-				Shares:      1, // paper: 1 contract equivalent
-				StopLoss:    c.StopLoss,
-				Target1:     c.Target1,
-				Target2:     c.Target2,
-				OptionType:  optionType,
-				SetupFamily: c.SetupFamily,
-			})
-			if posErr != nil {
-				log.Printf("activity: create paper position %s: %v", c.Ticker, posErr)
-			} else {
-				_ = store.InsertPositionEvent(ctx, d.Pool, posID, c.Ticker, "position_opened",
-					entryPrice, map[string]any{
-						"candidate_status": "confirmed",
-						"setup_family":     c.SetupFamily,
-						"stop_loss":        c.StopLoss,
-						"target1":          c.Target1,
-					})
-				log.Printf("activity: paper position created %s id=%s entry=%.2f", c.Ticker, posID, entryPrice)
-			}
-
-		default:
 			watchOnlyCount++
+			evidenceMap[c.Ticker] = candidateEvidence{cand: c, result: result, hardBlocked: true}
+			continue
 		}
+
+		// Build signal details list
+		var sigDetails []string
+		if result.SignalLevelHolds {
+			sigDetails = append(sigDetails, "level_holds")
+		}
+		if result.SignalOpenRange {
+			sigDetails = append(sigDetails, "open_range_ok")
+		}
+		if result.SignalNoRejection {
+			sigDetails = append(sigDetails, "no_rejection")
+		}
+		if result.SignalVolumeOK {
+			sigDetails = append(sigDetails, "volume_ok")
+		}
+		if result.SignalMarketOK {
+			sigDetails = append(sigDetails, "market_ok")
+		}
+
+		// Build opening context from intraday bars
+		var oc claudeclient.OpeningContext
+		if bars := barsMap[c.Ticker]; len(bars) > 0 {
+			n := len(bars)
+			oc.First10mClose = bars[n-1].Close
+			if len(bars) >= 5 {
+				oc.First5mClose = bars[4].Close
+			}
+			var hi, lo float64
+			var volSum float64
+			for _, b := range bars {
+				if hi == 0 || b.High > hi {
+					hi = b.High
+				}
+				if lo == 0 || b.Low < lo {
+					lo = b.Low
+				}
+				volSum += b.Volume
+			}
+			oc.OpeningRangeHigh = hi
+			oc.OpeningRangeLow = lo
+			oc.OpeningVolume = volSum / float64(n)
+			// VWAP approximation: sum(close*vol)/sum(vol)
+			var vwapNumer float64
+			for _, b := range bars {
+				vwapNumer += b.Close * b.Volume
+			}
+			if volSum > 0 {
+				oc.VWAP = vwapNumer / volSum
+			}
+		}
+
+		optionType := "call"
+		if c.Direction == "bearish" {
+			optionType = "put"
+		}
+
+		softMinMet := result.SignalsPassed >= ccfg.DeterministicSignalsSoftMin
+
+		pc := claudeclient.ConfirmationCandidate{
+			Ticker:      c.Ticker,
+			SetupFamily: c.SetupFamily,
+			Direction:   optionType,
+			Daily: claudeclient.DailyContext{
+				Close:       c.ClosePrice,
+				EMA20:       c.EMA20,
+				EMA50:       0, // not stored in DB currently
+				EMA100:      c.EMA100,
+				RSI:         c.RSI14,
+				MACDHist:    c.MACDHist,
+				VolumeRatio: c.VolumeRatio,
+				FinalScore:  c.ClaudeConf,
+				PriorDayHigh: c.EntryHigh, // best proxy available in DB
+				PriorDayLow:  c.EntryLow,
+			},
+			Opening: oc,
+			Risk: claudeclient.RiskContext{
+				StopLossPct:      c.StopLoss,
+				BaseTargetPct:    c.Target1,
+				StretchTargetPct: c.Target2,
+				RRRatio:          c.RRRatio,
+			},
+			DeterministicSignals: claudeclient.DeterministicSignals{
+				TrueCount:    result.SignalsPassed,
+				TotalChecked: 5, // 5 standard signals
+				SoftMinMet:   softMinMet,
+				Details:      sigDetails,
+			},
+			HardBlocks: claudeclient.HardBlockSummary{
+				IsClean: !result.AutoRejected,
+			},
+		}
+		if result.AutoRejected {
+			pc.HardBlocks.Fired = []string{result.AutoRejectReason}
+		}
+
+		forClaude = append(forClaude, pc)
+		evidenceMap[c.Ticker] = candidateEvidence{cand: c, result: result, hardBlocked: false, payloadCand: pc}
 	}
 
-	// ── 6. Update daily_summaries.candidates_confirmed ──────────────────────────
-	_, summaryErr := d.Pool.Exec(ctx,
+	if len(forClaude) == 0 {
+		log.Println("activity: all shortlisted candidates blocked — skipping Claude call")
+		return fmt.Sprintf("confirmed=0 watch_only=%d all_hard_blocked=true", watchOnlyCount), nil
+	}
+
+	// ── 6. Call Claude for final confirmation ────────────────────────────────────
+	claudeCli := claudeclient.NewClient(
+		d.Cfg.AnthropicAPIKey,
+		"claude-sonnet-4-6",
+		d.Cfg.ClaudeMaxOutputTokens,
+		"", // ConfirmEntry uses its own built-in system prompt
+	)
+
+	confirmPayload := claudeclient.EntryConfirmationPayload{
+		Candidates: forClaude,
+	}
+	claudeResp, claudeErr := claudeCli.ConfirmEntry(confirmPayload)
+	if claudeErr != nil {
+		log.Printf("activity: Claude ConfirmEntry error: %v — defaulting all to watch_only", claudeErr)
+		// Safe default: mark all as watch_only if Claude call fails
+		for _, c := range shortlisted {
+			if !evidenceMap[c.Ticker].hardBlocked {
+				_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only")
+				watchOnlyCount++
+			}
+		}
+		return fmt.Sprintf("confirmed=0 watch_only=%d claude_error=true", watchOnlyCount), nil
+	}
+
+	log.Printf("activity: Claude ConfirmEntry returned %d decisions (regime=%s)",
+		len(claudeResp.Decisions), claudeResp.Regime)
+
+	// ── 7-8. Apply Claude decisions ──────────────────────────────────────────────
+	minConfidence := ccfg.MinConfidence
+	if minConfidence <= 0 {
+		minConfidence = 0.65
+	}
+
+	confirmedCount := 0
+	decisionMap := make(map[string]claudeclient.EntryConfirmationDecision, len(claudeResp.Decisions))
+	for _, d2 := range claudeResp.Decisions {
+		decisionMap[d2.Ticker] = d2
+	}
+
+	lf := rules.OptionsTranslation.LiquidityFilters
+	todayStr := tradeDate.Format("2006-01-02")
+
+	for _, c := range shortlisted {
+		ev, ok := evidenceMap[c.Ticker]
+		if !ok || ev.hardBlocked {
+			continue // already handled
+		}
+
+		dec, hasDec := decisionMap[c.Ticker]
+		isConfirm := hasDec && dec.Decision == "CONFIRM" && dec.Confidence >= minConfidence
+
+		if !isConfirm {
+			reason := "no_decision"
+			if hasDec {
+				reason = fmt.Sprintf("claude_reject(conf=%.2f)", dec.Confidence)
+			}
+			log.Printf("activity: %s → watch_only (%s)", c.Ticker, reason)
+			if err := store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only"); err != nil {
+				log.Printf("activity: update status %s: %v", c.Ticker, err)
+			}
+			watchOnlyCount++
+			continue
+		}
+
+		// Claude confirmed — promote to confirmed
+		log.Printf("activity: %s → confirmed (claude conf=%.2f reason=%s)",
+			c.Ticker, dec.Confidence, dec.Reason)
+
+		if err := store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "confirmed"); err != nil {
+			log.Printf("activity: update status %s: %v", c.Ticker, err)
+		}
+
+		// Suppress if position already open for this ticker
+		if hasPos, _ := store.HasOpenPositionForTicker(ctx, d.Pool, c.Ticker); hasPos {
+			log.Printf("activity: %s already has open position — skipping buy", c.Ticker)
+			confirmedCount++
+			continue
+		}
+
+		// ── 7a. Fetch option chain and select best contract ──────────────────────
+		optionType := "call"
+		if c.Direction == "bearish" {
+			optionType = "put"
+		}
+		contracts, chainErr := d.Alpaca.FetchOptionChain(c.Ticker, c.ClosePrice, todayStr)
+		if chainErr != nil {
+			log.Printf("activity: fetch chain %s: %v — skipping buy", c.Ticker, chainErr)
+			confirmedCount++
+			continue
+		}
+
+		qualified := market.FilterChainQuality(contracts,
+			lf.MinOpenInterest, lf.MinOptionVolume, lf.MaxBidAskSpreadPctOfMid)
+		best := market.SelectBestContract(qualified, optionType)
+		if best == nil {
+			log.Printf("activity: no qualifying %s contract for %s — skipping buy", optionType, c.Ticker)
+			confirmedCount++
+			continue
+		}
+
+		limitPrice := (best.Bid + best.Ask) / 2.0
+		if best.Bid <= 0 {
+			limitPrice = best.Ask
+		}
+		// Use Claude's suggested limit price if provided and reasonable
+		if hasDec && dec.LimitPrice > 0 {
+			limitPrice = dec.LimitPrice
+		}
+
+		// ── 7b. Place buy via execution service ──────────────────────────────────
+		posID, posErr := store.CreatePaperPosition(ctx, d.Pool, store.PaperPositionInput{
+			CandidateID: c.ID,
+			Ticker:      c.Ticker,
+			EntryPrice:  limitPrice,
+			EntryDate:   tradeDate,
+			Shares:      1,
+			StopLoss:    c.StopLoss,
+			Target1:     c.Target1,
+			Target2:     c.Target2,
+			OptionType:  optionType,
+			SetupFamily: c.SetupFamily,
+		})
+		if posErr != nil {
+			log.Printf("activity: create paper position %s: %v", c.Ticker, posErr)
+			confirmedCount++
+			continue
+		}
+
+		orderID, orderErr := d.Alpaca.PlaceOptionOrder(best.Symbol, limitPrice)
+		if orderErr != nil {
+			log.Printf("activity: place option order %s: %v", c.Ticker, orderErr)
+		} else {
+			_ = store.UpdatePositionAlpacaOrderID(ctx, d.Pool, posID, orderID)
+		}
+		_ = store.UpdatePositionOptionDetails(ctx, d.Pool, posID, best.Symbol, limitPrice)
+
+		_ = store.InsertPositionEvent(ctx, d.Pool, posID, c.Ticker, "position_opened",
+			limitPrice, map[string]any{
+				"candidate_status": "confirmed",
+				"setup_family":     c.SetupFamily,
+				"contract":         best.Symbol,
+				"claude_conf":      dec.Confidence,
+				"claude_reason":    dec.Reason,
+			})
+		log.Printf("activity: paper position created %s posID=%s contract=%s limit=%.2f orderID=%s",
+			c.Ticker, posID, best.Symbol, limitPrice, orderID)
+		confirmedCount++
+	}
+
+	// ── 10. Update daily_summaries.candidates_confirmed ─────────────────────────
+	if _, err := d.Pool.Exec(ctx,
 		`UPDATE daily_summaries SET candidates_confirmed=$2, updated_at=NOW() WHERE trade_date=$1`,
 		tradeDate, confirmedCount,
-	)
-	if summaryErr != nil {
-		log.Printf("activity: update summary confirmed count: %v", summaryErr)
+	); err != nil {
+		log.Printf("activity: update summary confirmed count: %v", err)
 	}
 
-	summary := fmt.Sprintf("confirmed=%d watch_only=%d total_entry_ready=%d",
-		confirmedCount, watchOnlyCount, len(candidates))
+	summary := fmt.Sprintf("confirmed=%d watch_only=%d total_entry_ready=%d shortlisted=%d",
+		confirmedCount, watchOnlyCount, len(candidates), len(shortlisted))
 	log.Printf("activity: RunOpeningConfirmation done — %s", summary)
 	return summary, nil
 }

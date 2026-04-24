@@ -1,4 +1,4 @@
-version: 6
+version: 7
 
 # ============================================================
 # GLOBAL — feature computation windows and data quality gates.
@@ -16,8 +16,40 @@ global:
     atr_period: 14
     volume_avg_period: 20
     ema_slope_lookback: 5      # bars used to measure EMA20 slope as % change
+    # New in v7: extended indicator windows for additional scoring sleeves
+    realized_vol_short: 20     # realized volatility lookback (short)
+    realized_vol_long: 40      # realized volatility lookback (long)
+    momentum_short: 63         # vol-scaled momentum lookback (short, ~3 months)
+    momentum_long: 126         # vol-scaled momentum lookback (long, ~6 months)
+    entropy: 30                # Shannon entropy of daily returns lookback
+    bollinger: 20              # Bollinger band width lookback
   data_quality:
     min_bars_required: 35      # minimum daily bars for MACD(12,26,9) + RSI(14) + ATR(14)
+
+
+# ============================================================
+# TRADE FREQUENCY — controls how many setups advance per day.
+# ============================================================
+trade_frequency:
+  mode: active_paper                # active_paper | conservative | aggressive
+  max_entry_ready_to_confirm: 5     # max candidates sent to Claude for confirmation
+  max_new_positions_per_day: 3      # hard cap on new paper positions opened per day
+  min_entry_ready_score: 68         # minimum deterministic score to shortlist
+  min_claude_confidence: 0.65       # minimum Claude confidence to create position
+  allow_zero_trade_day: true        # no-trade days are valid; never force a trade
+
+
+# ============================================================
+# CLAUDE CONFIRMATION — controls Claude's role at opening time.
+# Claude is the final authority after deterministic evidence.
+# ============================================================
+claude_confirmation:
+  enabled: true
+  min_confidence: 0.65                        # below this → decline (REJECT)
+  max_candidates_per_run: 5                   # shortlist cap sent to ConfirmEntry
+  use_deterministic_opening_evidence: true    # pass deterministic signals as evidence
+  deterministic_signals_soft_min: 2           # soft floor (below this → warn Claude)
+  deterministic_auto_reject_is_hard_block: true  # auto_reject fired → hard block (Claude cannot override)
 
 
 # ============================================================

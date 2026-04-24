@@ -664,3 +664,184 @@ func IsLowerHighBreakdown(bars []Bar, lookback int) bool {
 	last := highs[len(highs)-3:]
 	return last[1] < last[0] && last[2] < last[1]
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Realized Volatility — annualized standard deviation of log daily returns
+// ──────────────────────────────────────────────────────────────────────────────
+
+// RealizedVolatility computes the annualized realized volatility over the last
+// `period` bars using log daily returns. Returns (0, false) when data is short.
+//
+//	realVol = stddev(logReturns) × sqrt(252)
+//
+// Used to normalize momentum across tickers (vol-scaled momentum).
+func RealizedVolatility(closes []float64, period int) (float64, bool) {
+	n := len(closes)
+	if n < period+1 {
+		return 0, false
+	}
+	// compute log returns for the last `period` days
+	logReturns := make([]float64, period)
+	for i := 0; i < period; i++ {
+		idx := n - period + i
+		if closes[idx-1] <= 0 {
+			return 0, false
+		}
+		logReturns[i] = math.Log(closes[idx] / closes[idx-1])
+	}
+	// mean
+	var sum float64
+	for _, r := range logReturns {
+		sum += r
+	}
+	mean := sum / float64(period)
+	// variance
+	var variance float64
+	for _, r := range logReturns {
+		diff := r - mean
+		variance += diff * diff
+	}
+	variance /= float64(period - 1) // sample variance
+	return math.Sqrt(variance) * math.Sqrt(252), true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Vol-Scaled Momentum — return normalized by realized volatility
+// ──────────────────────────────────────────────────────────────────────────────
+
+// VolScaledMomentum returns the N-day return divided by annualized realized
+// volatility over the same window. Higher = stronger risk-adjusted move.
+//
+//	volScaledMom = ROC(N) / realizedVol(N)
+//
+// A value > 1.5 indicates a meaningful trend relative to recent noise.
+// Returns (0, false) when data is insufficient or vol is zero.
+func VolScaledMomentum(closes []float64, period int) (float64, bool) {
+	roc, ok1 := ROCLast(closes, period)
+	vol, ok2 := RealizedVolatility(closes, period)
+	if !ok1 || !ok2 || vol == 0 {
+		return 0, false
+	}
+	return (roc / 100) / vol, true // roc is %, convert to decimal first
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Shannon Entropy of Daily Returns — measures trend vs noise
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ShannonEntropy computes the entropy of the sign distribution of daily returns
+// over the last `period` bars. Low entropy = clean directional trend.
+// High entropy = choppy / mean-reverting.
+//
+//	H = -p_up * log2(p_up) - p_down * log2(p_down)
+//
+// Perfect trend (all up or all down): H = 0.0
+// Coin flip (50/50): H = 1.0
+// Returns (0, false) when data is insufficient.
+func ShannonEntropy(closes []float64, period int) (float64, bool) {
+	n := len(closes)
+	if n < period+1 {
+		return 0, false
+	}
+	var ups, downs int
+	for i := n - period; i < n; i++ {
+		if closes[i] > closes[i-1] {
+			ups++
+		} else if closes[i] < closes[i-1] {
+			downs++
+		}
+		// flat days are ignored (neither up nor down)
+	}
+	total := ups + downs
+	if total == 0 {
+		return 1.0, true // all flat → maximum uncertainty
+	}
+	pUp := float64(ups) / float64(total)
+	pDown := float64(downs) / float64(total)
+
+	var entropy float64
+	if pUp > 0 {
+		entropy -= pUp * math.Log2(pUp)
+	}
+	if pDown > 0 {
+		entropy -= pDown * math.Log2(pDown)
+	}
+	return entropy, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Bollinger Band Width — envelope expansion / contraction signal
+// ──────────────────────────────────────────────────────────────────────────────
+
+// BollingerWidth computes the normalized Bollinger Band width over the last
+// `period` bars. Width = (upper - lower) / middle, where middle is SMA(period).
+//
+// Expanding width → increasing volatility / breakout condition.
+// Contracting width → squeeze — often precedes a directional move.
+// Returns (0, false) when data is insufficient.
+func BollingerWidth(closes []float64, period int, numStdDev float64) (float64, bool) {
+	n := len(closes)
+	if n < period {
+		return 0, false
+	}
+	slice := closes[n-period:]
+
+	// SMA
+	var sum float64
+	for _, v := range slice {
+		sum += v
+	}
+	sma := sum / float64(period)
+	if sma == 0 {
+		return 0, false
+	}
+
+	// stddev
+	var variance float64
+	for _, v := range slice {
+		diff := v - sma
+		variance += diff * diff
+	}
+	stddev := math.Sqrt(variance / float64(period))
+
+	upper := sma + numStdDev*stddev
+	lower := sma - numStdDev*stddev
+	return (upper - lower) / sma, true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Squeeze Ratio — Keltner Channel vs Bollinger Band compression
+// ──────────────────────────────────────────────────────────────────────────────
+
+// SqueezeRatio computes how compressed Bollinger Bands are relative to the
+// Keltner Channel. A ratio < 1.0 indicates the bands are inside the channel —
+// a classic "squeeze" condition that often precedes large directional moves.
+//
+//	squeezeRatio = BollingerWidth / KeltnerWidth
+//	            = (4×stddev) / (4×ATR)   [both normalized by SMA / EMA20]
+//
+// Returns (0, false) when ATR cannot be computed or data is short.
+func SqueezeRatio(bars []Bar, period int) (float64, bool) {
+	if len(bars) < period {
+		return 0, false
+	}
+	closes := Closes(bars)
+
+	bWidth, ok1 := BollingerWidth(closes, period, 2.0)
+	atr, ok2 := ATRLast(bars, period)
+	if !ok1 || !ok2 || atr == 0 {
+		return 0, false
+	}
+
+	// Keltner width (normalized): 4×ATR / EMA20
+	ema20, ok3 := EMALast(closes, period)
+	if !ok3 || ema20 == 0 {
+		return 0, false
+	}
+	keltnerWidth := 4 * atr / ema20
+
+	if keltnerWidth == 0 {
+		return 0, false
+	}
+	return bWidth / keltnerWidth, true
+}

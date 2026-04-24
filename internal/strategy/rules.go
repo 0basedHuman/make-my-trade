@@ -25,7 +25,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Rules is the decoded form of strategy_rules.yaml v6.
+// Rules is the decoded form of strategy_rules.yaml v7.
 type Rules struct {
 	Version int `yaml:"version"`
 
@@ -45,9 +45,11 @@ type Rules struct {
 	// Per-family DTE/delta bands live in Families[*].Options.
 	OptionsTranslation OptionsTranslationConfig `yaml:"options_translation"`
 
-	OpenConfirmation OpenConfirmationConfig `yaml:"open_confirmation"`
-	Scoring          ScoringConfig          `yaml:"scoring"`
-	DailyOutput      DailyOutputConfig      `yaml:"daily_output"`
+	OpenConfirmation    OpenConfirmationConfig    `yaml:"open_confirmation"`
+	Scoring             ScoringConfig             `yaml:"scoring"`
+	DailyOutput         DailyOutputConfig         `yaml:"daily_output"`
+	TradeFrequency      TradeFrequencyConfig      `yaml:"trade_frequency"`
+	ClaudeConfirmation  ClaudeConfirmationConfig  `yaml:"claude_confirmation"`
 }
 
 // ── Global ────────────────────────────────────────────────────────────────────
@@ -71,6 +73,13 @@ type FeatureWindowsConfig struct {
 	ATRPeriod        int `yaml:"atr_period"`
 	VolumeAvgPeriod  int `yaml:"volume_avg_period"`
 	EMASlopeLookback int `yaml:"ema_slope_lookback"`
+	// v7: extended windows for new scoring sleeves
+	RealizedVolShort int `yaml:"realized_vol_short"` // realized vol lookback (short)
+	RealizedVolLong  int `yaml:"realized_vol_long"`  // realized vol lookback (long)
+	MomentumShort    int `yaml:"momentum_short"`     // vol-scaled momentum (short, ~63d)
+	MomentumLong     int `yaml:"momentum_long"`      // vol-scaled momentum (long, ~126d)
+	Entropy          int `yaml:"entropy"`             // Shannon entropy of returns
+	Bollinger        int `yaml:"bollinger"`           // Bollinger width window
 }
 
 // DataQualityConfig holds minimum bar requirements before scoring begins.
@@ -317,6 +326,32 @@ type DailyOutputConfig struct {
 	NoTradeDayMessage         string `yaml:"no_trade_day_message"`
 }
 
+// ── Trade frequency ───────────────────────────────────────────────────────────
+
+// TradeFrequencyConfig controls how many setups advance to Claude per day.
+// mode: "active_paper" | "conservative" | "aggressive"
+type TradeFrequencyConfig struct {
+	Mode                   string  `yaml:"mode"`
+	MaxEntryReadyToConfirm int     `yaml:"max_entry_ready_to_confirm"`
+	MaxNewPositionsPerDay  int     `yaml:"max_new_positions_per_day"`
+	MinEntryReadyScore     float64 `yaml:"min_entry_ready_score"`
+	MinClaudeConfidence    float64 `yaml:"min_claude_confidence"`
+	AllowZeroTradeDay      bool    `yaml:"allow_zero_trade_day"`
+}
+
+// ── Claude confirmation ───────────────────────────────────────────────────────
+
+// ClaudeConfirmationConfig controls Claude's role as final authority at open.
+// When enabled, deterministic signals are evidence; Claude makes the call.
+type ClaudeConfirmationConfig struct {
+	Enabled                            bool    `yaml:"enabled"`
+	MinConfidence                      float64 `yaml:"min_confidence"`
+	MaxCandidatesPerRun                int     `yaml:"max_candidates_per_run"`
+	UseDeterministicOpeningEvidence    bool    `yaml:"use_deterministic_opening_evidence"`
+	DeterministicSignalsSoftMin        int     `yaml:"deterministic_signals_soft_min"`
+	DeterministicAutoRejectIsHardBlock bool    `yaml:"deterministic_auto_reject_is_hard_block"`
+}
+
 // ── Loader ────────────────────────────────────────────────────────────────────
 
 // LoadRules parses strategy_rules.yaml from the given path.
@@ -480,12 +515,15 @@ func DefaultRules() *Rules {
 		HoldWindow: HoldWindow{Min: 2, Base: 7, Max: 10},
 	}
 	return &Rules{
-		Version: 6,
+		Version: 7,
 		Global: GlobalConfig{
 			FeatureWindows: FeatureWindowsConfig{
 				EMAShort: 20, EMAMedium: 50, EMALong: 100,
 				RSIPeriod: 14, MACDFast: 12, MACDSlow: 26, MACDSignal: 9,
 				ATRPeriod: 14, VolumeAvgPeriod: 20, EMASlopeLookback: 5,
+				RealizedVolShort: 20, RealizedVolLong: 40,
+				MomentumShort: 63, MomentumLong: 126,
+				Entropy: 30, Bollinger: 20,
 			},
 			DataQuality: DataQualityConfig{MinBarsRequired: 35},
 		},
@@ -554,6 +592,22 @@ func DefaultRules() *Rules {
 		DailyOutput: DailyOutputConfig{
 			AllowZeroTradeDay: true, NoTradeDayWhenNoConfirmed: true,
 			NoTradeDayMessage: "No symbols reached confirmed status. Watchlist candidates may still exist.",
+		},
+		TradeFrequency: TradeFrequencyConfig{
+			Mode:                   "active_paper",
+			MaxEntryReadyToConfirm: 5,
+			MaxNewPositionsPerDay:  3,
+			MinEntryReadyScore:     68,
+			MinClaudeConfidence:    0.65,
+			AllowZeroTradeDay:      true,
+		},
+		ClaudeConfirmation: ClaudeConfirmationConfig{
+			Enabled:                            true,
+			MinConfidence:                      0.65,
+			MaxCandidatesPerRun:                5,
+			UseDeterministicOpeningEvidence:    true,
+			DeterministicSignalsSoftMin:        2,
+			DeterministicAutoRejectIsHardBlock: true,
 		},
 	}
 }

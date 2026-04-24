@@ -104,6 +104,37 @@ type Features struct {
 
 	// Relative strength vs SPY (% outperformance over 20 days)
 	RelStrength float64
+
+	// ── v7: Extended indicator sleeves ────────────────────────────────────────
+
+	// Realized volatility (annualized stddev of log returns)
+	RealVol20    float64
+	RealVol40    float64
+	HasRealVol20 bool
+	HasRealVol40 bool
+
+	// Vol-scaled momentum: return / realized_vol — cross-ticker normalized
+	VolScaledMom63  float64 // ~3-month horizon
+	VolScaledMom126 float64 // ~6-month horizon
+	HasVolScaledMom bool
+
+	// Shannon entropy of daily returns (0=clean trend, 1=coin flip)
+	Entropy30    float64
+	HasEntropy30 bool
+
+	// Bollinger Band width (upper−lower / SMA, 20-bar, 2σ)
+	BollingerWidth20    float64
+	HasBollingerWidth   bool
+
+	// Squeeze ratio: Bollinger width / Keltner width (< 1.0 = squeeze active)
+	SqueezeRatio20    float64
+	HasSqueezeRatio   bool
+
+	// Raw returns used in SMA/EMA divergence sleeve
+	Return63d  float64 // 63-bar ROC %
+	Return126d float64 // 126-bar ROC %
+	HasReturn63d  bool
+	HasReturn126d bool
 }
 
 // FamilyScore is the complete scored result for one setup family.
@@ -464,6 +495,64 @@ func (e *Engine) computeFeatures(bars []indicators.Bar, spyBars []indicators.Bar
 			f.RelStrength = rs
 		}
 	}
+
+	// ── v7: Extended indicator sleeves ────────────────────────────────────────
+	fw := e.rules.Global.FeatureWindows
+
+	rvShort := fw.RealizedVolShort
+	if rvShort <= 0 {
+		rvShort = 20
+	}
+	rvLong := fw.RealizedVolLong
+	if rvLong <= 0 {
+		rvLong = 40
+	}
+	momShort := fw.MomentumShort
+	if momShort <= 0 {
+		momShort = 63
+	}
+	momLong := fw.MomentumLong
+	if momLong <= 0 {
+		momLong = 126
+	}
+	entropyPeriod := fw.Entropy
+	if entropyPeriod <= 0 {
+		entropyPeriod = 30
+	}
+	bolPeriod := fw.Bollinger
+	if bolPeriod <= 0 {
+		bolPeriod = 20
+	}
+
+	if rv, ok := indicators.RealizedVolatility(closes, rvShort); ok {
+		f.RealVol20, f.HasRealVol20 = rv, true
+	}
+	if rv, ok := indicators.RealizedVolatility(closes, rvLong); ok {
+		f.RealVol40, f.HasRealVol40 = rv, true
+	}
+	if vsm63, ok := indicators.VolScaledMomentum(closes, momShort); ok {
+		f.VolScaledMom63, f.HasVolScaledMom = vsm63, true
+	}
+	if vsm126, ok := indicators.VolScaledMomentum(closes, momLong); ok {
+		f.VolScaledMom126 = vsm126
+		// HasVolScaledMom already set if 63d succeeded; 126d is supplemental
+	}
+	if ent, ok := indicators.ShannonEntropy(closes, entropyPeriod); ok {
+		f.Entropy30, f.HasEntropy30 = ent, true
+	}
+	if bw, ok := indicators.BollingerWidth(closes, bolPeriod, 2.0); ok {
+		f.BollingerWidth20, f.HasBollingerWidth = bw, true
+	}
+	if sr, ok := indicators.SqueezeRatio(bars, bolPeriod); ok {
+		f.SqueezeRatio20, f.HasSqueezeRatio = sr, true
+	}
+	if r63, ok := indicators.ROCLast(closes, momShort); ok {
+		f.Return63d, f.HasReturn63d = r63, true
+	}
+	if r126, ok := indicators.ROCLast(closes, momLong); ok {
+		f.Return126d, f.HasReturn126d = r126, true
+	}
+
 	return f
 }
 
@@ -575,63 +664,125 @@ func checkPreconditions(p FamilyPreconditions, f Features) string {
 // scoreTrendStructure measures the quality of the EMA stack alignment.
 // For continuation families: EMA20-EMA50 gap depth.
 // For momentum families: EMA20 slope steepness (% per 5 bars).
+//
+// v7 sleeve: SMA/EMA divergence (Return63d vs Return126d).
+//   Short momentum > long momentum → trend is accelerating → +0.10 bonus.
+//   Short momentum < long momentum → trend may be exhausting → −0.05 penalty.
 func scoreTrendStructure(name string, cfg FamilyConfig, f Features) float64 {
 	isMomentum := name == "bullish_momentum_breakout" || name == "bearish_momentum_breakdown"
+	var base float64
+
 	if isMomentum {
-		// Momentum: score based on EMA20 slope magnitude.
-		// EMASlope returns % change over lookback bars.
 		if !f.HasEMA20Slope {
-			return 0.3 // slope unknown but precondition passed
+			base = 0.3
+		} else {
+			slope := f.EMA20Slope
+			if name == "bearish_momentum_breakdown" {
+				slope = -slope
+			}
+			switch {
+			case slope >= 1.0:
+				base = 1.0
+			case slope >= 0.5:
+				base = lerp(0.7, 1.0, (slope-0.5)/0.5)
+			case slope >= 0.2:
+				base = lerp(0.5, 0.7, (slope-0.2)/0.3)
+			default:
+				base = 0.3
+			}
 		}
-		slope := f.EMA20Slope
-		if name == "bearish_momentum_breakdown" {
-			slope = -slope // make negative slope positive for scoring
-		}
-		// slope > 0 (precondition), score by magnitude:
-		// ≥ 1.0% → 1.0,  ≥ 0.5% → 0.7,  ≥ 0.2% → 0.5,  > 0 → 0.3
-		switch {
-		case slope >= 1.0:
-			return 1.0
-		case slope >= 0.5:
-			return lerp(0.7, 1.0, (slope-0.5)/0.5)
-		case slope >= 0.2:
-			return lerp(0.5, 0.7, (slope-0.2)/0.3)
-		default:
-			return 0.3
+	} else {
+		// Continuation: score based on EMA20-EMA50 gap quality.
+		g := cfg.EMAGapPct
+		if g.StrongMin == 0 && g.AdequateMin == 0 {
+			base = 0.5
+		} else {
+			gapPct := f.EMA20vsEMA50Pct
+			if name == "bearish_continuation" {
+				gapPct = -gapPct
+			}
+			switch {
+			case gapPct >= g.StrongMin:
+				base = 1.0
+			case gapPct >= g.AdequateMin:
+				if g.StrongMin > g.AdequateMin {
+					base = lerp(0.4, 1.0, (gapPct-g.AdequateMin)/(g.StrongMin-g.AdequateMin))
+				} else {
+					base = 0.6
+				}
+			default:
+				base = 0.2
+			}
 		}
 	}
 
-	// Continuation: score based on EMA20-EMA50 gap quality.
-	g := cfg.EMAGapPct
-	if g.StrongMin == 0 && g.AdequateMin == 0 {
-		// Family doesn't use EMA gap scoring (momentum families)
-		return 0.5
-	}
-
-	gapPct := f.EMA20vsEMA50Pct
-	if name == "bearish_continuation" {
-		gapPct = -gapPct // bearish: EMA20 below EMA50, so gap is negative
-	}
-
-	switch {
-	case gapPct >= g.StrongMin:
-		return 1.0
-	case gapPct >= g.AdequateMin:
-		if g.StrongMin > g.AdequateMin {
-			return lerp(0.4, 1.0, (gapPct-g.AdequateMin)/(g.StrongMin-g.AdequateMin))
+	// Sleeve 3: SMA/EMA divergence — short vs long momentum alignment
+	if f.HasReturn63d && f.HasReturn126d {
+		isBull := isBullishFamily(name)
+		short := f.Return63d
+		long := f.Return126d
+		if !isBull {
+			short = -short // for bearish families, negative returns are positive signals
+			long = -long
 		}
-		return 0.6
-	default:
-		return 0.2 // positive gap (precondition passed) but very narrow
+		if short > long+5.0 {
+			// Short momentum meaningfully exceeds long → trend accelerating
+			base = math.Min(1.0, base+0.10)
+		} else if short < long-5.0 {
+			// Short momentum lagging long → potential trend exhaustion
+			base = math.Max(0, base-0.05)
+		}
 	}
+
+	return clamp01(base)
 }
 
-// scoreMomentumAlignment measures MACD magnitude and RSI position.
-// Both components carry equal weight within this dimension.
+// scoreMomentumAlignment measures MACD magnitude, RSI position, and (v7)
+// vol-scaled momentum quality gated by Shannon entropy.
+//
+// v7 sleeve integration:
+//   - Vol-scaled momentum (vsm63) adds up to +0.15 bonus when momentum is
+//     strong and risk-adjusted (vsm > 1.5).
+//   - Shannon entropy gates the bonus: high entropy (choppy) → no bonus;
+//     low entropy (clean trend) → full bonus. Entropy > 0.92 also penalizes
+//     the base score slightly.
 func scoreMomentumAlignment(cfg FamilyConfig, f Features) float64 {
 	macdScore := scoreMACDComponent(f)
 	rsiScore := scoreRSIComponent(cfg.RSI, f)
-	return (macdScore + rsiScore) / 2.0
+	base := (macdScore + rsiScore) / 2.0
+
+	// Sleeve 1: vol-scaled momentum bonus (0..+0.15)
+	vsmBonus := 0.0
+	if f.HasVolScaledMom {
+		vsm := math.Abs(f.VolScaledMom63)
+		switch {
+		case vsm >= 2.5:
+			vsmBonus = 0.15
+		case vsm >= 1.5:
+			vsmBonus = lerp(0.07, 0.15, (vsm-1.5)/1.0)
+		case vsm >= 0.8:
+			vsmBonus = lerp(0.0, 0.07, (vsm-0.8)/0.7)
+		}
+	}
+
+	// Sleeve 2: entropy gate — low entropy (clean trend) = full bonus;
+	// high entropy (choppy) = reduced bonus and small base penalty.
+	entropyMultiplier := 1.0
+	if f.HasEntropy30 {
+		ent := f.Entropy30
+		if ent > 0.92 {
+			// Very choppy — apply mild base penalty and zero vsmBonus
+			base = math.Max(0, base-0.08)
+			vsmBonus = 0
+			entropyMultiplier = 0
+		} else if ent > 0.80 {
+			// Moderately choppy — scale down bonus
+			entropyMultiplier = lerp(0.0, 1.0, (0.92-ent)/(0.92-0.80))
+		}
+		// ent <= 0.80: clean trend → full bonus (multiplier stays 1.0)
+	}
+
+	return math.Min(1.0, base+vsmBonus*entropyMultiplier)
 }
 
 // scoreMACDComponent scores the MACD histogram magnitude relative to price.
@@ -702,9 +853,14 @@ func scoreVolumeParticipation(cfg FamilyConfig, f Features) float64 {
 
 // scoreEntryQuality scores how close to ideal the current entry point is.
 // Extension from EMA20 is the primary signal; RSI tightness adds refinement.
+//
+// v7 sleeve 4: Bollinger width + squeeze ratio (breakout/expansion quality).
+//   Squeeze active (ratio < 1.0): potential energy → +0.10 entry quality bonus.
+//   Expanding bands (width > 0.08): breakout in progress → +0.08 bonus.
+//   Extremely wide bands (width > 0.15): overextended → small penalty.
 func scoreEntryQuality(cfg FamilyConfig, f Features) float64 {
 	ext := cfg.ExtensionPct
-	extPct := math.Abs(f.CloseVsEMA20Pct) // distance from EMA20 in either direction
+	extPct := math.Abs(f.CloseVsEMA20Pct)
 
 	var extScore float64
 	switch {
@@ -715,18 +871,39 @@ func scoreEntryQuality(cfg FamilyConfig, f Features) float64 {
 	case extPct <= ext.HardReject:
 		extScore = 0.1
 	default:
-		extScore = 0.0 // fully extended — entry quality is zero
+		extScore = 0.0
 	}
 
-	// RSI tightness: extra credit for being in the ideal band
+	// RSI tightness bonus
 	rsiBonus := 0.0
 	if f.HasRSI {
 		if f.RSI >= cfg.RSI.IdealMin && f.RSI <= cfg.RSI.IdealMax {
 			rsiBonus = 0.2
 		}
 	}
+	base := math.Min(1.0, extScore+rsiBonus*extScore)
 
-	return math.Min(1.0, extScore+rsiBonus*extScore) // bonus only amplifies good entries
+	// Sleeve 4: Bollinger / squeeze expansion quality
+	expansionBonus := 0.0
+	if f.HasSqueezeRatio && f.SqueezeRatio20 < 1.0 {
+		// Squeeze active: energy coiling, potential breakout
+		// Tighter squeeze → larger bonus
+		squeezeness := 1.0 - f.SqueezeRatio20 // 0 = not squeezed, 1 = fully inside channel
+		expansionBonus += lerp(0.0, 0.10, squeezeness)
+	}
+	if f.HasBollingerWidth {
+		bw := f.BollingerWidth20
+		if bw > 0.15 {
+			// Bands very wide → overextended, small penalty
+			base = math.Max(0, base-0.06)
+		} else if bw > 0.08 {
+			// Bands expanding — breakout underway
+			expansionBonus += lerp(0.0, 0.08, (bw-0.08)/0.07)
+		}
+		// bw < 0.08: tight bands, squeeze bonus already handled above
+	}
+
+	return clamp01(base + expansionBonus)
 }
 
 // scorePatternStrength normalizes the integer pattern score to 0.0-1.0.
@@ -1194,6 +1371,37 @@ func RegimeLabel(vix float64, btcROC float64) string {
 		return "risk_on"
 	}
 	return "neutral"
+}
+
+// ShortlistEntryReady filters and ranks entry_ready candidates for Claude confirmation.
+//
+// Selection rules (all configurable via Rules.TradeFrequency):
+//  1. Only entry_ready status — structural_candidate and others are excluded.
+//  2. FinalScore >= minScore — weak candidates are filtered before Claude sees them.
+//  3. Results are sorted by FinalScore descending.
+//  4. The top maxCount candidates are returned.
+//
+// The returned slice is what gets sent to RunOpeningConfirmationActivity.
+// Claude is the final authority; this function is the pre-filter only.
+func ShortlistEntryReady(analyses []SymbolAnalysis, maxCount int, minScore float64) []SymbolAnalysis {
+	// Filter
+	var candidates []SymbolAnalysis
+	for _, a := range analyses {
+		if a.CandidateStatus == "entry_ready" && a.ScoreBreakdown.FinalScore >= minScore {
+			candidates = append(candidates, a)
+		}
+	}
+	// Sort by FinalScore descending (insertion sort is fine for ≤26 symbols)
+	for i := 1; i < len(candidates); i++ {
+		for j := i; j > 0 && candidates[j].ScoreBreakdown.FinalScore > candidates[j-1].ScoreBreakdown.FinalScore; j-- {
+			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
+		}
+	}
+	// Trim to maxCount
+	if maxCount > 0 && len(candidates) > maxCount {
+		candidates = candidates[:maxCount]
+	}
+	return candidates
 }
 
 // ScanResult holds the aggregate result of scanning all symbols.

@@ -29,12 +29,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/yourname/makemytrade/config"
 	claudeclient "github.com/yourname/makemytrade/internal/claude"
+	"github.com/yourname/makemytrade/internal/execution"
 	"github.com/yourname/makemytrade/internal/indicators"
 	"github.com/yourname/makemytrade/internal/market"
 	"github.com/yourname/makemytrade/internal/store"
 	"github.com/yourname/makemytrade/internal/strategy"
-	"github.com/yourname/makemytrade/config"
 )
 
 // ActivityDeps holds shared dependencies for all activities.
@@ -131,37 +132,37 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 			}
 
 			candID, upsertErr := store.UpsertCandidate(ctx, d.Pool, store.UpsertCandidateInput{
-				TradeDate:      today.Truncate(24 * time.Hour),
-				Ticker:         t,
-				GateTrend:      a.GateTrend.Passed,
-				GateMomentum:   a.GateMomentum.Passed,
-				GateVolume:     a.GateVolume.Passed,
-				GateVIX:        a.GateVIX.Passed,
-				GateBTC:        a.GateBTC.Passed,
-				GateRSI:        a.GateRSI.Passed,
-				AllGates:       a.Eligible,
-				ClosePrice:     a.ClosePrice,
-				EMA20:          a.EMA20,
-				EMA100:         a.EMA100,
-				RSI14:          a.RSI14,
-				MACDHist:       a.MACDHist,
-				VolumeRatio:    a.VolumeRatio,
-				VIXLevel:       vixLevel,
-				BTCROC20:       btcROC,
-				PatternName:    a.PatternName,
-				PatternScore:   a.PatternScore,
-				AntiPatterns:   a.AntiPatterns,
-				RejectedByAnti: a.RejectedByAnti,
-				EntryLow:       a.EntryLow,
-				EntryHigh:      a.EntryHigh,
-				StopLoss:       a.StopLoss,
-				Target1:        a.Target1,
-				Target2:        a.Target2,
-				RRRatio:        a.RRRatio,
-				HoldDaysMin:    a.HoldDaysMin,
-				HoldDaysBase:   a.HoldDaysBase,
-				HoldDaysMax:    a.HoldDaysMax,
-				RejectReason:   a.ScreenReason,
+				TradeDate:       today.Truncate(24 * time.Hour),
+				Ticker:          t,
+				GateTrend:       a.GateTrend.Passed,
+				GateMomentum:    a.GateMomentum.Passed,
+				GateVolume:      a.GateVolume.Passed,
+				GateVIX:         a.GateVIX.Passed,
+				GateBTC:         a.GateBTC.Passed,
+				GateRSI:         a.GateRSI.Passed,
+				AllGates:        a.Eligible,
+				ClosePrice:      a.ClosePrice,
+				EMA20:           a.EMA20,
+				EMA100:          a.EMA100,
+				RSI14:           a.RSI14,
+				MACDHist:        a.MACDHist,
+				VolumeRatio:     a.VolumeRatio,
+				VIXLevel:        vixLevel,
+				BTCROC20:        btcROC,
+				PatternName:     a.PatternName,
+				PatternScore:    a.PatternScore,
+				AntiPatterns:    a.AntiPatterns,
+				RejectedByAnti:  a.RejectedByAnti,
+				EntryLow:        a.EntryLow,
+				EntryHigh:       a.EntryHigh,
+				StopLoss:        a.StopLoss,
+				Target1:         a.Target1,
+				Target2:         a.Target2,
+				RRRatio:         a.RRRatio,
+				HoldDaysMin:     a.HoldDaysMin,
+				HoldDaysBase:    a.HoldDaysBase,
+				HoldDaysMax:     a.HoldDaysMax,
+				RejectReason:    a.ScreenReason,
 				CandidateStatus: a.CandidateStatus,
 				SetupFamily:     a.SetupFamily,
 				Direction:       dir,
@@ -327,22 +328,31 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 //
 // WHAT:  Runs after 6:40 AM PT on the trade date, once opening bars are available.
 // WHY:   Separates structural setup quality (overnight analysis) from live open
-//        behavior. Deterministic signals provide evidence; Claude makes the call.
+//
+//	behavior. Deterministic signals provide evidence; Claude makes the call.
+//
 // HOW:
-//   1. Load entry_ready candidates for today.
-//   2. Fetch 1-min bars (6:30–6:40 AM PT) for all tickers + SPY in one batch.
-//   3. Shortlist top N by score (strategy.TradeFrequency config).
-//   4. For each shortlisted candidate: run deterministic confirmation as evidence.
-//   5. If hard block fired → mark watch_only directly (Claude cannot override).
-//   6. Build EntryConfirmationPayload and call Claude.ConfirmEntry.
-//   7. For Claude CONFIRM (confidence >= min): fetch chain, place buy, create position.
-//   8. For Claude REJECT → watch_only.
-//   9. Non-shortlisted entry_ready → watch_only (didn't pass score bar).
+//  1. Load entry_ready candidates for today.
+//  2. Fetch 1-min bars (6:30–6:40 AM PT) for all tickers + SPY in one batch.
+//  3. Shortlist top N by score (strategy.TradeFrequency config).
+//  4. For each shortlisted candidate:
+//     a. Run deterministic confirmation as evidence (not authority).
+//     b. If hard block fired → mark watch_only directly (Claude cannot override).
+//     c. Fetch option chain, filter for quality, select best contract.
+//     d. If no qualifying contract → watch_only (nothing to confirm).
+//     e. Populate ConfirmationCandidate with actual contract details.
+//  5. Fetch market context (VIX, BTC ROC20, SPY trend) for Claude payload.
+//  6. Call Claude.ConfirmEntry with full payload (candidates + market context).
+//  7. For Claude CONFIRM (confidence >= min): buy the SAME contract Claude saw
+//     via execution.BuyOptionPosition (DB-first → Alpaca order).
+//  8. For Claude REJECT → watch_only.
+//  9. Non-shortlisted entry_ready → watch_only (didn't pass score bar).
 //  10. Update daily_summaries.candidates_confirmed.
 //
 // WHAT BREAKS: If bars are unavailable, deterministic signals default to failing.
-//   Claude sees this in the evidence and will likely reject. The system is safe
-//   to the conservative side when data is absent.
+//
+//	Claude sees this in the evidence and will likely reject. The system is safe
+//	to the conservative side when data is absent.
 func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (string, error) {
 	loc, _ := time.LoadLocation("America/Los_Angeles")
 	now := time.Now().In(loc)
@@ -608,6 +618,7 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 				MidPrice:     limitPrice,
 				BidAskSpread: best.SpreadPct,
 				OpenInterest: best.OpenInterest,
+				OptionVolume: best.OptionVolume,
 			},
 			Risk: claudeclient.RiskContext{
 				EntryPrice:       limitPrice,
@@ -645,7 +656,36 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 		return fmt.Sprintf("confirmed=0 watch_only=%d all_blocked=true", watchOnlyCount), nil
 	}
 
-	// ── 6. Call Claude for final confirmation ────────────────────────────────────
+	// ── 6. Build market context + call Claude for final confirmation ─────────────
+	// Fetch VIX and BTC ROC20 so Claude can factor broad market state into the
+	// confirm/reject decision. Both calls are best-effort — failure defaults to
+	// safe neutral values rather than blocking the confirmation run.
+	confirmVIX := 20.0
+	if vix, _, err := d.FRED.FetchLatestVIX(); err == nil {
+		confirmVIX = vix
+	} else {
+		log.Printf("activity: confirmation VIX fetch warning: %v — using %.1f", err, confirmVIX)
+	}
+
+	confirmBTCROC := 0.0
+	if btcBars, err := d.Alpaca.FetchCryptoDailyBars("BTC/USD", tradeDate.AddDate(0, -2, 0), 60); err == nil && len(btcBars) >= 21 {
+		btcCloses := indicators.Closes(btcBars)
+		if roc, ok := indicators.ROCLast(btcCloses, 20); ok {
+			confirmBTCROC = roc
+		}
+	}
+
+	// Derive SPY trend from first-5m bar relative to prior close.
+	spyTrend := "neutral"
+	if len(spyBars) > 0 {
+		spyFirst := spyBars[0]
+		if spyFirst.Close > spyFirst.Open*1.002 {
+			spyTrend = "bullish"
+		} else if spyFirst.Close < spyFirst.Open*0.998 {
+			spyTrend = "bearish"
+		}
+	}
+
 	claudeCli := claudeclient.NewClient(
 		d.Cfg.AnthropicAPIKey,
 		"claude-sonnet-4-6",
@@ -654,6 +694,12 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 	)
 
 	confirmPayload := claudeclient.EntryConfirmationPayload{
+		MarketContext: claudeclient.MarketContext{
+			VIX:           confirmVIX,
+			BTCRoc20:      confirmBTCROC,
+			SPXTrend:      spyTrend,
+			MacroNewsBias: "neutral",
+		},
 		Candidates: forClaude,
 	}
 	claudeResp, claudeErr := claudeCli.ConfirmEntry(confirmPayload)
@@ -724,41 +770,27 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			continue
 		}
 
-		// ── 7b. Create DB position FIRST (idempotent), then place Alpaca order ───
-		// DB-first ensures that even if the Alpaca call succeeds but the process
-		// crashes, the next Temporal retry will find the position (ON CONFLICT)
-		// and skip re-buying. Alpaca order goes out after a confirmed DB record.
-		posID, posErr := store.CreatePaperPosition(ctx, d.Pool, store.PaperPositionInput{
-			CandidateID: c.ID,
-			Ticker:      c.Ticker,
-			EntryPrice:  limitPrice,
-			EntryDate:   tradeDate,
-			Shares:      1,
-			StopLoss:    c.StopLoss,
-			Target1:     c.Target1,
-			Target2:     c.Target2,
-			OptionType:  ev.optionType,
-			SetupFamily: c.SetupFamily,
+		// ── 7b. Buy via shared execution service (DB-first, single lifecycle owner) ─
+		// execution.BuyOptionPosition: CreatePaperPosition → PlaceOptionOrder →
+		// UpdatePositionAlpacaOrderID → UpdatePositionOptionDetails
+		buyResult, buyErr := execution.BuyOptionPosition(ctx, d.Pool, d.Alpaca, execution.BuyInput{
+			CandidateID:    c.ID,
+			Ticker:         c.Ticker,
+			SetupFamily:    c.SetupFamily,
+			OptionType:     ev.optionType,
+			ContractSymbol: best.Symbol,
+			LimitPrice:     limitPrice,
+			StopLoss:       c.StopLoss,
+			Target1:        c.Target1,
+			Target2:        c.Target2,
 		})
-		if posErr != nil {
-			log.Printf("activity: create paper position %s: %v", c.Ticker, posErr)
+		if buyErr != nil {
+			log.Printf("activity: buy option position %s: %v", c.Ticker, buyErr)
 			confirmedCount++
 			continue
 		}
 
-		// Save contract details before placing order so P&L tracking works
-		// even if the order call fails (we can still compute P&L from option mid)
-		_ = store.UpdatePositionOptionDetails(ctx, d.Pool, posID, best.Symbol, limitPrice)
-
-		orderID, orderErr := d.Alpaca.PlaceOptionOrder(best.Symbol, limitPrice)
-		if orderErr != nil {
-			log.Printf("activity: place option order %s: %v", c.Ticker, orderErr)
-			// Non-fatal: position in DB, can be manually reconciled
-		} else {
-			_ = store.UpdatePositionAlpacaOrderID(ctx, d.Pool, posID, orderID)
-		}
-
-		_ = store.InsertPositionEvent(ctx, d.Pool, posID, c.Ticker, "position_opened",
+		_ = store.InsertPositionEvent(ctx, d.Pool, buyResult.PositionID, c.Ticker, "position_opened",
 			limitPrice, map[string]any{
 				"candidate_status": "confirmed",
 				"setup_family":     c.SetupFamily,
@@ -770,7 +802,7 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 				"claude_reason":    dec.Reason,
 			})
 		log.Printf("activity: paper position created %s posID=%s contract=%s limit=%.2f orderID=%s",
-			c.Ticker, posID, best.Symbol, limitPrice, orderID)
+			c.Ticker, buyResult.PositionID, best.Symbol, limitPrice, buyResult.AlpacaOrderID)
 		confirmedCount++
 	}
 
@@ -792,14 +824,16 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 //
 // WHAT: Runs once per trading day (~12:45 PM PT, before market close).
 // WHY:  Ensures every open position gets a daily HOLD/EXIT decision rather
-//       than sitting unmonitored until expiration.
+//
+//	than sitting unmonitored until expiration.
+//
 // HOW:
-//   1. Load all open positions (with option_type / setup_family).
-//   2. Fetch current price for each ticker via Alpaca latest quote.
-//   3. Compute PnL% and days held.
-//   4. Call Claude DecideOptions with OpenPositions list (no new candidates).
-//   5. For each position: write position_reviews row.
-//   6. Execute EXIT: close position + insert position_closed event.
+//  1. Load all open positions (with option_type / setup_family).
+//  2. Fetch current price for each ticker via Alpaca latest quote.
+//  3. Compute PnL% and days held.
+//  4. Call Claude DecideOptions with OpenPositions list (no new candidates).
+//  5. For each position: write position_reviews row.
+//  6. Execute EXIT: close position + insert position_closed event.
 func (d *ActivityDeps) RunPositionReviewActivity(ctx context.Context) (string, error) {
 	loc, _ := time.LoadLocation("America/Los_Angeles")
 	now := time.Now().In(loc)
@@ -940,30 +974,24 @@ func (d *ActivityDeps) RunPositionReviewActivity(ctx context.Context) (string, e
 
 		executed := false
 		if action == "EXIT" {
-			// Place sell order on Alpaca before marking closed in DB.
-			if p.OptionSymbol != "" {
-				sellPrice := e.currentPrice // option mid-price from earlier fetch
-				if sellPrice <= 0 {
-					sellPrice, _ = d.Alpaca.FetchOptionMidPrice(p.OptionSymbol)
-				}
-				if sellPrice > 0 {
-					orderID, sellErr := d.Alpaca.SellOptionOrder(p.OptionSymbol, sellPrice)
-					if sellErr != nil {
-						log.Printf("activity: alpaca sell %s (%s): %v", p.Ticker, p.OptionSymbol, sellErr)
-					} else {
-						log.Printf("activity: alpaca sell order placed %s symbol=%s order=%s limit=%.2f",
-							p.Ticker, p.OptionSymbol, orderID, sellPrice)
-					}
-				}
-			}
-			if closeErr := store.ClosePosition(ctx, d.Pool, p.ID, e.currentPrice, e.pnlPct, "review_exit"); closeErr != nil {
-				log.Printf("activity: close position %s: %v", p.Ticker, closeErr)
+			// Sell via shared execution service. Sell order must succeed before DB
+			// is closed — if Alpaca rejects the sell, position stays open and an
+			// event is recorded so the next review can retry.
+			_, sellErr := execution.SellOptionPosition(ctx, d.Pool, d.Alpaca, execution.SellInput{
+				PositionID:     p.ID,
+				Ticker:         p.Ticker,
+				ContractSymbol: p.OptionSymbol,
+				SellPrice:      e.currentPrice, // 0 → SellOptionPosition fetches mid
+				PnLPct:         e.pnlPct,
+				ExitReason:     "review_exit",
+			})
+			if sellErr != nil {
+				log.Printf("activity: sell option position %s: %v — keeping open", p.Ticker, sellErr)
+				_ = store.InsertPositionEvent(ctx, d.Pool, p.ID, p.Ticker, "sell_failed",
+					e.currentPrice, map[string]any{"error": sellErr.Error(), "pnl_pct": e.pnlPct})
 			} else {
 				_ = store.InsertPositionEvent(ctx, d.Pool, p.ID, p.Ticker, "position_closed",
-					e.currentPrice, map[string]any{
-						"reason":  "review_exit",
-						"pnl_pct": e.pnlPct,
-					})
+					e.currentPrice, map[string]any{"reason": "review_exit", "pnl_pct": e.pnlPct})
 				executed = true
 				exitedCount++
 				log.Printf("activity: closed position %s pnl=%.2f%%", p.Ticker, e.pnlPct)
@@ -1014,13 +1042,15 @@ func mapPositionAction(claudeStatus string) string {
 //
 // WHAT: Runs once per week (Sunday morning).
 // WHY:  Autonomous operation requires periodic self-assessment. This activity
-//       generates explicit tuning proposals without auto-applying them.
+//
+//	generates explicit tuning proposals without auto-applying them.
+//
 // HOW:
-//   1. Compute week_start / week_end (today − 7 days).
-//   2. Count confirmed candidates and closed positions for the period.
-//   3. Build a structured text prompt with trade statistics.
-//   4. Call Claude.GenerateText for a free-text review + proposals.
-//   5. Persist to weekly_reviews (ON CONFLICT replaces if re-run).
+//  1. Compute week_start / week_end (today − 7 days).
+//  2. Count confirmed candidates and closed positions for the period.
+//  3. Build a structured text prompt with trade statistics.
+//  4. Call Claude.GenerateText for a free-text review + proposals.
+//  5. Persist to weekly_reviews (ON CONFLICT replaces if re-run).
 func (d *ActivityDeps) RunWeeklyReviewActivity(ctx context.Context) (string, error) {
 	loc, _ := time.LoadLocation("America/Los_Angeles")
 	now := time.Now().In(loc)

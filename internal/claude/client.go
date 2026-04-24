@@ -101,20 +101,20 @@ func loadFile(path, fallback string) string {
 // RuntimePayload is the complete input payload for Claude's decision.
 // It matches the structure of examples/runtime_payload.json.
 type RuntimePayload struct {
-	ScanTimePT    string            `json:"scan_time_pt"`
-	MarketContext MarketContext      `json:"market_context"`
-	OpenPositions []PositionInput   `json:"open_positions"`
-	Candidates    []CandidateInput  `json:"candidates"`
+	ScanTimePT    string           `json:"scan_time_pt"`
+	MarketContext MarketContext    `json:"market_context"`
+	OpenPositions []PositionInput  `json:"open_positions"`
+	Candidates    []CandidateInput `json:"candidates"`
 }
 
 // MarketContext holds broad market state.
 type MarketContext struct {
-	SPXTrend     string `json:"spx_trend"`      // "bullish" | "bearish" | "mixed"
-	QQQTrend     string `json:"qqq_trend"`
-	MacroNewsBias string `json:"macro_news_bias"` // "positive" | "negative" | "neutral"
-	BreadthTone  string `json:"breadth_tone"`
-	VIX          float64 `json:"vix"`
-	BTCRoc20     float64 `json:"btc_roc20"`
+	SPXTrend      string  `json:"spx_trend"` // "bullish" | "bearish" | "mixed"
+	QQQTrend      string  `json:"qqq_trend"`
+	MacroNewsBias string  `json:"macro_news_bias"` // "positive" | "negative" | "neutral"
+	BreadthTone   string  `json:"breadth_tone"`
+	VIX           float64 `json:"vix"`
+	BTCRoc20      float64 `json:"btc_roc20"`
 }
 
 // CandidateInput is one prescreened ticker in the runtime payload.
@@ -133,20 +133,20 @@ type CandidateInput struct {
 	PremktLow      float64                 `json:"premarket_low"`
 	PriorDayHigh   float64                 `json:"prior_day_high"`
 	PriorDayLow    float64                 `json:"prior_day_low"`
-	TrendBias      string                  `json:"trend_bias"`    // "bullish" | "bearish" | "mixed"
-	Sentiment      string                  `json:"sentiment"`     // "positive" | "negative" | "neutral"
+	TrendBias      string                  `json:"trend_bias"` // "bullish" | "bearish" | "mixed"
+	Sentiment      string                  `json:"sentiment"`  // "positive" | "negative" | "neutral"
 	EarningsRisk   bool                    `json:"earnings_risk"`
 	AntiPatterns   []string                `json:"anti_patterns,omitempty"`
 	Options        []market.OptionContract `json:"options"`
 
 	// v2 fields — derived from strategy_rules.yaml by the strategy engine
-	SetupFamily     string   `json:"setup_family"`              // e.g. "bullish_continuation"
-	PatternScore    int      `json:"pattern_score"`             // integer from YAML pattern_scores
-	ReasonCodes     []string `json:"reason_codes,omitempty"`    // from YAML reason_codes enum
-	HoldWindowBase  int      `json:"hold_window_base_days"`     // from YAML target_model
-	BaseTarget      float64  `json:"base_target"`               // structure-based (ATR/swing)
-	StretchTarget   float64  `json:"stretch_target"`            // structure-based extended target
-	OptionsStatus   string   `json:"options_status"`            // options_not_allowed | options_ready
+	SetupFamily    string   `json:"setup_family"`           // e.g. "bullish_continuation"
+	PatternScore   int      `json:"pattern_score"`          // integer from YAML pattern_scores
+	ReasonCodes    []string `json:"reason_codes,omitempty"` // from YAML reason_codes enum
+	HoldWindowBase int      `json:"hold_window_base_days"`  // from YAML target_model
+	BaseTarget     float64  `json:"base_target"`            // structure-based (ATR/swing)
+	StretchTarget  float64  `json:"stretch_target"`         // structure-based extended target
+	OptionsStatus  string   `json:"options_status"`         // options_not_allowed | options_ready
 }
 
 // PositionInput describes an open paper position for daily review.
@@ -163,11 +163,11 @@ type PositionInput struct {
 
 // OptionsDecision is the full schema-validated response from Claude.
 type OptionsDecision struct {
-	ScanTimePT         string              `json:"scan_time_pt"`
-	MarketRegime       RegimeDecision      `json:"market_regime"`
+	ScanTimePT         string               `json:"scan_time_pt"`
+	MarketRegime       RegimeDecision       `json:"market_regime"`
 	DailySummary       DailySummaryDecision `json:"daily_summary"`
 	Candidates         []CandidateDecision  `json:"candidates"`
-	OpenPositionReview []PositionReview    `json:"open_positions_review"`
+	OpenPositionReview []PositionReview     `json:"open_positions_review"`
 }
 
 type RegimeDecision struct {
@@ -182,20 +182,20 @@ type DailySummaryDecision struct {
 }
 
 type CandidateDecision struct {
-	Ticker        string              `json:"ticker"`
-	Direction     string              `json:"direction"`      // "call" | "put" | "none"
-	Status        string              `json:"status"`         // "rejected" | "structural_candidate" | "entry_ready" | "confirmed" | "watch_only"
-	Score         int                 `json:"score"`          // 0–100
-	RegimeFit     int                 `json:"regime_fit"`     // 0–100
-	Thesis        ThesisDecision      `json:"thesis"`
-	Levels        LevelsDecision      `json:"levels"`
-	Targets       TargetsDecision     `json:"targets"`
-	Contract      ContractDecision    `json:"contract_selection"`
-	EntryTrigger  EntryTrigger        `json:"entry_trigger"`
-	RiskPlan      RiskPlan            `json:"risk_plan"`
-	HoldOvernight HoldOvernightRule   `json:"hold_overnight_rule"`
-	DailyReview   DailyReviewRule     `json:"daily_review_rule"`
-	FinalDecision string              `json:"final_decision"` // "paper_trade_now" | "place_trigger_only" | "watchlist_only" | "reject"
+	Ticker        string            `json:"ticker"`
+	Direction     string            `json:"direction"`  // "call" | "put" | "none"
+	Status        string            `json:"status"`     // "rejected" | "structural_candidate" | "entry_ready" | "confirmed" | "watch_only"
+	Score         int               `json:"score"`      // 0–100
+	RegimeFit     int               `json:"regime_fit"` // 0–100
+	Thesis        ThesisDecision    `json:"thesis"`
+	Levels        LevelsDecision    `json:"levels"`
+	Targets       TargetsDecision   `json:"targets"`
+	Contract      ContractDecision  `json:"contract_selection"`
+	EntryTrigger  EntryTrigger      `json:"entry_trigger"`
+	RiskPlan      RiskPlan          `json:"risk_plan"`
+	HoldOvernight HoldOvernightRule `json:"hold_overnight_rule"`
+	DailyReview   DailyReviewRule   `json:"daily_review_rule"`
+	FinalDecision string            `json:"final_decision"` // "paper_trade_now" | "place_trigger_only" | "watchlist_only" | "reject"
 
 	// v2 fields
 	SetupFamily   string   `json:"setup_family"`           // family name from strategy_rules.yaml
@@ -228,29 +228,29 @@ type TargetsDecision struct {
 }
 
 type ContractDecision struct {
-	Selected          bool    `json:"selected"`
-	Type              string  `json:"type"`              // "call" | "put" | "none"
-	ExpirationDTE     *int    `json:"expiration_dte"`
-	TargetDeltaRange  *string `json:"target_delta_range"`
-	StrikeLogi        string  `json:"strike_logic"`
-	LiquidityCheck    string  `json:"liquidity_check"`   // "pass" | "fail" | "borderline"
-	Reason            string  `json:"reason"`
+	Selected         bool    `json:"selected"`
+	Type             string  `json:"type"` // "call" | "put" | "none"
+	ExpirationDTE    *int    `json:"expiration_dte"`
+	TargetDeltaRange *string `json:"target_delta_range"`
+	StrikeLogi       string  `json:"strike_logic"`
+	LiquidityCheck   string  `json:"liquidity_check"` // "pass" | "fail" | "borderline"
+	Reason           string  `json:"reason"`
 }
 
 type EntryTrigger struct {
-	Type                string   `json:"type"` // "breakout_stop_limit" | "breakdown_stop_limit" | "pullback_limit" | "rejection_limit" | "none"
+	Type                   string   `json:"type"` // "breakout_stop_limit" | "breakdown_stop_limit" | "pullback_limit" | "rejection_limit" | "none"
 	UnderlyingTriggerPrice *float64 `json:"underlying_trigger_price"`
-	Explanation         string   `json:"explanation"`
-	Invalidation        string   `json:"invalidation"`
+	Explanation            string   `json:"explanation"`
+	Invalidation           string   `json:"invalidation"`
 }
 
 type RiskPlan struct {
-	InitialStopLossPct      float64 `json:"initial_stop_loss_pct"`
-	FirstProfitZonePct      string  `json:"first_profit_zone_pct"`
+	InitialStopLossPct       float64 `json:"initial_stop_loss_pct"`
+	FirstProfitZonePct       string  `json:"first_profit_zone_pct"`
 	BreakevenShiftTriggerPct float64 `json:"breakeven_shift_trigger_pct"`
-	TrailActivationPct      string  `json:"trail_activation_pct"`
-	TrailingMethod          string  `json:"trailing_method"` // "premium_pct" | "structure_based" | "none"
-	TrailingValue           string  `json:"trailing_value"`
+	TrailActivationPct       string  `json:"trail_activation_pct"`
+	TrailingMethod           string  `json:"trailing_method"` // "premium_pct" | "structure_based" | "none"
+	TrailingValue            string  `json:"trailing_value"`
 }
 
 type HoldOvernightRule struct {
@@ -274,7 +274,7 @@ type PositionReview struct {
 
 // Recommendation is the legacy response type kept for workflow activities.
 type Recommendation struct {
-	Action          string   `json:"action"`     // BUY | WATCH | INVALID
+	Action          string   `json:"action"` // BUY | WATCH | INVALID
 	Ticker          string   `json:"ticker"`
 	Confidence      float64  `json:"confidence"`
 	TimeHorizon     string   `json:"time_horizon"`
@@ -308,12 +308,12 @@ type SlimCandidate struct {
 
 // SlimReview is the minimal output Claude returns per candidate.
 type SlimReview struct {
-	T      string   `json:"t"`       // ticker
-	Status string   `json:"status"`  // structural_candidate|entry_ready|watch_only|rejected
-	Dir    string   `json:"dir"`     // call|put|none
-	Score  int      `json:"score"`   // 0-100
-	FD     string   `json:"fd"`      // paper_trade_now|place_trigger_only|watchlist_only|reject
-	Why    string   `json:"why"`     // ≤15 words
+	T      string   `json:"t"`      // ticker
+	Status string   `json:"status"` // structural_candidate|entry_ready|watch_only|rejected
+	Dir    string   `json:"dir"`    // call|put|none
+	Score  int      `json:"score"`  // 0-100
+	FD     string   `json:"fd"`     // paper_trade_now|place_trigger_only|watchlist_only|reject
+	Why    string   `json:"why"`    // ≤15 words
 	RC     []string `json:"rc,omitempty"`
 }
 
@@ -342,9 +342,9 @@ Every candidate in input must appear in output. Be conservative — prefer struc
 // Each candidate takes ~80 chars input + ~80 chars output. Handles 50+ candidates in one call.
 func (c *Client) ReviewCandidates(vix, btc float64, regime string, candidates []SlimCandidate) (SlimResponse, error) {
 	type payload struct {
-		VIX    float64        `json:"vix"`
-		BTC    float64        `json:"btc"`
-		Regime string         `json:"regime"`
+		VIX    float64         `json:"vix"`
+		BTC    float64         `json:"btc"`
+		Regime string          `json:"regime"`
 		C      []SlimCandidate `json:"c"`
 	}
 	p := payload{VIX: vix, BTC: btc, Regime: regime, C: candidates}
@@ -430,15 +430,15 @@ type DailyContext struct {
 	ATR14       float64 `json:"atr14"`
 
 	// v7 extended indicators
-	RealVol20       float64 `json:"real_vol_20,omitempty"`       // realized vol, 20-day
-	VolScaledMom63  float64 `json:"vol_scaled_mom_63,omitempty"` // vol-normalized 63d momentum
-	Entropy30       float64 `json:"entropy_30,omitempty"`        // Shannon entropy of 30d returns
-	BollingerWidth  float64 `json:"bollinger_width,omitempty"`   // Bollinger band width
-	SqueezeRatio    float64 `json:"squeeze_ratio,omitempty"`     // Bollinger/Keltner ratio
+	RealVol20      float64 `json:"real_vol_20,omitempty"`       // realized vol, 20-day
+	VolScaledMom63 float64 `json:"vol_scaled_mom_63,omitempty"` // vol-normalized 63d momentum
+	Entropy30      float64 `json:"entropy_30,omitempty"`        // Shannon entropy of 30d returns
+	BollingerWidth float64 `json:"bollinger_width,omitempty"`   // Bollinger band width
+	SqueezeRatio   float64 `json:"squeeze_ratio,omitempty"`     // Bollinger/Keltner ratio
 
-	FinalScore      float64 `json:"final_score"`  // engine's deterministic score
-	PriorDayHigh    float64 `json:"prior_day_high"`
-	PriorDayLow     float64 `json:"prior_day_low"`
+	FinalScore   float64 `json:"final_score"` // engine's deterministic score
+	PriorDayHigh float64 `json:"prior_day_high"`
+	PriorDayLow  float64 `json:"prior_day_low"`
 }
 
 // OpeningContext holds first 5/10 min bar data at market open.
@@ -453,33 +453,34 @@ type OpeningContext struct {
 
 // ConfirmationContract holds the pre-selected option contract details.
 type ConfirmationContract struct {
-	Symbol     string  `json:"symbol"`      // OCC symbol e.g. "SPY260620C00580000"
-	Type       string  `json:"type"`        // "call" | "put"
-	Strike     float64 `json:"strike"`
-	Expiration string  `json:"expiration"`  // "2026-06-20"
-	DTE        int     `json:"dte"`
-	Delta      float64 `json:"delta"`
-	MidPrice   float64 `json:"mid_price"`   // current option mid
+	Symbol       string  `json:"symbol"` // OCC symbol e.g. "SPY260620C00580000"
+	Type         string  `json:"type"`   // "call" | "put"
+	Strike       float64 `json:"strike"`
+	Expiration   string  `json:"expiration"` // "2026-06-20"
+	DTE          int     `json:"dte"`
+	Delta        float64 `json:"delta"`
+	MidPrice     float64 `json:"mid_price"`          // current option mid
 	BidAskSpread float64 `json:"bid_ask_spread_pct"` // spread as % of mid
-	OpenInterest int   `json:"open_interest"`
+	OpenInterest int     `json:"open_interest"`
+	OptionVolume int     `json:"option_volume"` // today's traded volume
 }
 
 // RiskContext holds stop, target, and R/R from ATR analysis.
 type RiskContext struct {
-	EntryPrice    float64 `json:"entry_price"`    // option mid price to pay
-	StopLossPct   float64 `json:"stop_loss_pct"`  // stop as % of premium
-	BaseTargetPct float64 `json:"base_target_pct"` // base profit target as % of premium
+	EntryPrice       float64 `json:"entry_price"`        // option mid price to pay
+	StopLossPct      float64 `json:"stop_loss_pct"`      // stop as % of premium
+	BaseTargetPct    float64 `json:"base_target_pct"`    // base profit target as % of premium
 	StretchTargetPct float64 `json:"stretch_target_pct"` // stretch target
-	RRRatio       float64 `json:"rr_ratio"`        // reward/risk ratio
+	RRRatio          float64 `json:"rr_ratio"`           // reward/risk ratio
 }
 
 // DeterministicSignals is the output of the opening confirmation check.
 // Claude sees these as evidence to weigh — they are NOT the final decision.
 type DeterministicSignals struct {
-	TrueCount      int      `json:"true_count"`       // number of bullish signals
-	TotalChecked   int      `json:"total_checked"`
-	SoftMinMet     bool     `json:"soft_min_met"`     // >= deterministic_signals_soft_min
-	Details        []string `json:"details,omitempty"` // e.g. ["breakout_holds", "volume_support"]
+	TrueCount    int      `json:"true_count"` // number of bullish signals
+	TotalChecked int      `json:"total_checked"`
+	SoftMinMet   bool     `json:"soft_min_met"`      // >= deterministic_signals_soft_min
+	Details      []string `json:"details,omitempty"` // e.g. ["breakout_holds", "volume_support"]
 }
 
 // HardBlockSummary lists any auto_reject signals that fired.
@@ -492,18 +493,18 @@ type HardBlockSummary struct {
 // EntryConfirmationDecision is Claude's response per candidate in ConfirmEntry.
 type EntryConfirmationDecision struct {
 	Ticker     string  `json:"ticker"`
-	Decision   string  `json:"decision"`    // "CONFIRM" | "REJECT"
-	Confidence float64 `json:"confidence"`  // 0.0-1.0
-	Reason     string  `json:"reason"`      // ≤25 words
+	Decision   string  `json:"decision"`   // "CONFIRM" | "REJECT"
+	Confidence float64 `json:"confidence"` // 0.0-1.0
+	Reason     string  `json:"reason"`     // ≤25 words
 
 	// Contract to use (Claude may refine but typically echoes input)
-	ContractSymbol string `json:"contract_symbol,omitempty"`
+	ContractSymbol string  `json:"contract_symbol,omitempty"`
 	LimitPrice     float64 `json:"limit_price,omitempty"` // suggested entry premium
 }
 
 // EntryConfirmationResponse is Claude's full response for a ConfirmEntry call.
 type EntryConfirmationResponse struct {
-	Regime    string                      `json:"regime"`    // "bullish" | "bearish" | "mixed"
+	Regime    string                      `json:"regime"` // "bullish" | "bearish" | "mixed"
 	Decisions []EntryConfirmationDecision `json:"decisions"`
 }
 
@@ -572,7 +573,9 @@ func (c *Client) DecideOptions(payload RuntimePayload) (OptionsDecision, error) 
 
 	log.Printf("claude: raw response length = %d chars, first200=%q", len(raw), truncate(raw, 200))
 	tail := raw
-	if len(tail) > 100 { tail = tail[len(tail)-100:] }
+	if len(tail) > 100 {
+		tail = tail[len(tail)-100:]
+	}
 	log.Printf("claude: raw response last100=%q", tail)
 	jsonStr := extractJSON(raw)
 	if jsonStr == "" {

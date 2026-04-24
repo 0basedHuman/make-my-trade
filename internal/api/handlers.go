@@ -39,6 +39,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yourname/makemytrade/config"
 	claudeclient "github.com/yourname/makemytrade/internal/claude"
+	"github.com/yourname/makemytrade/internal/execution"
 	"github.com/yourname/makemytrade/internal/indicators"
 	"github.com/yourname/makemytrade/internal/market"
 	"github.com/yourname/makemytrade/internal/store"
@@ -101,21 +102,21 @@ type CandidateResponse struct {
 	AntiPatterns []string `json:"anti_patterns,omitempty"`
 
 	// v2: setup family classification from strategy_rules.yaml
-	SetupFamily  string   `json:"setup_family,omitempty"`  // e.g. "bullish_continuation"
-	ReasonCodes  []string `json:"reason_codes,omitempty"`  // from YAML reason_codes enum
-	BaseTarget   float64  `json:"base_target,omitempty"`   // structure-based target
-	StretchTarget float64 `json:"stretch_target,omitempty"`
+	SetupFamily   string   `json:"setup_family,omitempty"` // e.g. "bullish_continuation"
+	ReasonCodes   []string `json:"reason_codes,omitempty"` // from YAML reason_codes enum
+	BaseTarget    float64  `json:"base_target,omitempty"`  // structure-based target
+	StretchTarget float64  `json:"stretch_target,omitempty"`
 
 	// Options decision fields (from Claude)
 	// Options fields are populated ONLY for confirmed status; hidden for all others
 	// per options_translation.hide_options_for_statuses in strategy_rules.yaml.
-	DecisionStatus string   `json:"decision_status"`    // rejected | structural_candidate | entry_ready | confirmed | blocked_by_event | watch_only
-	StatusLabel    string   `json:"status_label"`       // human-readable display label for the UI
-	OptionsStatus  string   `json:"options_status"`     // options_not_allowed | options_ready | options_confirmed | options_hidden_until_confirmed
-	Direction      string   `json:"direction"`          // call | put | none
-	Score          int      `json:"score"`              // 0 when hidden per scoring.hide_score_for
-	ScoreVisible   bool     `json:"score_visible"`      // false → UI must not render score bar
-	FinalDecision  string   `json:"final_decision"`     // paper_trade_now | place_trigger_only | watchlist_only | reject
+	DecisionStatus string   `json:"decision_status"` // rejected | structural_candidate | entry_ready | confirmed | blocked_by_event | watch_only
+	StatusLabel    string   `json:"status_label"`    // human-readable display label for the UI
+	OptionsStatus  string   `json:"options_status"`  // options_not_allowed | options_ready | options_confirmed | options_hidden_until_confirmed
+	Direction      string   `json:"direction"`       // call | put | none
+	Score          int      `json:"score"`           // 0 when hidden per scoring.hide_score_for
+	ScoreVisible   bool     `json:"score_visible"`   // false → UI must not render score bar
+	FinalDecision  string   `json:"final_decision"`  // paper_trade_now | place_trigger_only | watchlist_only | reject
 	ContractDTE    *int     `json:"contract_dte,omitempty"`
 	ContractType   string   `json:"contract_type,omitempty"`
 	ContractDelta  string   `json:"contract_delta_range,omitempty"`
@@ -148,32 +149,32 @@ type CandidateResponse struct {
 // AnalysisResponse is the full JSON response for /api/daily-analysis and /api/run-analysis.
 // Sections map 1:1 to ui_rules.sections in strategy_rules.yaml.
 //
-//   confirmed            — true trade signal, full options output allowed
-//   entry_ready          — pre-open candidate, options hidden until confirmed
-//   structural_candidates — watchlist only, shows family + targets + what's missing
-//   blocked_by_event     — watchlist, overrides entry_ready when event blackout fires
-//   watch_only           — watchlist, no active setup
-//   rejected             — screened out (failed regime/family/data gates)
+//	confirmed            — true trade signal, full options output allowed
+//	entry_ready          — pre-open candidate, options hidden until confirmed
+//	structural_candidates — watchlist only, shows family + targets + what's missing
+//	blocked_by_event     — watchlist, overrides entry_ready when event blackout fires
+//	watch_only           — watchlist, no active setup
+//	rejected             — screened out (failed regime/family/data gates)
 //
 // no_trade_today fires when confirmed is empty (daily_output.no_trade_day_when_no_confirmed).
 type AnalysisResponse struct {
-	Date          string        `json:"date"`
-	RunAt         time.Time     `json:"run_at"`
-	Regime        RegimeResponse `json:"regime"`
-	ActionBias    string        `json:"action_bias"`
-	RegimeSummary string        `json:"regime_summary,omitempty"`
-	NoTradeToday  bool          `json:"no_trade_today"`
-	NoTradeReason string        `json:"no_trade_reason,omitempty"`
-	SymbolsScanned int          `json:"symbols_scanned"`
-	EligibleCount  int          `json:"eligible_count"`
+	Date           string         `json:"date"`
+	RunAt          time.Time      `json:"run_at"`
+	Regime         RegimeResponse `json:"regime"`
+	ActionBias     string         `json:"action_bias"`
+	RegimeSummary  string         `json:"regime_summary,omitempty"`
+	NoTradeToday   bool           `json:"no_trade_today"`
+	NoTradeReason  string         `json:"no_trade_reason,omitempty"`
+	SymbolsScanned int            `json:"symbols_scanned"`
+	EligibleCount  int            `json:"eligible_count"`
 
 	// Per-status sections (YAML ui_rules.sections order)
-	Confirmed            []CandidateResponse  `json:"confirmed"`
-	EntryReady           []CandidateResponse  `json:"entry_ready"`
-	StructuralCandidates []CandidateResponse  `json:"structural_candidates"`
-	BlockedByEvent       []CandidateResponse  `json:"blocked_by_event"`
-	WatchOnly            []CandidateResponse  `json:"watch_only"`
-	Rejected             []CandidateResponse  `json:"rejected"`
+	Confirmed            []CandidateResponse `json:"confirmed"`
+	EntryReady           []CandidateResponse `json:"entry_ready"`
+	StructuralCandidates []CandidateResponse `json:"structural_candidates"`
+	BlockedByEvent       []CandidateResponse `json:"blocked_by_event"`
+	WatchOnly            []CandidateResponse `json:"watch_only"`
+	Rejected             []CandidateResponse `json:"rejected"`
 
 	Positions []store.PaperPosition `json:"open_positions"`
 }
@@ -282,23 +283,23 @@ func (h *Handler) RunConfirmation(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if upsertErr := store.UpsertTradeConfirmation(ctx, h.pool, store.ConfirmationStoreInput{
-			CandidateID:      c.ID,
-			Ticker:           c.Ticker,
-			TradeDate:        tradeDate,
-			Status:           result.Status,
-			SignalLevelHolds: result.SignalLevelHolds,
-			SignalOpenRange:  result.SignalOpenRange,
+			CandidateID:       c.ID,
+			Ticker:            c.Ticker,
+			TradeDate:         tradeDate,
+			Status:            result.Status,
+			SignalLevelHolds:  result.SignalLevelHolds,
+			SignalOpenRange:   result.SignalOpenRange,
 			SignalNoRejection: result.SignalNoRejection,
-			SignalVolumeOK:   result.SignalVolumeOK,
-			SignalMarketOK:   result.SignalMarketOK,
-			SignalsPassed:    result.SignalsPassed,
-			AutoRejected:     result.AutoRejected,
-			AutoRejectReason: result.AutoRejectReason,
-			OpenPrice:        result.OpenPrice,
-			First10High:      result.First10High,
-			First10Low:       result.First10Low,
-			First10Close:     result.First10Close,
-			First10Volume:    result.First10Volume,
+			SignalVolumeOK:    result.SignalVolumeOK,
+			SignalMarketOK:    result.SignalMarketOK,
+			SignalsPassed:     result.SignalsPassed,
+			AutoRejected:      result.AutoRejected,
+			AutoRejectReason:  result.AutoRejectReason,
+			OpenPrice:         result.OpenPrice,
+			First10High:       result.First10High,
+			First10Low:        result.First10Low,
+			First10Close:      result.First10Close,
+			First10Volume:     result.First10Volume,
 		}); upsertErr != nil {
 			log.Printf("run-confirmation: persist %s: %v", c.Ticker, upsertErr)
 		}
@@ -306,7 +307,7 @@ func (h *Handler) RunConfirmation(w http.ResponseWriter, r *http.Request) {
 		if result.Status == "confirmed" {
 			confirmedCount++
 
-			// Auto paper entry — idempotent via ON CONFLICT (candidate_id)
+			// Auto paper entry — select contract first, then buy via execution service.
 			entryPrice := result.First10Close
 			if entryPrice <= 0 {
 				entryPrice = c.EntryHigh
@@ -315,31 +316,36 @@ func (h *Handler) RunConfirmation(w http.ResponseWriter, r *http.Request) {
 			if c.Direction == "bearish" {
 				optionType = "put"
 			}
-			posID, posErr := store.CreatePaperPosition(ctx, h.pool, store.PaperPositionInput{
-				CandidateID: c.ID,
-				Ticker:      c.Ticker,
-				EntryPrice:  entryPrice,
-				EntryDate:   tradeDate,
-				Shares:      1,
-				StopLoss:    c.StopLoss,
-				Target1:     c.Target1,
-				Target2:     c.Target2,
-				OptionType:  optionType,
-				SetupFamily: c.SetupFamily,
+
+			// Select best contract before buying (mirrors Temporal confirmation flow).
+			contractSym, contractPrice := h.selectBestContract(ctx, c.Ticker, optionType, c.ClosePrice)
+			if contractPrice > 0 {
+				entryPrice = contractPrice
+			}
+
+			buyResult, buyErr := execution.BuyOptionPosition(ctx, h.pool, h.alpaca, execution.BuyInput{
+				CandidateID:    c.ID,
+				Ticker:         c.Ticker,
+				SetupFamily:    c.SetupFamily,
+				OptionType:     optionType,
+				ContractSymbol: contractSym,
+				LimitPrice:     entryPrice,
+				StopLoss:       c.StopLoss,
+				Target1:        c.Target1,
+				Target2:        c.Target2,
 			})
-			if posErr != nil {
-				log.Printf("run-confirmation: create paper position %s: %v", c.Ticker, posErr)
+			if buyErr != nil {
+				log.Printf("run-confirmation: buy option position %s: %v", c.Ticker, buyErr)
 			} else {
-				_ = store.InsertPositionEvent(ctx, h.pool, posID, c.Ticker, "position_opened",
+				_ = store.InsertPositionEvent(ctx, h.pool, buyResult.PositionID, c.Ticker, "position_opened",
 					entryPrice, map[string]any{
 						"candidate_status": "confirmed",
 						"setup_family":     c.SetupFamily,
 						"stop_loss":        c.StopLoss,
 						"target1":          c.Target1,
 					})
-				log.Printf("run-confirmation: paper position created %s id=%s entry=%.2f", c.Ticker, posID, entryPrice)
-				// Place real Alpaca paper-trading option order (non-fatal)
-				h.placeAlpacaOptionOrder(ctx, posID, c.Ticker, optionType, c.ClosePrice)
+				log.Printf("run-confirmation: paper position created %s id=%s entry=%.2f orderID=%s",
+					c.Ticker, buyResult.PositionID, entryPrice, buyResult.AlpacaOrderID)
 			}
 		}
 	}
@@ -413,7 +419,16 @@ func (h *Handler) ForceConfirm(w http.ResponseWriter, r *http.Request) {
 			req.Ticker,
 		).Scan(&posID, &posClosePrice, &posOptionType)
 		if posID != "" {
-			alpacaOrderID := h.placeAlpacaOptionOrder(ctx, posID, req.Ticker, posOptionType, posClosePrice)
+			// Position already exists — only place the Alpaca order (no new DB row).
+			contractSym, limitPrice := h.selectBestContract(ctx, req.Ticker, posOptionType, posClosePrice)
+			alpacaOrderID := ""
+			if contractSym != "" {
+				alpacaOrderID, _ = h.alpaca.PlaceOptionOrder(contractSym, limitPrice)
+				if alpacaOrderID != "" {
+					_ = store.UpdatePositionAlpacaOrderID(ctx, h.pool, posID, alpacaOrderID)
+					_ = store.UpdatePositionOptionDetails(ctx, h.pool, posID, contractSym, limitPrice)
+				}
+			}
 			writeJSON(w, map[string]any{
 				"status":          "confirmed",
 				"ticker":          req.Ticker,
@@ -446,24 +461,29 @@ func (h *Handler) ForceConfirm(w http.ResponseWriter, r *http.Request) {
 		entryPrice = found.EntryHigh
 	}
 
-	posID, posErr := store.CreatePaperPosition(ctx, h.pool, store.PaperPositionInput{
-		CandidateID: found.ID,
-		Ticker:      found.Ticker,
-		EntryPrice:  entryPrice,
-		EntryDate:   tradeDate,
-		Shares:      1,
-		StopLoss:    found.StopLoss,
-		Target1:     found.Target1,
-		Target2:     found.Target2,
-		OptionType:  optionType,
-		SetupFamily: found.SetupFamily,
+	// Select best contract before buying (single lifecycle path via execution service).
+	contractSym, contractPrice := h.selectBestContract(ctx, found.Ticker, optionType, found.ClosePrice)
+	if contractPrice > 0 {
+		entryPrice = contractPrice
+	}
+
+	buyResult, buyErr := execution.BuyOptionPosition(ctx, h.pool, h.alpaca, execution.BuyInput{
+		CandidateID:    found.ID,
+		Ticker:         found.Ticker,
+		SetupFamily:    found.SetupFamily,
+		OptionType:     optionType,
+		ContractSymbol: contractSym,
+		LimitPrice:     entryPrice,
+		StopLoss:       found.StopLoss,
+		Target1:        found.Target1,
+		Target2:        found.Target2,
 	})
-	if posErr != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("create position: %v", posErr))
+	if buyErr != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("buy option position: %v", buyErr))
 		return
 	}
 
-	_ = store.InsertPositionEvent(ctx, h.pool, posID, found.Ticker, "position_opened",
+	_ = store.InsertPositionEvent(ctx, h.pool, buyResult.PositionID, found.Ticker, "position_opened",
 		entryPrice, map[string]any{
 			"candidate_status": "confirmed",
 			"setup_family":     found.SetupFamily,
@@ -474,30 +494,28 @@ func (h *Handler) ForceConfirm(w http.ResponseWriter, r *http.Request) {
 
 	// Store rationale so the DB reader can reconstruct direction/score.
 	ratJSON, _ := json.Marshal(map[string]any{
-		"status":       "confirmed",
-		"direction":    optionType,
-		"score":        70,
+		"status":         "confirmed",
+		"direction":      optionType,
+		"score":          70,
 		"final_decision": "paper_trade_now",
-		"thesis":       "Force-confirmed entry_ready candidate",
+		"thesis":         "Force-confirmed entry_ready candidate",
 	})
 	_ = store.UpdateCandidateClaudeReview(ctx, h.pool, found.ID, "paper_trade_now", 0.70, string(ratJSON))
 
-	log.Printf("force-confirm: paper position created %s id=%s entry=%.2f opt=%s", found.Ticker, posID, entryPrice, optionType)
-
-	// Place real Alpaca paper-trading option order (non-fatal if it fails)
-	alpacaOrderID := h.placeAlpacaOptionOrder(ctx, posID, found.Ticker, optionType, found.ClosePrice)
+	log.Printf("force-confirm: paper position created %s id=%s entry=%.2f opt=%s orderID=%s",
+		found.Ticker, buyResult.PositionID, entryPrice, optionType, buyResult.AlpacaOrderID)
 
 	writeJSON(w, map[string]any{
 		"status":          "confirmed",
 		"ticker":          found.Ticker,
-		"position_id":     posID,
+		"position_id":     buyResult.PositionID,
 		"entry_price":     entryPrice,
 		"option_type":     optionType,
 		"setup_family":    found.SetupFamily,
 		"stop_loss":       found.StopLoss,
 		"target1":         found.Target1,
 		"target2":         found.Target2,
-		"alpaca_order_id": alpacaOrderID,
+		"alpaca_order_id": buyResult.AlpacaOrderID,
 	})
 }
 
@@ -651,37 +669,37 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 			}
 
 			candID, err := store.UpsertCandidate(ctx, h.pool, store.UpsertCandidateInput{
-				TradeDate:      today.Truncate(24 * time.Hour),
-				Ticker:         t,
-				GateTrend:      a.GateTrend.Passed,
-				GateMomentum:   a.GateMomentum.Passed,
-				GateVolume:     a.GateVolume.Passed,
-				GateVIX:        a.GateVIX.Passed,
-				GateBTC:        a.GateBTC.Passed,
-				GateRSI:        a.GateRSI.Passed,
-				AllGates:       a.Eligible, // eligible for options review
-				ClosePrice:     a.ClosePrice,
-				EMA20:          a.EMA20,
-				EMA100:         a.EMA100,
-				RSI14:          a.RSI14,
-				MACDHist:       a.MACDHist,
-				VolumeRatio:    a.VolumeRatio,
-				VIXLevel:       vixLevel,
-				BTCROC20:       btcROC,
-				PatternName:    a.PatternName,
-				PatternScore:   a.PatternScore,
-				AntiPatterns:   a.AntiPatterns,
-				RejectedByAnti: a.RejectedByAnti,
-				EntryLow:       a.EntryLow,
-				EntryHigh:      a.EntryHigh,
-				StopLoss:       a.StopLoss,
-				Target1:        a.Target1,
-				Target2:        a.Target2,
-				RRRatio:        a.RRRatio,
-				HoldDaysMin:    a.HoldDaysMin,
-				HoldDaysBase:   a.HoldDaysBase,
-				HoldDaysMax:    a.HoldDaysMax,
-				RejectReason:   a.ScreenReason,
+				TradeDate:       today.Truncate(24 * time.Hour),
+				Ticker:          t,
+				GateTrend:       a.GateTrend.Passed,
+				GateMomentum:    a.GateMomentum.Passed,
+				GateVolume:      a.GateVolume.Passed,
+				GateVIX:         a.GateVIX.Passed,
+				GateBTC:         a.GateBTC.Passed,
+				GateRSI:         a.GateRSI.Passed,
+				AllGates:        a.Eligible, // eligible for options review
+				ClosePrice:      a.ClosePrice,
+				EMA20:           a.EMA20,
+				EMA100:          a.EMA100,
+				RSI14:           a.RSI14,
+				MACDHist:        a.MACDHist,
+				VolumeRatio:     a.VolumeRatio,
+				VIXLevel:        vixLevel,
+				BTCROC20:        btcROC,
+				PatternName:     a.PatternName,
+				PatternScore:    a.PatternScore,
+				AntiPatterns:    a.AntiPatterns,
+				RejectedByAnti:  a.RejectedByAnti,
+				EntryLow:        a.EntryLow,
+				EntryHigh:       a.EntryHigh,
+				StopLoss:        a.StopLoss,
+				Target1:         a.Target1,
+				Target2:         a.Target2,
+				RRRatio:         a.RRRatio,
+				HoldDaysMin:     a.HoldDaysMin,
+				HoldDaysBase:    a.HoldDaysBase,
+				HoldDaysMax:     a.HoldDaysMax,
+				RejectReason:    a.ScreenReason,
 				CandidateStatus: a.CandidateStatus,
 				SetupFamily:     a.SetupFamily,
 				Direction:       dir,
@@ -742,19 +760,19 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 		a := r.analysis
 		contracts := filterChainQuality(chains[r.ticker], lf)
 		slimCandidates = append(slimCandidates, claudeclient.SlimCandidate{
-			T:    r.ticker,
-			Fam:  a.SetupFamily,
+			T:     r.ticker,
+			Fam:   a.SetupFamily,
 			Score: a.PatternScoreInt,
-			Px:   a.ClosePrice,
-			RSI:  a.RSI14,
-			MACD: a.MACDHist,
-			RVol: a.VolumeRatio,
+			Px:    a.ClosePrice,
+			RSI:   a.RSI14,
+			MACD:  a.MACDHist,
+			RVol:  a.VolumeRatio,
 			Trend: a.TrendBias,
-			T1:   a.BaseTarget,
-			T2:   a.StretchTarget,
-			RC:   a.ReasonCodes,
-			Earn: a.EarningsRisk,
-			Opts: len(contracts) > 0,
+			T1:    a.BaseTarget,
+			T2:    a.StretchTarget,
+			RC:    a.ReasonCodes,
+			Earn:  a.EarningsRisk,
+			Opts:  len(contracts) > 0,
 		})
 	}
 
@@ -1021,23 +1039,23 @@ func candidateStatusLabel(status string) string {
 
 func toCandidateResponse(a strategy.SymbolAnalysis) CandidateResponse {
 	cr := CandidateResponse{
-		Ticker:        a.Ticker,
-		Eligible:      a.Eligible,
-		TrendBias:     a.TrendBias,
-		ClosePrice:    a.ClosePrice,
-		EMA20:         a.EMA20,
-		EMA50:         a.EMA50,
-		RSI14:         a.RSI14,
-		MACDHist:      a.MACDHist,
-		VolumeRatio:   a.VolumeRatio,
-		PatternName:   a.PatternName,
-		AntiPatterns:  a.AntiPatterns,
-		ScreenReason:  a.ScreenReason,
+		Ticker:       a.Ticker,
+		Eligible:     a.Eligible,
+		TrendBias:    a.TrendBias,
+		ClosePrice:   a.ClosePrice,
+		EMA20:        a.EMA20,
+		EMA50:        a.EMA50,
+		RSI14:        a.RSI14,
+		MACDHist:     a.MACDHist,
+		VolumeRatio:  a.VolumeRatio,
+		PatternName:  a.PatternName,
+		AntiPatterns: a.AntiPatterns,
+		ScreenReason: a.ScreenReason,
 		// v2 fields
-		SetupFamily:   a.SetupFamily,
-		ReasonCodes:   a.ReasonCodes,
-		BaseTarget:    a.BaseTarget,
-		StretchTarget: a.StretchTarget,
+		SetupFamily:    a.SetupFamily,
+		ReasonCodes:    a.ReasonCodes,
+		BaseTarget:     a.BaseTarget,
+		StretchTarget:  a.StretchTarget,
 		DecisionStatus: a.CandidateStatus,
 		StatusLabel:    candidateStatusLabel(a.CandidateStatus),
 	}
@@ -1303,15 +1321,15 @@ func buildAnalysisResponseFromDB(candidates []store.Candidate, summary *store.Da
 
 	for _, c := range candidates {
 		cr := CandidateResponse{
-			Ticker:        c.Ticker,
-			Eligible:      c.AllGatesPassed,
-			ClosePrice:    c.ClosePrice,
-			EMA20:         c.EMA20,
-			RSI14:         c.RSI14,
-			MACDHist:      c.MACDHist,
-			VolumeRatio:   c.VolumeRatio,
-			PatternName:   c.PatternName,
-			ScreenReason:  c.RejectReason,
+			Ticker:       c.Ticker,
+			Eligible:     c.AllGatesPassed,
+			ClosePrice:   c.ClosePrice,
+			EMA20:        c.EMA20,
+			RSI14:        c.RSI14,
+			MACDHist:     c.MACDHist,
+			VolumeRatio:  c.VolumeRatio,
+			PatternName:  c.PatternName,
+			ScreenReason: c.RejectReason,
 			// Populate family + targets from engine-computed DB columns so cards
 			// render correctly even for rows without a Claude decision.
 			SetupFamily:   c.SetupFamily,
@@ -1431,16 +1449,16 @@ func buildAnalysisResponseFromDB(candidates []store.Candidate, summary *store.Da
 	return resp
 }
 
-// placeAlpacaOptionOrder fetches a fresh option chain, selects the best contract,
-// and places an Alpaca paper-trading order. Updates paper_positions.alpaca_order_id
-// on success. Non-fatal — logs errors but does not fail the caller.
-// Returns the Alpaca order ID, or "" if anything fails.
-func (h *Handler) placeAlpacaOptionOrder(ctx context.Context, posID, ticker, optionType string, underlyingPrice float64) string {
+// selectBestContract fetches the option chain for a ticker, applies quality
+// filters, and returns the best contract symbol and limit price. Returns ("", 0)
+// if no qualifying contract is found. Used by API buy paths before delegating
+// to execution.BuyOptionPosition.
+func (h *Handler) selectBestContract(ctx context.Context, ticker, optionType string, underlyingPrice float64) (string, float64) {
 	todayStr := time.Now().Format("2006-01-02")
 	contracts, err := h.alpaca.FetchOptionChain(ticker, underlyingPrice, todayStr)
 	if err != nil {
-		log.Printf("alpaca order: fetch chain %s: %v", ticker, err)
-		return ""
+		log.Printf("select-contract: fetch chain %s: %v", ticker, err)
+		return "", 0
 	}
 
 	lf := h.rules.OptionsTranslation.LiquidityFilters
@@ -1448,36 +1466,19 @@ func (h *Handler) placeAlpacaOptionOrder(ctx context.Context, posID, ticker, opt
 
 	best := market.SelectBestContract(qualified, optionType)
 	if best == nil {
-		log.Printf("alpaca order: no qualifying %s contract found for %s (chain=%d qualified=%d)",
+		log.Printf("select-contract: no qualifying %s contract for %s (chain=%d qualified=%d)",
 			optionType, ticker, len(contracts), len(qualified))
-		return ""
+		return "", 0
 	}
 
-	// Use mid-price as limit (fair value). Fall back to ask if bid is zero.
 	limitPrice := (best.Bid + best.Ask) / 2.0
 	if best.Bid <= 0 {
 		limitPrice = best.Ask
 	}
 
-	log.Printf("alpaca order: placing %s %s %s strike=%.2f dte=%d delta=%.3f limit=%.2f",
+	log.Printf("select-contract: %s %s %s strike=%.2f dte=%d delta=%.3f limit=%.2f",
 		ticker, optionType, best.Symbol, best.Strike, best.DTE, best.Delta, limitPrice)
-
-	orderID, err := h.alpaca.PlaceOptionOrder(best.Symbol, limitPrice)
-	if err != nil {
-		log.Printf("alpaca order: place %s: %v", ticker, err)
-		return ""
-	}
-
-	if err := store.UpdatePositionAlpacaOrderID(ctx, h.pool, posID, orderID); err != nil {
-		log.Printf("alpaca order: save order ID %s: %v", ticker, err)
-	}
-	// Store OCC symbol and premium so daily review can compute option-level P&L.
-	if err := store.UpdatePositionOptionDetails(ctx, h.pool, posID, best.Symbol, limitPrice); err != nil {
-		log.Printf("alpaca order: save option details %s: %v", ticker, err)
-	}
-
-	log.Printf("alpaca order: confirmed %s symbol=%s order=%s limit=%.2f", ticker, best.Symbol, orderID, limitPrice)
-	return orderID
+	return best.Symbol, limitPrice
 }
 
 // RunPositionReview runs the position review immediately (same logic as the
@@ -1591,11 +1592,11 @@ func (h *Handler) RunPositionReview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type reviewResult struct {
-		Ticker  string  `json:"ticker"`
-		PnLPct  float64 `json:"pnl_pct"`
-		Action  string  `json:"action"`
-		Reason  string  `json:"reason"`
-		Exited  bool    `json:"exited"`
+		Ticker string  `json:"ticker"`
+		PnLPct float64 `json:"pnl_pct"`
+		Action string  `json:"action"`
+		Reason string  `json:"reason"`
+		Exited bool    `json:"exited"`
 	}
 	var results []reviewResult
 	exitedCount := 0
@@ -1610,24 +1611,19 @@ func (h *Handler) RunPositionReview(w http.ResponseWriter, r *http.Request) {
 		}
 		executed := false
 		if action == "EXIT" {
-			// Place sell order on Alpaca before marking closed in DB.
-			if p.OptionSymbol != "" {
-				sellPrice := e.currentPrice // option mid-price fetched above
-				if sellPrice <= 0 {
-					sellPrice, _ = h.alpaca.FetchOptionMidPrice(p.OptionSymbol)
-				}
-				if sellPrice > 0 {
-					orderID, sellErr := h.alpaca.SellOptionOrder(p.OptionSymbol, sellPrice)
-					if sellErr != nil {
-						log.Printf("position-review: alpaca sell %s (%s): %v", p.Ticker, p.OptionSymbol, sellErr)
-					} else {
-						log.Printf("position-review: alpaca sell order placed %s symbol=%s order=%s limit=%.2f",
-							p.Ticker, p.OptionSymbol, orderID, sellPrice)
-					}
-				}
-			}
-			if closeErr := store.ClosePosition(ctx, h.pool, p.ID, e.currentPrice, e.pnlPct, "review_exit"); closeErr != nil {
-				log.Printf("position-review: close %s: %v", p.Ticker, closeErr)
+			// Sell via shared execution service. Position stays open if sell fails.
+			_, sellErr := execution.SellOptionPosition(ctx, h.pool, h.alpaca, execution.SellInput{
+				PositionID:     p.ID,
+				Ticker:         p.Ticker,
+				ContractSymbol: p.OptionSymbol,
+				SellPrice:      e.currentPrice, // 0 → SellOptionPosition fetches mid
+				PnLPct:         e.pnlPct,
+				ExitReason:     "review_exit",
+			})
+			if sellErr != nil {
+				log.Printf("position-review: sell option position %s: %v — keeping open", p.Ticker, sellErr)
+				_ = store.InsertPositionEvent(ctx, h.pool, p.ID, p.Ticker, "sell_failed",
+					e.currentPrice, map[string]any{"error": sellErr.Error(), "pnl_pct": e.pnlPct})
 			} else {
 				_ = store.InsertPositionEvent(ctx, h.pool, p.ID, p.Ticker, "position_closed",
 					e.currentPrice, map[string]any{"reason": "review_exit", "pnl_pct": e.pnlPct})

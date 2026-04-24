@@ -61,7 +61,7 @@ type BuyInput struct {
 
 // BuyResult holds the identifiers created by a successful buy.
 type BuyResult struct {
-	PositionID  string
+	PositionID    string
 	AlpacaOrderID string
 }
 
@@ -122,12 +122,12 @@ func BuyOptionPosition(ctx context.Context, pool *pgxpool.Pool, alpaca Alpaca, i
 
 // SellInput holds parameters needed to close a paper option position.
 type SellInput struct {
-	PositionID    string
-	Ticker        string
-	ContractSymbol string // OCC symbol
-	SellPrice     float64 // limit price to use; if 0, fetches current mid
-	PnLPct        float64 // pre-computed P&L % to store
-	ExitReason    string  // "TAKE_PROFIT" | "STOP_LOSS" | "EXPIRY_CLOSE" | etc.
+	PositionID     string
+	Ticker         string
+	ContractSymbol string  // OCC symbol
+	SellPrice      float64 // limit price to use; if 0, fetches current mid
+	PnLPct         float64 // pre-computed P&L % to store
+	ExitReason     string  // "TAKE_PROFIT" | "STOP_LOSS" | "EXPIRY_CLOSE" | etc.
 }
 
 // SellOptionPosition places a paper option sell order via Alpaca and closes

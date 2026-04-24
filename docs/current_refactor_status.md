@@ -1,5 +1,73 @@
 # Current Refactor Status
 
+## Completed: bearish_exhaustion_reversal Family (2026-04-24)
+
+### Objective
+Add a new optional PUT-only setup family that detects overextended bullish names
+near short-term exhaustion, but only confirms after intraday rejection.
+
+### What was done
+
+#### 1. `strategy_rules.yaml` — new family block + 2 pattern scores
+- `bearish_exhaustion_reversal` family added after `bearish_momentum_breakdown`
+- `max_scan_status: "structural_candidate"` — engine hard-cap (never entry_ready from daily scan)
+- Preconditions: `close_above_ema20: true`, `rsi_min_precondition: 72`, `atr_extension_min: 1.8`
+- RSI bands inverted: ideal 75–85 (higher = more overbought = better for this family)
+- Hold window: 1–7 days (short; reversals tend to be fast)
+- DTE 5–14, delta 0.35–0.55 (slightly OTM puts)
+- Added to `pattern_scores.bearish`: `overextension_exhaustion: 3`, `rejection_wick_reversal: 3`
+
+#### 2. `internal/strategy/rules.go` — struct additions
+- `FamilyPreconditions`: `RSIMinPrecondition float64`, `ATRExtensionMin float64`
+- `FamilyConfig`: `MaxScanStatus string`
+- `DefaultRules()`: added `bearish_exhaustion_reversal` entry + 2 new pattern scores
+
+#### 3. `internal/strategy/engine.go` — 8 targeted changes
+- `Features`: added `ATR14`, `ATRExtension`, `HasATRExtension`
+- `computeFeatures()`: computes `ATRExtension = (close - EMA20) / ATR14`
+- `checkPreconditions()`: added `rsi_min_precondition` and `atr_extension_min` checks
+- `familyOrder`: added `"bearish_exhaustion_reversal"` (5th family)
+- `scoreFamily()`: `MaxScanStatus` cap applied after status assignment
+- `scoreTrendStructure()`: special case for exhaustion reversal (ATR extension score, more = better)
+- `scoreEntryQuality()`: new `name string` param; exhaustion reversal inverts logic (more extension = better entry)
+- `detectPatterns()`: new `f Features` param; detects `overextension_exhaustion` (>= 20% upper wick + ATR >= 1.8) and `rejection_wick_reversal` (>= 40% upper wick)
+- `computePenalties()`: `RSIOverextendedBullish` penalty exempted for this family
+- Layer 5 reason codes: `bearish_exhaustion_reversal` gets `rsi_extended`, `above_ema20`, `bearish_reversal_setup` instead of `below_ema20`
+
+### Lifecycle flow (as deployed)
+```
+06:25 Daily scan → if close > EMA20, RSI >= 72, ATRExtension >= 1.8
+                 → scores to structural_candidate (max_scan_status cap)
+                 → watchlisted for opening confirmation
+
+06:42 Opening confirmation activity:
+      TODO: detect intraday rejection for structural_candidate with
+            family == "bearish_exhaustion_reversal":
+              - first 10/30/60m close below VWAP or OR midpoint
+              - relative volume >= 1.3
+              - QQQ/SPY not strongly bullish
+              - no hard blocks (spread, VWAP hold, no wick)
+            If rejection confirmed → promote to entry_ready → Claude payload
+
+07:45 Continuation review:
+      Same rejection check on fresh 6:30→7:45 intraday bars (TODO).
+```
+
+### Remaining work
+- `RunOpeningConfirmationActivity` and `RunContinuationReviewActivity` do NOT yet
+  check for `bearish_exhaustion_reversal` structural candidates.
+  Currently only `entry_ready` candidates are sent to Claude.
+  TODO: add intraday rejection detection pass for this family before building payload.
+- The `max_scan_status` cap means these names will never auto-confirm without
+  the activity-level promotion code being written.
+
+### Files changed
+- `strategy_rules.yaml`
+- `internal/strategy/rules.go`
+- `internal/strategy/engine.go`
+
+---
+
 ## Completed: Trading-Day Schedule Fix (2026-04-24)
 
 ### Objective

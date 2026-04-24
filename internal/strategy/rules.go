@@ -121,6 +121,12 @@ type FamilyConfig struct {
 	OptionType  string `yaml:"option_type"` // "call" | "put"
 	Description string `yaml:"description"`
 
+	// MaxScanStatus caps the lifecycle status the daily scan engine may assign.
+	// When non-empty (e.g. "structural_candidate"), the engine will never promote
+	// to entry_ready regardless of score. Used by bearish_exhaustion_reversal to
+	// ensure entry_ready can only come from the opening confirmation activity.
+	MaxScanStatus string `yaml:"max_scan_status"`
+
 	Preconditions   FamilyPreconditions   `yaml:"preconditions"`
 	Scoring         FamilyScoringConfig   `yaml:"scoring"`
 	RSI             FamilyRSIBands        `yaml:"rsi"`
@@ -149,6 +155,9 @@ type FamilyPreconditions struct {
 	// Momentum families
 	EMA20SlopePositive bool `yaml:"ema20_slope_positive"`
 	EMA20SlopeNegative bool `yaml:"ema20_slope_negative"`
+	// Exhaustion reversal: numeric threshold gates (zero = not enforced)
+	RSIMinPrecondition float64 `yaml:"rsi_min_precondition"` // RSI must be >= this (e.g. 72)
+	ATRExtensionMin    float64 `yaml:"atr_extension_min"`    // (close-EMA20)/ATR14 must be >= this (e.g. 1.8)
 }
 
 // FamilyScoringConfig holds the 5 dimension weights and promotion thresholds.
@@ -530,6 +539,31 @@ func DefaultRules() *Rules {
 		Options:    FamilyOptionsBand{DTEMin: 7, DTEMax: 14, DeltaMin: 0.45, DeltaMax: 0.70},
 		HoldWindow: HoldWindow{Min: 2, Base: 7, Max: 10},
 	}
+	bearishExhaustionFamily := FamilyConfig{
+		Direction: "bearish", OptionType: "put",
+		MaxScanStatus: "structural_candidate",
+		Preconditions: FamilyPreconditions{
+			CloseAboveEMA20:    true,
+			RSIMinPrecondition: 72,
+			ATRExtensionMin:    1.8,
+		},
+		Scoring: FamilyScoringConfig{
+			Weights: ScoringWeights{
+				TrendStructure: 30, MomentumAlignment: 25,
+				VolumeParticipation: 15, EntryQuality: 20, PatternStrength: 10,
+			},
+			Thresholds: ScoringThresholds{StructuralCandidate: 40, EntryReady: 999},
+		},
+		RSI:          FamilyRSIBands{IdealMin: 75, IdealMax: 85, AcceptableMin: 72, AcceptableMax: 90},
+		ExtensionPct: FamilyExtensionBands{IdealMax: 999.0, AcceptableMax: 999.0, HardReject: 999.0},
+		Volume:       FamilyVolumeBands{StrongMin: 1.5, AdequateMin: 1.0},
+		EMAGapPct:    FamilyEMAGapBands{StrongMin: 0.0, AdequateMin: 0.0},
+		EntryConditions: FamilyEntryConditions{
+			VolumeMin: 1.3, RSIMin: 72, RSIMax: 95, ExtensionMaxPct: 999.0,
+		},
+		Options:    FamilyOptionsBand{DTEMin: 5, DTEMax: 14, DeltaMin: 0.35, DeltaMax: 0.55},
+		HoldWindow: HoldWindow{Min: 1, Base: 3, Max: 7},
+	}
 	return &Rules{
 		Version: 7,
 		Global: GlobalConfig{
@@ -551,10 +585,11 @@ func DefaultRules() *Rules {
 			RSIOverextendedBullish: 10, RSIOversoldBearish: 10,
 		},
 		Families: map[string]FamilyConfig{
-			"bullish_continuation":       bullContFamily,
-			"bullish_momentum_breakout":  bullMomFamily,
-			"bearish_continuation":       bearContFamily,
-			"bearish_momentum_breakdown": bearMomFamily,
+			"bullish_continuation":         bullContFamily,
+			"bullish_momentum_breakout":    bullMomFamily,
+			"bearish_continuation":         bearContFamily,
+			"bearish_momentum_breakdown":   bearMomFamily,
+			"bearish_exhaustion_reversal":  bearishExhaustionFamily,
 		},
 		PatternScoreConfig: PatternScoreConfig{
 			Bullish: map[string]int{
@@ -565,6 +600,7 @@ func DefaultRules() *Rules {
 			Bearish: map[string]int{
 				"bear_flag": 3, "lower_high_breakdown": 2,
 				"volatility_contraction_breakdown": 3, "relative_weakness_bearish": 2,
+				"overextension_exhaustion": 3, "rejection_wick_reversal": 3,
 			},
 		},
 		AntiPatternConfig: AntiPatternConfig{

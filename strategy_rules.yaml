@@ -325,6 +325,112 @@ families:
 
 
   # ----------------------------------------------------------
+  # BEARISH EXHAUSTION REVERSAL
+  # Thesis: overextended bullish names showing first signs of
+  # rejection after a sustained rally. PUT candidates only.
+  #
+  # IMPORTANT — two-phase lifecycle:
+  #   Phase 1 (daily scan, 6:25 AM):
+  #     Preconditions detect overextension (RSI >= 72, price >= 1.8
+  #     ATR above EMA20). Engine caps output at structural_candidate.
+  #     Never produces entry_ready from overnight bars alone.
+  #
+  #   Phase 2 (opening confirmation / continuation review):
+  #     Activity observes intraday rejection evidence:
+  #       - failed breakout or upper-wick rejection candle
+  #       - first 10/30/60m close below VWAP or OR midpoint
+  #       - relative volume >= 1.3
+  #       - QQQ/SPY not strongly bullish
+  #     If evidence present → promote to entry_ready → Claude confirms.
+  #
+  # Hard rejects at confirmation time (activity enforces):
+  #   - price still holding above VWAP
+  #   - no visible rejection wick
+  #   - QQQ/SPY strong risk-on
+  #   - spread too wide or no valid put contract
+  # ----------------------------------------------------------
+  bearish_exhaustion_reversal:
+    direction: bearish
+    option_type: put
+    description: >
+      Close above EMA20 with RSI >= 72 and price extended >= 1.8 ATR above EMA20.
+      Daily scan produces structural_candidate only. entry_ready requires intraday
+      rejection evidence observed at opening confirmation or continuation review:
+      failed breakout or rejection wick, first 10/30/60m close below VWAP or
+      opening range midpoint, relative volume >= 1.3, and QQQ/SPY not risk-on.
+
+    # max_scan_status caps what the daily engine can assign.
+    # The opening confirmation activity is the only path to entry_ready.
+    max_scan_status: "structural_candidate"
+
+    # Preconditions for daily scan pass (all must be true):
+    #   close_above_ema20     — still above EMA20 (not yet broken down)
+    #   rsi_min_precondition  — RSI must be overextended (new field)
+    #   atr_extension_min     — (close - EMA20) / ATR14 >= this value (new field)
+    preconditions:
+      close_above_ema20: true
+      rsi_min_precondition: 72
+      atr_extension_min: 1.8
+
+    scoring:
+      # trend_structure: ATR extension magnitude (more extended = higher reversal potential)
+      # momentum_alignment: RSI level via rsi bands below (higher = more overbought = better)
+      # entry_quality: inverted extension scoring + upper-wick quality at scan time
+      weights:
+        trend_structure: 30
+        momentum_alignment: 25
+        volume_participation: 15     # prior-day volume in the up-move
+        entry_quality: 20            # overextension quality (inverted: more = better)
+        pattern_strength: 10
+      thresholds:
+        structural_candidate: 40     # lower bar — preconditions already enforce quality
+        entry_ready: 999             # unreachable at scan time; only assigned by activity
+
+    # For this family: higher RSI = more overbought = better PUT setup.
+    # Ideal: 75–85 (classic overbought territory). Acceptable: 72–90.
+    rsi:
+      ideal_min: 75
+      ideal_max: 85
+      acceptable_min: 72
+      acceptable_max: 90
+
+    # extension_pct fields are unused for this family (scoring is inverted via ATR
+    # extension in scoreTrendStructure and scoreEntryQuality). Set to no-op values.
+    extension_pct:
+      ideal_max: 999.0
+      acceptable_max: 999.0
+      hard_reject: 999.0
+
+    volume:
+      strong_min: 1.5
+      adequate_min: 1.0              # elevated buying-volume into the top is expected
+
+    ema_gap_pct:
+      strong_min: 0.0
+      adequate_min: 0.0
+
+    # entry_conditions are evaluated by the opening confirmation activity,
+    # not by the daily scan engine. The max_scan_status cap ensures entry_ready
+    # cannot be set by the engine regardless of these values.
+    entry_conditions:
+      volume_min: 1.3                # intraday relative volume >= 1.3
+      rsi_min: 72                    # already gated by precondition
+      rsi_max: 95                    # allow extreme overbought
+      extension_max_pct: 999.0       # no upper cap on extension
+
+    options:
+      dte_min: 5
+      dte_max: 14
+      delta_min: 0.35                # slightly lower delta — sharp reversal expected
+      delta_max: 0.55
+
+    hold_window:
+      min: 1
+      base: 3
+      max: 7
+
+
+  # ----------------------------------------------------------
   # BEARISH MOMENTUM BREAKDOWN
   # Thesis: price breaking below EMA20 with slope confirming.
   # Earlier entry — higher volume and score requirements.
@@ -408,6 +514,8 @@ pattern_scores:
     lower_high_breakdown: 2
     volatility_contraction_breakdown: 3
     relative_weakness_bearish: 2
+    overextension_exhaustion: 3    # price far above EMA20 with fading momentum
+    rejection_wick_reversal: 3     # upper wick on last bar indicating intraday selling
 
 
 # ============================================================

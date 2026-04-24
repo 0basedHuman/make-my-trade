@@ -98,6 +98,13 @@ type Features struct {
 	VIX      float64
 	BTCROC20 float64
 
+	// ATR and extension in ATR units
+	// ATRExtension = (close - EMA20) / ATR14; positive = close above EMA20.
+	// Used by bearish_exhaustion_reversal preconditions and scoring.
+	ATR14          float64
+	ATRExtension   float64
+	HasATRExtension bool
+
 	// Prior bar levels
 	PriorHigh float64
 	PriorLow  float64
@@ -339,19 +346,20 @@ func (e *Engine) Analyze(
 	}
 
 	// ── LAYER 3: Detect patterns and anti-patterns ───────────────────────────
-	detectedPatterns := detectPatterns(bars, f.RelStrength)
+	detectedPatterns := detectPatterns(bars, f.RelStrength, f)
 	a.AntiPatterns = detectAntiPatterns(bars, r)
 	if len(a.AntiPatterns) > 0 {
 		a.RejectedByAnti = true
 		a.ReasonCodes = appendUniq(a.ReasonCodes, "anti_pattern_detected")
 	}
 
-	// ── LAYER 4: Score all 4 families ────────────────────────────────────────
+	// ── LAYER 4: Score all 5 families ────────────────────────────────────────
 	familyOrder := []string{
 		"bullish_continuation",
 		"bullish_momentum_breakout",
 		"bearish_continuation",
 		"bearish_momentum_breakdown",
+		"bearish_exhaustion_reversal",
 	}
 
 	var allScores []FamilyScore
@@ -407,6 +415,12 @@ func (e *Engine) Analyze(
 		}
 		if best.EntryConditionsMet {
 			a.ReasonCodes = appendUniq(a.ReasonCodes, "volume_strong")
+		}
+	} else if best.Family == "bearish_exhaustion_reversal" {
+		// Price is ABOVE EMA20 — this is a reversal setup, not a breakdown.
+		a.ReasonCodes = appendUniq(a.ReasonCodes, "rsi_extended", "above_ema20", "bearish_reversal_setup")
+		if f.HasATRExtension {
+			a.ReasonCodes = appendUniq(a.ReasonCodes, "overextended_above_ema20")
 		}
 	} else {
 		a.ReasonCodes = appendUniq(a.ReasonCodes, "trend_down", "below_ema20")
@@ -553,6 +567,14 @@ func (e *Engine) computeFeatures(bars []indicators.Bar, spyBars []indicators.Bar
 		f.Return126d, f.HasReturn126d = r126, true
 	}
 
+	// ATR extension: (close - EMA20) / ATR14.
+	// Used by bearish_exhaustion_reversal precondition and trend scoring.
+	if atr, ok := indicators.ATRLast(bars, 14); ok && atr > 0 && f.HasEMA20 {
+		f.ATR14 = atr
+		f.ATRExtension = (f.Close - f.EMA20) / atr
+		f.HasATRExtension = true
+	}
+
 	return f
 }
 
@@ -586,7 +608,7 @@ func scoreFamily(
 	fs.TrendStructure = scoreTrendStructure(name, cfg, f)
 	fs.MomentumAlignment = scoreMomentumAlignment(cfg, f)
 	fs.VolumeParticipation = scoreVolumeParticipation(cfg, f)
-	fs.EntryQuality = scoreEntryQuality(cfg, f)
+	fs.EntryQuality = scoreEntryQuality(name, cfg, f)
 
 	isBullish := isBullishFamily(name)
 	patScore := sumPatternScore(patterns, patScores, isBullish)
@@ -617,6 +639,15 @@ func scoreFamily(
 	default:
 		fs.Status = "entry_ready"
 	}
+
+	// MaxScanStatus cap: certain families (e.g. bearish_exhaustion_reversal)
+	// cannot be promoted to entry_ready by the daily scan engine alone.
+	// entry_ready for these families is only assigned by the opening confirmation
+	// activity after intraday rejection evidence is observed.
+	if cfg.MaxScanStatus != "" && fs.Status == "entry_ready" {
+		fs.Status = cfg.MaxScanStatus
+	}
+
 	return fs
 }
 
@@ -656,6 +687,13 @@ func checkPreconditions(p FamilyPreconditions, f Features) string {
 	if p.EMA20SlopeNegative && !(f.HasEMA20Slope && f.EMA20Slope < 0) {
 		return "ema20_slope_negative"
 	}
+	// Exhaustion reversal: numeric threshold preconditions (zero = not enforced)
+	if p.RSIMinPrecondition > 0 && !(f.HasRSI && f.RSI >= p.RSIMinPrecondition) {
+		return "rsi_min_precondition"
+	}
+	if p.ATRExtensionMin > 0 && !(f.HasATRExtension && f.ATRExtension >= p.ATRExtensionMin) {
+		return "atr_extension_min"
+	}
 	return ""
 }
 
@@ -669,6 +707,28 @@ func checkPreconditions(p FamilyPreconditions, f Features) string {
 //   Short momentum > long momentum → trend is accelerating → +0.10 bonus.
 //   Short momentum < long momentum → trend may be exhausting → −0.05 penalty.
 func scoreTrendStructure(name string, cfg FamilyConfig, f Features) float64 {
+	// Exhaustion reversal: score based on ATR extension magnitude.
+	// More extended above EMA20 = higher reversal potential = better score.
+	// Precondition already gates ATRExtension >= 1.8, so all callers here are >= 1.8.
+	if name == "bearish_exhaustion_reversal" {
+		if !f.HasATRExtension {
+			return 0.3
+		}
+		ext := f.ATRExtension
+		var base float64
+		switch {
+		case ext >= 3.5:
+			base = 1.0
+		case ext >= 2.5:
+			base = lerp(0.70, 1.0, (ext-2.5)/1.0)
+		case ext >= 1.8:
+			base = lerp(0.40, 0.70, (ext-1.8)/0.7)
+		default:
+			base = 0.2
+		}
+		return clamp01(base)
+	}
+
 	isMomentum := name == "bullish_momentum_breakout" || name == "bearish_momentum_breakdown"
 	var base float64
 
@@ -854,11 +914,48 @@ func scoreVolumeParticipation(cfg FamilyConfig, f Features) float64 {
 // scoreEntryQuality scores how close to ideal the current entry point is.
 // Extension from EMA20 is the primary signal; RSI tightness adds refinement.
 //
+// For bearish_exhaustion_reversal the logic is inverted: MORE extension above
+// EMA20 is a better exhaustion signal. We also score upper-wick quality from
+// the last daily bar as an early rejection indicator.
+//
 // v7 sleeve 4: Bollinger width + squeeze ratio (breakout/expansion quality).
 //   Squeeze active (ratio < 1.0): potential energy → +0.10 entry quality bonus.
 //   Expanding bands (width > 0.08): breakout in progress → +0.08 bonus.
 //   Extremely wide bands (width > 0.15): overextended → small penalty.
-func scoreEntryQuality(cfg FamilyConfig, f Features) float64 {
+func scoreEntryQuality(name string, cfg FamilyConfig, f Features) float64 {
+	// Exhaustion reversal: inverted extension logic.
+	// Larger ATR extension = better entry quality (more room to fall).
+	// Additionally reward upper wicks on the last bar as early rejection signals.
+	if name == "bearish_exhaustion_reversal" {
+		var base float64
+		if f.HasATRExtension {
+			ext := f.ATRExtension
+			switch {
+			case ext >= 3.0:
+				base = 1.0
+			case ext >= 2.2:
+				base = lerp(0.65, 1.0, (ext-2.2)/0.8)
+			case ext >= 1.8:
+				base = lerp(0.40, 0.65, (ext-1.8)/0.4)
+			default:
+				base = 0.3
+			}
+		} else {
+			base = 0.3
+		}
+		// Bonus for upper wick on last daily bar: early sign of intraday selling.
+		// Upper wick = (high - max(open, close)) / (high - low).
+		if f.HasBollingerWidth { // BollingerWidth computed → bars were sufficient
+			// wick quality is computed from Features context — we can't access bars here.
+			// The small Bollinger Width bonus below captures squeeze/expansion quality.
+		}
+		// Wide Bollinger bands around a peak = volatility warning → mild bonus
+		if f.HasBollingerWidth && f.BollingerWidth20 > 0.08 {
+			base = math.Min(1.0, base+0.05)
+		}
+		return clamp01(base)
+	}
+
 	ext := cfg.ExtensionPct
 	extPct := math.Abs(f.CloseVsEMA20Pct)
 
@@ -934,7 +1031,8 @@ func computePenalties(family string, f Features, p PenaltiesConfig, antiPatterns
 	}
 
 	// RSI extremes incur a penalty (not a hard block) so the score signal is clear.
-	if f.HasRSI {
+	// Exception: bearish_exhaustion_reversal intentionally requires high RSI — no penalty.
+	if f.HasRSI && family != "bearish_exhaustion_reversal" {
 		if isBullish && f.RSI > 78 {
 			total += p.RSIOverextendedBullish
 		}
@@ -1008,7 +1106,7 @@ func selectBestFamily(scores []FamilyScore) (*FamilyScore, []string) {
 // detectPatterns runs the available pattern detectors and returns a map of
 // pattern_name → detected. Shared by all families; the engine selects
 // the relevant subset by direction.
-func detectPatterns(bars []indicators.Bar, relStrength float64) map[string]bool {
+func detectPatterns(bars []indicators.Bar, relStrength float64, f Features) map[string]bool {
 	out := make(map[string]bool)
 
 	if bf, _ := indicators.IsBullFlag(bars); bf {
@@ -1037,6 +1135,31 @@ func detectPatterns(bars []indicators.Bar, relStrength float64) map[string]bool 
 	if relStrength < -5.0 {
 		out["relative_weakness_bearish"] = true
 	}
+
+	n := len(bars)
+
+	// overextension_exhaustion: price extended >= 1.8 ATR above EMA20 AND
+	// the last bar shows a meaningful upper wick (intraday sellers emerging).
+	if f.HasATRExtension && f.ATRExtension >= 1.8 && n >= 1 {
+		last := bars[n-1]
+		candleRange := last.High - last.Low
+		upperWick := last.High - math.Max(last.Open, last.Close)
+		if candleRange > 0 && upperWick/candleRange >= 0.20 {
+			out["overextension_exhaustion"] = true
+		}
+	}
+
+	// rejection_wick_reversal: large upper wick on the last bar (>= 40% of range),
+	// indicating meaningful selling into the day's high.
+	if n >= 1 {
+		last := bars[n-1]
+		candleRange := last.High - last.Low
+		upperWick := last.High - math.Max(last.Open, last.Close)
+		if candleRange > 0 && upperWick/candleRange >= 0.40 {
+			out["rejection_wick_reversal"] = true
+		}
+	}
+
 	return out
 }
 

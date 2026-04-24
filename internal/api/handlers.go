@@ -572,7 +572,9 @@ func (h *Handler) PaperPositions(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 	loc, _ := time.LoadLocation("America/Los_Angeles")
-	today := time.Now().In(loc)
+	now := time.Now().In(loc)
+	// Use PT-local date, not UTC midnight, so runs after 5 PM PT land on the correct date.
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	todayStr := today.Format("2006-01-02")
 	_ = today.Format("15:04") // scanTime unused — kept for reference
 
@@ -669,7 +671,7 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 			}
 
 			candID, err := store.UpsertCandidate(ctx, h.pool, store.UpsertCandidateInput{
-				TradeDate:       today.Truncate(24 * time.Hour),
+				TradeDate:       today,
 				Ticker:          t,
 				GateTrend:       a.GateTrend.Passed,
 				GateMomentum:    a.GateMomentum.Passed,
@@ -868,10 +870,18 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 					"status": md.status, "direction": md.dir, "score": md.score,
 					"final_decision": md.fd, "thesis": md.why, "reason_codes": md.rc,
 				})
+				// Map final_decision to the DB-allowed claude_action enum values.
+				dbAction := finalDecisionToDBAction(md.fd)
 				if err := store.UpdateCandidateClaudeReview(ctx, h.pool, r.candID,
-					md.fd, float64(md.score)/100.0, string(decisionJSON),
+					dbAction, float64(md.score)/100.0, string(decisionJSON),
 				); err != nil {
 					log.Printf("pipeline: persist decision %s: %v", r.ticker, err)
+				}
+				// Also persist Claude's candidate_status (e.g. entry_ready) to the DB row.
+				if md.status != "" {
+					if err := store.UpdateCandidateStatus(ctx, h.pool, r.candID, md.status); err != nil {
+						log.Printf("pipeline: persist status %s: %v", r.ticker, err)
+					}
 				}
 			}
 		} else {
@@ -944,7 +954,7 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 	}
 
 	summary := store.DailySummary{
-		TradeDate:         today.Truncate(24 * time.Hour),
+		TradeDate:         today,
 		VIXLevel:          vixLevel,
 		BTCROC20:          btcROC,
 		RegimeLabel:       regimeLabel,
@@ -1447,6 +1457,24 @@ func buildAnalysisResponseFromDB(candidates []store.Candidate, summary *store.Da
 	resp.WatchOnly = nullSlice(resp.WatchOnly)
 	resp.Rejected = nullSlice(resp.Rejected)
 	return resp
+}
+
+// finalDecisionToDBAction maps Claude's final_decision string to the
+// claude_action enum allowed by the trade_candidates DB constraint:
+// BUY | WATCH | INVALID | PENDING | SKIPPED
+func finalDecisionToDBAction(fd string) string {
+	switch fd {
+	case "paper_trade_now":
+		return "BUY"
+	case "place_trigger_only", "watchlist_only":
+		return "WATCH"
+	case "reject":
+		return "INVALID"
+	case "":
+		return "PENDING"
+	default:
+		return "WATCH"
+	}
 }
 
 // selectBestContract fetches the option chain for a ticker, applies quality

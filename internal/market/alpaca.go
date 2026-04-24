@@ -220,15 +220,15 @@ func (c *AlpacaClient) FetchCryptoDailyBars(symbol string, startDate time.Time, 
 
 // OptionContract holds a single option contract snapshot from Alpaca.
 type OptionContract struct {
-	Symbol       string  `json:"symbol"`        // OCC symbol, e.g. "RTX260501P00200000"
-	Type         string  `json:"type"`          // "call" or "put"
+	Symbol       string  `json:"symbol"` // OCC symbol, e.g. "RTX260501P00200000"
+	Type         string  `json:"type"`   // "call" or "put"
 	Strike       float64 `json:"strike"`
-	Expiration   string  `json:"expiration"`    // "YYYY-MM-DD"
+	Expiration   string  `json:"expiration"` // "YYYY-MM-DD"
 	DTE          int     `json:"dte"`
 	Delta        float64 `json:"delta"`
 	Bid          float64 `json:"bid"`
 	Ask          float64 `json:"ask"`
-	SpreadPct    float64 `json:"spread_pct"`    // (ask-bid)/ask*100
+	SpreadPct    float64 `json:"spread_pct"` // (ask-bid)/ask*100
 	OpenInterest int     `json:"open_interest"`
 	OptionVolume int     `json:"option_volume"`
 }
@@ -259,8 +259,8 @@ func parseOptionSymbol(symbol, ticker string) (optType, expiration string, strik
 		return "", "", 0, false
 	}
 	dateStr := symbol[prefix : prefix+6] // YYMMDD
-	cpStr := symbol[prefix+6 : prefix+7]  // C or P
-	strikeStr := symbol[prefix+7:]         // 8 digits
+	cpStr := symbol[prefix+6 : prefix+7] // C or P
+	strikeStr := symbol[prefix+7:]       // 8 digits
 
 	// Parse date: YYMMDD → 20YY-MM-DD
 	if len(dateStr) != 6 {
@@ -512,9 +512,10 @@ func (c *AlpacaClient) fetchIntradayBatch(tickers []string, start, end time.Time
 // Pass zero for any threshold you don't want to apply.
 //
 // Parameters match strategy_rules.yaml options_translation.liquidity_filters:
-//   minOI        — minimum open interest (0 = skip check)
-//   minVolume    — minimum option volume (0 = skip check)
-//   maxSpreadPct — maximum bid-ask spread as % of mid (0 = skip check)
+//
+//	minOI        — minimum open interest (0 = skip check)
+//	minVolume    — minimum option volume (0 = skip check)
+//	maxSpreadPct — maximum bid-ask spread as % of mid (0 = skip check)
 func FilterChainQuality(contracts []OptionContract, minOI, minVolume int, maxSpreadPct float64) []OptionContract {
 	var qualified []OptionContract
 	for _, c := range contracts {
@@ -533,31 +534,147 @@ func FilterChainQuality(contracts []OptionContract, minOI, minVolume int, maxSpr
 	return qualified
 }
 
+// ContractSelectionOpts configures SelectBestContract ranking.
+// All fields have safe zero-value defaults (see SelectBestContract doc).
+type ContractSelectionOpts struct {
+	// DTE constraints applied as hard filters.
+	DTEMin        int // 0 → use 7
+	DTEMax        int // 0 → use 14
+	AvoidDTEBelow int // 0 → use 4; contracts below this DTE are excluded
+	TargetDTE     int // 0 → use 10; rank by |dte - target|
+
+	// Delta constraints applied as soft filters (prefer in-band, fall back to nearest).
+	DeltaMin float64 // 0 → 0.30
+	DeltaMax float64 // 0 → 0.75
+}
+
+// effectiveDTEOpts fills zero-value fields with safe defaults.
+func effectiveDTEOpts(o ContractSelectionOpts) ContractSelectionOpts {
+	if o.DTEMin <= 0 {
+		o.DTEMin = 7
+	}
+	if o.DTEMax <= 0 {
+		o.DTEMax = 14
+	}
+	if o.AvoidDTEBelow <= 0 {
+		o.AvoidDTEBelow = 4
+	}
+	if o.TargetDTE <= 0 {
+		o.TargetDTE = 10
+	}
+	if o.DeltaMin <= 0 {
+		o.DeltaMin = 0.30
+	}
+	if o.DeltaMax <= 0 {
+		o.DeltaMax = 0.75
+	}
+	return o
+}
+
 // SelectBestContract picks the best option contract for the given direction ("call" or "put").
-// Prefers the contract with |delta| closest to 0.50 (high-quality near-ATM).
-// Returns nil if no contracts match the direction.
-func SelectBestContract(contracts []OptionContract, direction string) *OptionContract {
-	var best *OptionContract
-	bestDist := 1.0 // distance from ideal |delta| of 0.50
-	for i := range contracts {
-		c := &contracts[i]
+//
+// Ranking priority (descending):
+//  1. Type matches direction (hard filter)
+//  2. DTE >= AvoidDTEBelow (hard filter; default 4)
+//  3. DTE inside [DTEMin, DTEMax] (hard filter; defaults 7–14)
+//  4. Delta inside [DeltaMin, DeltaMax] (soft preference; falls back to any in-type if no in-band contracts)
+//  5. Closest DTE to TargetDTE (default 10)
+//  6. Closest |delta| to mid of delta band
+//  7. Tighter bid-ask spread
+//  8. Higher open interest
+//  9. Higher option volume
+//
+// Log family, DTE, allowed range, target, delta, spread, OI, volume for the selected contract.
+// Returns nil if no contracts match.
+func SelectBestContract(contracts []OptionContract, direction string, opts ContractSelectionOpts) *OptionContract {
+	opts = effectiveDTEOpts(opts)
+	targetDeltaMid := (opts.DeltaMin + opts.DeltaMax) / 2.0
+
+	// Hard filter: type, avoid_dte_below, dte range
+	var candidates []OptionContract
+	for _, c := range contracts {
 		if c.Type != direction {
 			continue
 		}
+		if c.DTE < opts.AvoidDTEBelow {
+			continue
+		}
+		if c.DTE < opts.DTEMin || c.DTE > opts.DTEMax {
+			continue
+		}
+		candidates = append(candidates, c)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Soft filter: prefer contracts with |delta| inside the band.
+	// If none qualify, fall back to all DTE-filtered candidates.
+	inBand := candidates[:0:0]
+	for _, c := range candidates {
 		absDelta := c.Delta
 		if absDelta < 0 {
 			absDelta = -absDelta
 		}
-		dist := absDelta - 0.50
-		if dist < 0 {
-			dist = -dist
-		}
-		if best == nil || dist < bestDist {
-			best = c
-			bestDist = dist
+		if absDelta >= opts.DeltaMin && absDelta <= opts.DeltaMax {
+			inBand = append(inBand, c)
 		}
 	}
-	return best
+	pool := candidates
+	if len(inBand) > 0 {
+		pool = inBand
+	}
+
+	// Rank: find the best by the composite score.
+	// Lower score = better.
+	type scored struct {
+		c     *OptionContract
+		score float64
+	}
+	var ranked []scored
+	for i := range pool {
+		c := &pool[i]
+		absDelta := c.Delta
+		if absDelta < 0 {
+			absDelta = -absDelta
+		}
+		// Primary: DTE distance from target (normalised 0–1 over 14-day window)
+		dteDist := float64(c.DTE - opts.TargetDTE)
+		if dteDist < 0 {
+			dteDist = -dteDist
+		}
+		dteDist = dteDist / 14.0
+
+		// Secondary: delta distance from mid (0–0.5 range)
+		deltaDist := absDelta - targetDeltaMid
+		if deltaDist < 0 {
+			deltaDist = -deltaDist
+		}
+
+		// Tertiary: spread quality (0 to ~10% spread range)
+		spreadPenalty := c.SpreadPct / 100.0
+
+		// Tie-break: prefer higher liquidity (OI + volume; inverted, small = better)
+		liqPenalty := 0.0
+		if c.OpenInterest > 0 {
+			liqPenalty = 1.0 / float64(c.OpenInterest)
+		}
+
+		composite := dteDist*4.0 + deltaDist*2.0 + spreadPenalty*1.0 + liqPenalty*0.1
+		ranked = append(ranked, scored{c: c, score: composite})
+	}
+
+	if len(ranked) == 0 {
+		return nil
+	}
+
+	best := ranked[0]
+	for _, r := range ranked[1:] {
+		if r.score < best.score {
+			best = r
+		}
+	}
+	return best.c
 }
 
 // PlaceOptionOrder places a day limit buy order for one options contract

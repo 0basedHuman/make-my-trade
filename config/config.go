@@ -51,12 +51,12 @@ type Config struct {
 	// ── Market data — Alpaca ─────────────────────────────────────────────────
 	// Paper keys are used for all order execution in v1.
 	// Live keys are stored but gated behind LiveTradeEnabled.
-	AlpacaAPIKey       string
-	AlpacaSecretKey    string
-	AlpacaPaperAPIKey  string
-	AlpacaPaperSecret  string
-	AlpacaBaseURL      string // paper or live base URL
-	AlpacaDataURL      string // market data endpoint (same for both)
+	AlpacaAPIKey      string
+	AlpacaSecretKey   string
+	AlpacaPaperAPIKey string
+	AlpacaPaperSecret string
+	AlpacaBaseURL     string // paper or live base URL
+	AlpacaDataURL     string // market data endpoint (same for both)
 
 	// ── News and sentiment — Finnhub ─────────────────────────────────────────
 	// Provides news, earnings calendar, analyst ratings, social sentiment.
@@ -67,9 +67,9 @@ type Config struct {
 	FREDAPIKey string
 
 	// ── Claude API ───────────────────────────────────────────────────────────
-	AnthropicAPIKey      string
-	ClaudeInputTokenBudget  int // max input tokens per research packet
-	ClaudeMaxOutputTokens   int // max tokens Claude may return per call
+	AnthropicAPIKey        string
+	ClaudeInputTokenBudget int // max input tokens per research packet
+	ClaudeMaxOutputTokens  int // max tokens Claude may return per call
 
 	// ── Trading mode ─────────────────────────────────────────────────────────
 	// PaperTradeEnabled: paper orders execute automatically, always true.

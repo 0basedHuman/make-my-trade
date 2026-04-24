@@ -298,13 +298,42 @@ function showDetail(c, data) {
 
   // Open position for this ticker (if any)
   const pos = (data.open_positions||[]).find(p => p.ticker === c.ticker);
-  const posHTML = pos ? `
+  const posHTML = pos ? (() => {
+    const entry   = pos.option_premium || pos.entry_price || 0;
+    const current = pos.last_option_price || 0;
+    const peak    = pos.peak_option_price || 0;
+    const pnlPct  = entry > 0 && current > 0 ? ((current - entry) / entry * 100) : null;
+    const stopLevel  = entry > 0 ? entry * 0.70 : 0;  // -30%
+    const tpLevel    = entry > 0 ? entry * 1.50 : 0;  // +50%
+    const trailFloor = peak  > 0 ? peak  * 0.80 : 0;  // -20% from peak
+
+    const pnlColor = pnlPct === null ? 'var(--muted)' : pnlPct >= 0 ? 'var(--green)' : 'var(--red)';
+    const pnlStr   = pnlPct !== null ? `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%` : '—';
+
+    // Next mechanical exit trigger
+    let nextTrigger = '—';
+    if (entry > 0 && current > 0) {
+      if (current <= stopLevel) nextTrigger = `stop hit ($${fmt(stopLevel)})`;
+      else if (current >= tpLevel) nextTrigger = `take-profit hit ($${fmt(tpLevel)})`;
+      else if (pos.trailing_active && trailFloor > 0) nextTrigger = `trail floor $${fmt(trailFloor)}`;
+      else if (pos.trailing_active) nextTrigger = `trailing active`;
+      else nextTrigger = `stop $${fmt(stopLevel)} · TP $${fmt(tpLevel)}`;
+    }
+
+    return `
     <div class="d-section-title">Open Position</div>
     <div class="d-box">
-      <div class="d-box-row"><span class="d-box-label">Entry price</span><span class="d-box-val">$${fmt(pos.entry_price)}</span></div>
-      <div class="d-box-row"><span class="d-box-label">Stop loss</span><span class="d-box-val" style="color:var(--red)">$${fmt(pos.stop_loss)}</span></div>
-      <div class="d-box-row"><span class="d-box-label">Target 1</span><span class="d-box-val" style="color:var(--green)">$${fmt(pos.target1)}</span></div>
-    </div>` : '';
+      <div class="d-box-row"><span class="d-box-label">Entry premium</span><span class="d-box-val">$${fmt(entry)}</span></div>
+      <div class="d-box-row"><span class="d-box-label">Current premium</span><span class="d-box-val" style="color:${pnlColor}">${current > 0 ? `$${fmt(current)}` : '—'}</span></div>
+      <div class="d-box-row"><span class="d-box-label">P/L</span><span class="d-box-val" style="color:${pnlColor}">${pnlStr}</span></div>
+      ${peak > 0 ? `<div class="d-box-row"><span class="d-box-label">Peak premium</span><span class="d-box-val">$${fmt(peak)}</span></div>` : ''}
+      <div class="d-box-row"><span class="d-box-label">Stop loss level</span><span class="d-box-val" style="color:var(--red)">${entry > 0 ? `$${fmt(stopLevel)}` : '—'}</span></div>
+      <div class="d-box-row"><span class="d-box-label">Take profit level</span><span class="d-box-val" style="color:var(--green)">${entry > 0 ? `$${fmt(tpLevel)}` : '—'}</span></div>
+      <div class="d-box-row"><span class="d-box-label">Trailing stop</span><span class="d-box-val">${pos.trailing_active ? `<span style="color:var(--yellow)">ACTIVE — floor $${trailFloor > 0 ? fmt(trailFloor) : '?'}</span>` : 'not yet'}</span></div>
+      <div class="d-box-row"><span class="d-box-label">Next trigger</span><span class="d-box-val" style="font-size:11px">${nextTrigger}</span></div>
+      <div class="d-box-row"><span class="d-box-label">Hold overnight</span><span class="d-box-val">${pos.hold_overnight_approved ? '<span style="color:var(--green)">approved</span>' : '<span style="color:var(--muted)">not approved</span>'}</span></div>
+    </div>`;
+  })() : '';
 
   el.innerHTML = `
     <div>

@@ -194,7 +194,7 @@ func ROCLast(closes []float64, period int) (float64, bool) {
 	if base == 0 {
 		return 0, false
 	}
-	return (closes[n-1]-base) / base * 100, true
+	return (closes[n-1] - base) / base * 100, true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -597,8 +597,8 @@ func NearestSupport(bars []Bar, currentPrice float64, lookback int) float64 {
 // ATRTargetRange computes structure-based base and stretch price targets from
 // an ATR multiple. This replaces arbitrary percent targets.
 //
-//   Bullish: base = entry + 2.0×ATR,  stretch = entry + 3.5×ATR
-//   Bearish: base = entry − 2.0×ATR,  stretch = entry − 3.5×ATR
+//	Bullish: base = entry + 2.0×ATR,  stretch = entry + 3.5×ATR
+//	Bearish: base = entry − 2.0×ATR,  stretch = entry − 3.5×ATR
 //
 // Returns (0, 0, false) when ATR cannot be computed.
 func ATRTargetRange(bars []Bar, period int, entry float64, direction string) (base, stretch float64, ok bool) {

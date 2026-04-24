@@ -1492,10 +1492,17 @@ func (h *Handler) selectBestContract(ctx context.Context, ticker, optionType str
 	lf := h.rules.OptionsTranslation.LiquidityFilters
 	qualified := filterChainQuality(contracts, lf)
 
-	best := market.SelectBestContract(qualified, optionType)
+	// Use global risk DTE defaults for the API-path contract selector (no family context here).
+	selOpts := market.ContractSelectionOpts{
+		DTEMin:        h.rules.Risk.OptionLifecycle.DTEMin,
+		DTEMax:        h.rules.Risk.OptionLifecycle.DTEMax,
+		TargetDTE:     h.rules.Risk.OptionLifecycle.TargetDTE,
+		AvoidDTEBelow: h.rules.Risk.OptionLifecycle.AvoidDTEBelow,
+	}
+	best := market.SelectBestContract(qualified, optionType, selOpts)
 	if best == nil {
-		log.Printf("select-contract: no qualifying %s contract for %s (chain=%d qualified=%d)",
-			optionType, ticker, len(contracts), len(qualified))
+		log.Printf("select-contract: no qualifying %s contract for %s (chain=%d qualified=%d dteRange=%d-%d)",
+			optionType, ticker, len(contracts), len(qualified), selOpts.DTEMin, selOpts.DTEMax)
 		return "", 0
 	}
 

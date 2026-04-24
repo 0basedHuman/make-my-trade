@@ -167,7 +167,8 @@ func ContinuationReviewCycle(ctx workflow.Context) error {
 }
 
 // DailyPositionReview runs at 12:45 PM PT (before close) for end-of-day decisions.
-// Determines hold-overnight vs exit for all open paper positions.
+// Uses RunEODPositionReviewActivity: mechanical checks first, then Claude hold approval,
+// then force-exits anything without hold approval.
 func DailyPositionReview(ctx workflow.Context) error {
 	logger := workflow.GetLogger(ctx)
 	logger.Info("DailyPositionReview: starting")
@@ -182,11 +183,37 @@ func DailyPositionReview(ctx workflow.Context) error {
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
 	var result string
-	if err := workflow.ExecuteActivity(ctx, "RunPositionReviewActivity").Get(ctx, &result); err != nil {
+	if err := workflow.ExecuteActivity(ctx, "RunEODPositionReviewActivity").Get(ctx, &result); err != nil {
 		logger.Error("DailyPositionReview: failed", "error", err)
 		return err
 	}
 
 	logger.Info("DailyPositionReview: complete", "result", result)
+	return nil
+}
+
+// MechanicalRiskCycle runs every 10 minutes during market hours (06:50–12:50 PT weekdays).
+// Evaluates hard mechanical exit rules (stop, take-profit, trailing, EOD) for every
+// open paper position without waiting for Claude.
+func MechanicalRiskCycle(ctx workflow.Context) error {
+	logger := workflow.GetLogger(ctx)
+	logger.Info("MechanicalRiskCycle: starting")
+
+	ao := workflow.ActivityOptions{
+		StartToCloseTimeout: 3 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 2,
+			InitialInterval: 15 * time.Second,
+		},
+	}
+	ctx = workflow.WithActivityOptions(ctx, ao)
+
+	var result string
+	if err := workflow.ExecuteActivity(ctx, "RunMechanicalRiskCheckActivity").Get(ctx, &result); err != nil {
+		logger.Error("MechanicalRiskCycle: failed", "error", err)
+		return err
+	}
+
+	logger.Info("MechanicalRiskCycle: complete", "result", result)
 	return nil
 }

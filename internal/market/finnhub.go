@@ -47,40 +47,40 @@ const finnhubBase = "https://finnhub.io/api/v1"
 
 // NewsItem is a single news article from Finnhub.
 type NewsItem struct {
-	Category  string `json:"category"`
-	Datetime  int64  `json:"datetime"`
-	Headline  string `json:"headline"`
-	Source    string `json:"source"`
-	Summary   string `json:"summary"`
-	URL       string `json:"url"`
-	Image     string `json:"image"`
-	Related   string `json:"related"`
+	Category  string  `json:"category"`
+	Datetime  int64   `json:"datetime"`
+	Headline  string  `json:"headline"`
+	Source    string  `json:"source"`
+	Summary   string  `json:"summary"`
+	URL       string  `json:"url"`
+	Image     string  `json:"image"`
+	Related   string  `json:"related"`
 	Sentiment float64 // computed externally or from sentiment endpoint
 }
 
 // EarningsEvent is a scheduled earnings announcement.
 type EarningsEvent struct {
-	Date        string  `json:"date"`
-	Symbol      string  `json:"symbol"`
-	EPS         float64 `json:"epsActual"`
-	EPSEst      float64 `json:"epsEstimate"`
-	Revenue     float64 `json:"revenueActual"`
-	RevenueEst  float64 `json:"revenueEstimate"`
-	Quarter     int     `json:"quarter"`
-	Year        int     `json:"year"`
+	Date       string  `json:"date"`
+	Symbol     string  `json:"symbol"`
+	EPS        float64 `json:"epsActual"`
+	EPSEst     float64 `json:"epsEstimate"`
+	Revenue    float64 `json:"revenueActual"`
+	RevenueEst float64 `json:"revenueEstimate"`
+	Quarter    int     `json:"quarter"`
+	Year       int     `json:"year"`
 }
 
 // SentimentData is the social sentiment summary for a symbol.
 type SentimentData struct {
-	Symbol             string  `json:"symbol"`
-	AtTime             string  `json:"atTime"`
-	Mention            int     `json:"mention"`
-	PositiveMention    int     `json:"positiveMention"`
-	NegativeMention    int     `json:"negativeMention"`
-	Score              float64 // derived: (positive - negative) / mention
-	RedditMention      int     `json:"redditMention"`
-	RedditPositive     int     `json:"redditPositiveMention"`
-	RedditNegative     int     `json:"redditNegativeMention"`
+	Symbol          string  `json:"symbol"`
+	AtTime          string  `json:"atTime"`
+	Mention         int     `json:"mention"`
+	PositiveMention int     `json:"positiveMention"`
+	NegativeMention int     `json:"negativeMention"`
+	Score           float64 // derived: (positive - negative) / mention
+	RedditMention   int     `json:"redditMention"`
+	RedditPositive  int     `json:"redditPositiveMention"`
+	RedditNegative  int     `json:"redditNegativeMention"`
 }
 
 // FetchCompanyNews fetches the last N days of news for a specific ticker.
@@ -91,7 +91,7 @@ func (c *FinnhubClient) FetchCompanyNews(ticker string, from, to time.Time) ([]N
 	params.Set("to", to.Format("2006-01-02"))
 	params.Set("token", c.apiKey)
 
-	body, err := c.get(finnhubBase+"/company-news?"+params.Encode())
+	body, err := c.get(finnhubBase + "/company-news?" + params.Encode())
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,7 @@ func (c *FinnhubClient) FetchUpcomingEarnings(from, to time.Time) ([]EarningsEve
 	params.Set("to", to.Format("2006-01-02"))
 	params.Set("token", c.apiKey)
 
-	body, err := c.get(finnhubBase+"/calendar/earnings?"+params.Encode())
+	body, err := c.get(finnhubBase + "/calendar/earnings?" + params.Encode())
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +129,7 @@ func (c *FinnhubClient) FetchSocialSentiment(ticker string) (SentimentData, erro
 	params.Set("symbol", ticker)
 	params.Set("token", c.apiKey)
 
-	body, err := c.get(finnhubBase+"/stock/social-sentiment?"+params.Encode())
+	body, err := c.get(finnhubBase + "/stock/social-sentiment?" + params.Encode())
 	if err != nil {
 		return SentimentData{}, err
 	}

@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"log"
 
-	"go.temporal.io/sdk/client"
 	wf "github.com/yourname/makemytrade/internal/workflow"
+	"go.temporal.io/sdk/client"
 )
 
 func main() {

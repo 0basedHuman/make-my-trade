@@ -41,11 +41,11 @@ import "github.com/yourname/makemytrade/internal/indicators"
 // ConfirmationInput is the per-candidate input to EvaluateConfirmation.
 type ConfirmationInput struct {
 	Ticker        string
-	Direction     string          // "bullish" or "bearish"
-	EntryLow      float64         // from trade_candidates.entry_low
-	EntryHigh     float64         // from trade_candidates.entry_high
-	StopLoss      float64         // from trade_candidates.stop_loss
-	PrevDayVolume int64           // prior session total volume (0 = unknown)
+	Direction     string           // "bullish" or "bearish"
+	EntryLow      float64          // from trade_candidates.entry_low
+	EntryHigh     float64          // from trade_candidates.entry_high
+	StopLoss      float64          // from trade_candidates.stop_loss
+	PrevDayVolume int64            // prior session total volume (0 = unknown)
 	Bars          []indicators.Bar // 1-min bars, 6:30–6:40 AM PT, sorted oldest-first
 	SPYBars       []indicators.Bar // SPY 1-min bars for the same window
 }
@@ -56,11 +56,11 @@ type ConfirmationResult struct {
 	Ticker string
 
 	// Individual signal results
-	SignalLevelHolds bool // breakout_or_reclaim_holds
-	SignalOpenRange  bool // opening_range midpoint check
+	SignalLevelHolds  bool // breakout_or_reclaim_holds
+	SignalOpenRange   bool // opening_range midpoint check
 	SignalNoRejection bool // no immediate rejection wick
-	SignalVolumeOK  bool // opening_volume_support
-	SignalMarketOK  bool // market_open_alignment (SPY)
+	SignalVolumeOK    bool // opening_volume_support
+	SignalMarketOK    bool // market_open_alignment (SPY)
 
 	SignalsPassed int
 
@@ -74,10 +74,10 @@ type ConfirmationResult struct {
 	Status string
 
 	// Bar data snapshot for persistence
-	OpenPrice    float64
-	First10High  float64
-	First10Low   float64
-	First10Close float64
+	OpenPrice     float64
+	First10High   float64
+	First10Low    float64
+	First10Close  float64
 	First10Volume int64
 }
 
@@ -341,6 +341,149 @@ func EvaluateConfirmation(in ConfirmationInput, cfg OpenConfirmationConfig) Conf
 	} else {
 		res.Status = "watch_only"
 	}
+
+	return res
+}
+
+// ── bearish_exhaustion_reversal intraday rejection check ─────────────────────
+
+// ExhaustionRejectionInput is the per-candidate input for the
+// bearish_exhaustion_reversal intraday check.
+//
+// This is NOT a general opening-confirmation check — it is only valid for
+// structural_candidate rows with setup_family='bearish_exhaustion_reversal'.
+// The check confirms that the overextended name is actually rejecting intraday,
+// which is the trigger that promotes it from structural_candidate → entry_ready.
+type ExhaustionRejectionInput struct {
+	Ticker        string
+	PrevDayVolume int64
+	Bars          []indicators.Bar // 1-min bars from 6:30 AM PT, sorted oldest-first
+	SPYBars       []indicators.Bar // SPY bars for the same window
+}
+
+// ExhaustionRejectionResult is the per-candidate output of EvaluateExhaustionRejection.
+type ExhaustionRejectionResult struct {
+	Ticker string
+
+	// Promotion gate: true means the candidate should be promoted to entry_ready
+	RejectionConfirmed bool
+
+	// Sub-signals
+	VWAPBreak        bool // last close below VWAP
+	ORMidBreak       bool // last close below opening-range midpoint
+	RelVolumeOK      bool // relative volume >= 1.3× expected
+	MarketNotBullish bool // SPY is not strongly bullish (< +0.3%)
+
+	// Hard blocks — any true prevents promotion
+	HardBlockFired  bool
+	HardBlockReason string
+
+	// Computed values (for logging)
+	VWAP      float64
+	ORMid     float64
+	RelVolume float64
+}
+
+// EvaluateExhaustionRejection checks whether a bearish_exhaustion_reversal
+// structural_candidate is showing intraday rejection in the opening window.
+//
+// Promotion requires ALL of:
+//   - last close below VWAP OR below opening-range midpoint
+//   - relative volume >= 1.3× expected 10-min pace (or prior-day volume unknown)
+//   - SPY not strongly bullish (< +0.3% from open)
+//
+// Hard blocks (prevent promotion regardless):
+//   - no intraday bars available
+//   - any bar has a lower wick >= 40% of bar range (bulls stepped in = no exhaustion)
+func EvaluateExhaustionRejection(in ExhaustionRejectionInput) ExhaustionRejectionResult {
+	res := ExhaustionRejectionResult{Ticker: in.Ticker}
+
+	if len(in.Bars) == 0 {
+		res.HardBlockFired = true
+		res.HardBlockReason = "no_intraday_bars_available"
+		return res
+	}
+
+	// ── Aggregate opening range and VWAP ─────────────────────────────────────
+	rangeHigh := in.Bars[0].High
+	rangeLow := in.Bars[0].Low
+	var vwapNumer, volSum float64
+	for _, b := range in.Bars {
+		if b.High > rangeHigh {
+			rangeHigh = b.High
+		}
+		if b.Low < rangeLow {
+			rangeLow = b.Low
+		}
+		vwapNumer += b.Close * b.Volume
+		volSum += b.Volume
+	}
+	if volSum > 0 {
+		res.VWAP = vwapNumer / volSum
+	}
+	res.ORMid = (rangeHigh + rangeLow) / 2.0
+
+	last := in.Bars[len(in.Bars)-1]
+
+	// ── Hard block: bullish recovery wick ────────────────────────────────────
+	// Any bar with a lower wick >= 40% of bar range = buyers defended the price.
+	// That means bulls are NOT exhausted and this is not a clean reversal setup.
+	for _, b := range in.Bars {
+		barRange := b.High - b.Low
+		if barRange > 0 {
+			lowerWick := minF(b.Close, b.Open) - b.Low
+			if lowerWick/barRange >= 0.40 {
+				res.HardBlockFired = true
+				res.HardBlockReason = "bullish_recovery_wick"
+				return res
+			}
+		}
+	}
+
+	// ── Sub-signals ──────────────────────────────────────────────────────────
+
+	// VWAP break: last close is below VWAP (stock is rejecting the day's average)
+	if res.VWAP > 0 && last.Close < res.VWAP {
+		res.VWAPBreak = true
+	}
+
+	// OR midpoint break: last close is below the opening-range midpoint
+	if last.Close < res.ORMid {
+		res.ORMidBreak = true
+	}
+
+	// Relative volume: compare actual 10-min volume to expected pace.
+	// Expected = prevDayVolume / 39  (390-min trading day divided into 10-min slices).
+	// A ratio >= 1.3 means elevated selling participation — required for a real rejection.
+	// If prior-day volume is unknown, we skip this check (conservative: pass it).
+	if in.PrevDayVolume > 0 {
+		expected := float64(in.PrevDayVolume) / 39.0
+		if expected > 0 {
+			res.RelVolume = volSum / expected
+		}
+		res.RelVolumeOK = res.RelVolume >= 1.3
+	} else {
+		res.RelVolumeOK = true // no prior data — assume volume requirement is met
+	}
+
+	// SPY not strongly bullish: SPY's 10-min move < +0.3% from open.
+	// If SPY is ripping, a single-stock put setup is fighting the market — skip it.
+	if len(in.SPYBars) > 0 {
+		spyOpen := in.SPYBars[0].Open
+		spyClose := in.SPYBars[len(in.SPYBars)-1].Close
+		if spyOpen > 0 {
+			spyMovePct := (spyClose - spyOpen) / spyOpen * 100.0
+			res.MarketNotBullish = spyMovePct < 0.3
+		} else {
+			res.MarketNotBullish = true
+		}
+	} else {
+		res.MarketNotBullish = true // no SPY data — assume neutral/not bullish
+	}
+
+	// ── Promotion gate ────────────────────────────────────────────────────────
+	// All three must be true: price rejection (VWAP or OR), volume participation, market alignment.
+	res.RejectionConfirmed = (res.VWAPBreak || res.ORMidBreak) && res.RelVolumeOK && res.MarketNotBullish
 
 	return res
 }

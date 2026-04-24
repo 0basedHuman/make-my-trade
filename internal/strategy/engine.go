@@ -65,9 +65,9 @@ type Features struct {
 	Close float64
 
 	// EMAs and derived ratios
-	EMA20  float64
-	EMA50  float64
-	EMA100 float64
+	EMA20                         float64
+	EMA50                         float64
+	EMA100                        float64
 	HasEMA20, HasEMA50, HasEMA100 bool
 
 	// EMA20 slope: % change over ema_slope_lookback bars.
@@ -101,8 +101,8 @@ type Features struct {
 	// ATR and extension in ATR units
 	// ATRExtension = (close - EMA20) / ATR14; positive = close above EMA20.
 	// Used by bearish_exhaustion_reversal preconditions and scoring.
-	ATR14          float64
-	ATRExtension   float64
+	ATR14           float64
+	ATRExtension    float64
 	HasATRExtension bool
 
 	// Prior bar levels
@@ -130,16 +130,16 @@ type Features struct {
 	HasEntropy30 bool
 
 	// Bollinger Band width (upper−lower / SMA, 20-bar, 2σ)
-	BollingerWidth20    float64
-	HasBollingerWidth   bool
+	BollingerWidth20  float64
+	HasBollingerWidth bool
 
 	// Squeeze ratio: Bollinger width / Keltner width (< 1.0 = squeeze active)
-	SqueezeRatio20    float64
-	HasSqueezeRatio   bool
+	SqueezeRatio20  float64
+	HasSqueezeRatio bool
 
 	// Raw returns used in SMA/EMA divergence sleeve
-	Return63d  float64 // 63-bar ROC %
-	Return126d float64 // 126-bar ROC %
+	Return63d     float64 // 63-bar ROC %
+	Return126d    float64 // 126-bar ROC %
 	HasReturn63d  bool
 	HasReturn126d bool
 }
@@ -203,8 +203,8 @@ type SymbolAnalysis struct {
 	// ── Score breakdown (new in v6) ───────────────────────────────────────────
 	// ScoreBreakdown is the winning family's full scored result.
 	// AllFamilyScores contains scored results for all 4 families (for debugging).
-	ScoreBreakdown   FamilyScore
-	AllFamilyScores  []FamilyScore
+	ScoreBreakdown  FamilyScore
+	AllFamilyScores []FamilyScore
 
 	// ── Lifecycle status ──────────────────────────────────────────────────────
 	// Set deterministically by the engine from YAML thresholds.
@@ -704,8 +704,9 @@ func checkPreconditions(p FamilyPreconditions, f Features) string {
 // For momentum families: EMA20 slope steepness (% per 5 bars).
 //
 // v7 sleeve: SMA/EMA divergence (Return63d vs Return126d).
-//   Short momentum > long momentum → trend is accelerating → +0.10 bonus.
-//   Short momentum < long momentum → trend may be exhausting → −0.05 penalty.
+//
+//	Short momentum > long momentum → trend is accelerating → +0.10 bonus.
+//	Short momentum < long momentum → trend may be exhausting → −0.05 penalty.
 func scoreTrendStructure(name string, cfg FamilyConfig, f Features) float64 {
 	// Exhaustion reversal: score based on ATR extension magnitude.
 	// More extended above EMA20 = higher reversal potential = better score.
@@ -919,9 +920,10 @@ func scoreVolumeParticipation(cfg FamilyConfig, f Features) float64 {
 // the last daily bar as an early rejection indicator.
 //
 // v7 sleeve 4: Bollinger width + squeeze ratio (breakout/expansion quality).
-//   Squeeze active (ratio < 1.0): potential energy → +0.10 entry quality bonus.
-//   Expanding bands (width > 0.08): breakout in progress → +0.08 bonus.
-//   Extremely wide bands (width > 0.15): overextended → small penalty.
+//
+//	Squeeze active (ratio < 1.0): potential energy → +0.10 entry quality bonus.
+//	Expanding bands (width > 0.08): breakout in progress → +0.08 bonus.
+//	Extremely wide bands (width > 0.15): overextended → small penalty.
 func scoreEntryQuality(name string, cfg FamilyConfig, f Features) float64 {
 	// Exhaustion reversal: inverted extension logic.
 	// Larger ATR extension = better entry quality (more room to fall).

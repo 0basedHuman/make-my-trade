@@ -1,137 +1,203 @@
 # Current Refactor Status
 
-## Completed: bearish_exhaustion_reversal Family (2026-04-24)
+## Completed: Mechanical Exits + 7–14 DTE Enforcement (2026-04-24)
 
 ### Objective
-Add a new optional PUT-only setup family that detects overextended bullish names
-near short-term exhaustion, but only confirms after intraday rejection.
+Enforce 7–14 DTE options with target DTE=10, and add automatic mechanical exit rules
+so the app doesn't rely solely on scheduled Claude review to close trades.
 
 ### What was done
 
-#### 1. `strategy_rules.yaml` — new family block + 2 pattern scores
-- `bearish_exhaustion_reversal` family added after `bearish_momentum_breakdown`
-- `max_scan_status: "structural_candidate"` — engine hard-cap (never entry_ready from daily scan)
-- Preconditions: `close_above_ema20: true`, `rsi_min_precondition: 72`, `atr_extension_min: 1.8`
-- RSI bands inverted: ideal 75–85 (higher = more overbought = better for this family)
-- Hold window: 1–7 days (short; reversals tend to be fast)
-- DTE 5–14, delta 0.35–0.55 (slightly OTM puts)
-- Added to `pattern_scores.bearish`: `overextension_exhaustion: 3`, `rejection_wick_reversal: 3`
-
-#### 2. `internal/strategy/rules.go` — struct additions
-- `FamilyPreconditions`: `RSIMinPrecondition float64`, `ATRExtensionMin float64`
-- `FamilyConfig`: `MaxScanStatus string`
-- `DefaultRules()`: added `bearish_exhaustion_reversal` entry + 2 new pattern scores
-
-#### 3. `internal/strategy/engine.go` — 8 targeted changes
-- `Features`: added `ATR14`, `ATRExtension`, `HasATRExtension`
-- `computeFeatures()`: computes `ATRExtension = (close - EMA20) / ATR14`
-- `checkPreconditions()`: added `rsi_min_precondition` and `atr_extension_min` checks
-- `familyOrder`: added `"bearish_exhaustion_reversal"` (5th family)
-- `scoreFamily()`: `MaxScanStatus` cap applied after status assignment
-- `scoreTrendStructure()`: special case for exhaustion reversal (ATR extension score, more = better)
-- `scoreEntryQuality()`: new `name string` param; exhaustion reversal inverts logic (more extension = better entry)
-- `detectPatterns()`: new `f Features` param; detects `overextension_exhaustion` (>= 20% upper wick + ATR >= 1.8) and `rejection_wick_reversal` (>= 40% upper wick)
-- `computePenalties()`: `RSIOverextendedBullish` penalty exempted for this family
-- Layer 5 reason codes: `bearish_exhaustion_reversal` gets `rsi_extended`, `above_ema20`, `bearish_reversal_setup` instead of `below_ema20`
-
-### Lifecycle flow (as deployed)
+#### 1. `strategy_rules.yaml` — `risk:` block added
+```yaml
+risk:
+  option_lifecycle:
+    dte_min: 7
+    dte_max: 14
+    target_dte: 10
+    avoid_dte_below: 4
+    contracts_per_trade: 1
+  mechanical_exits:
+    enabled: true
+    stop_loss_pct: 30
+    take_profit_pct: 50
+    trail_start_pct: 35
+    trail_giveback_pct: 20
+    force_eod_exit: true
+    max_hold_days: 1
 ```
-06:25 Daily scan → if close > EMA20, RSI >= 72, ATRExtension >= 1.8
-                 → scores to structural_candidate (max_scan_status cap)
-                 → watchlisted for opening confirmation
 
-06:42 Opening confirmation activity:
-      TODO: detect intraday rejection for structural_candidate with
-            family == "bearish_exhaustion_reversal":
-              - first 10/30/60m close below VWAP or OR midpoint
-              - relative volume >= 1.3
-              - QQQ/SPY not strongly bullish
-              - no hard blocks (spread, VWAP hold, no wick)
-            If rejection confirmed → promote to entry_ready → Claude payload
+#### 2. `internal/strategy/rules.go` — new structs
+- `RiskConfig`, `OptionLifecycleConfig`, `MechanicalExitsConfig`
+- Added `Risk RiskConfig` to `Rules` struct and `DefaultRules()`
 
-07:45 Continuation review:
-      Same rejection check on fresh 6:30→7:45 intraday bars (TODO).
+#### 3. `migrations/000007_risk_state.up.sql` + `down.sql` (new)
+- `peak_option_price`, `trailing_active`, `last_option_price`,
+  `last_risk_check_at`, `hold_overnight_approved`, `hold_overnight_approved_at`
+  added to `paper_positions` with `IF NOT EXISTS` guards
+- Index: `idx_paper_positions_open_risk` on `(status, last_risk_check_at) WHERE status='open'`
+
+#### 4. `internal/market/alpaca.go` — `SelectBestContract` redesigned
+- New signature: `SelectBestContract(contracts, direction, ContractSelectionOpts)`
+- `ContractSelectionOpts`: `DTEMin`, `DTEMax`, `TargetDTE`, `AvoidDTEBelow`, `DeltaMin`, `DeltaMax`
+- Hard filters: type, avoid_dte_below, dte range
+- Composite score: `dteDist*4.0 + deltaDist*2.0 + spreadPenalty*1.0 + liqPenalty*0.1`
+- Closest to target DTE wins when delta is in-band
+
+#### 5. `internal/risk/options.go` (new package)
+- `EvaluateMechanicalExit(pos, currentPremium, rules, nowPT)` — pure, no side effects
+- Priority: stop loss → take profit → trailing giveback → EOD exit
+- EOD cutoff: 12:45 PT; skipped if `hold_overnight_approved=true`
+- Exit reason constants: `PREMIUM_STOP_LOSS`, `PREMIUM_TAKE_PROFIT`,
+  `PREMIUM_TRAILING_GIVEBACK`, `EOD_EXIT_NO_HOLD_APPROVAL`
+
+#### 6. `internal/store/store.go` — risk-state helpers
+- Extended `PaperPosition` struct with risk-state columns
+- Added `RiskablePosition` struct (for risk-check queries)
+- `GetOpenPositionsForRiskCheck`, `UpdatePositionRiskState`, `SetHoldOvernightApproved`
+
+#### 7. `internal/workflow/activities.go` — 4 changes
+- `RunMechanicalRiskCheckActivity`: loads positions → fetches mid prices → evaluates
+  mechanical exits → sells → persists risk state
+- `runMechanicalChecks(ctx, pool, alpaca, rules, nowPT, source)`: shared helper
+- `RunEODPositionReviewActivity`: runs mechanical checks first, asks Claude for hold
+  approval, force-exits unapproved positions at EOD
+- `RunPositionReviewActivity`: calls `runMechanicalChecks` before Claude review
+- `SelectBestContract` calls now use `ContractSelectionOpts` with global risk DTE defaults
+
+#### 8. `internal/workflow/daily.go` — 2 changes
+- `DailyPositionReview` calls `RunEODPositionReviewActivity` instead of `RunPositionReviewActivity`
+- New `MechanicalRiskCycle` workflow calling `RunMechanicalRiskCheckActivity`
+
+#### 9. `cmd/worker/main.go` — registration + schedule
+- Registered `MechanicalRiskCycle`, `RunMechanicalRiskCheckActivity`, `RunEODPositionReviewActivity`
+- New schedule `makemytrade-mechanical-risk` with cron `*/10 6-12 * * 1-5`
+
+#### 10. `web/static/app.js` — full risk state in UI
+- Shows: entry premium, current premium, P/L%, peak premium, stop level, TP level,
+  trailing status with floor, next trigger, hold overnight approval
+
+#### 11. `internal/api/handlers.go`
+- `selectBestContract` helper uses `market.ContractSelectionOpts` with global risk DTE defaults
+
+#### 12. Tests
+- `internal/risk/options_test.go` — 15 tests for `EvaluateMechanicalExit`
+- `internal/market/contract_selector_test.go` — 9 tests for `SelectBestContract`
+- All tests pass: `go test ./...` ✅
+
+### Mechanical exit priority (as deployed)
 ```
+every 10 min (06:00–12:59 PT, Mon–Fri):
+  for each open position:
+    fetch current option mid price
+    1. stop loss:          current < entry × (1 - 0.30)  → EXIT
+    2. take profit:        current > entry × (1 + 0.50)  → EXIT
+    3. trailing activate:  current > entry × (1 + 0.35)  → set peak, set trailing=true
+    4. trailing giveback:  trailing && current < peak × (1 - 0.20) → EXIT
+    5. EOD (12:45 PT):     not hold_overnight_approved → EXIT
+    6. otherwise:          persist updated risk state, continue
+
+12:45 PT (RunEODPositionReviewActivity):
+  run mechanical checks first
+  for remaining open positions: ask Claude for hold approval
+  positions without approval: force exit
+```
+
+### Files changed (this refactor)
+- `strategy_rules.yaml`
+- `internal/strategy/rules.go`
+- `migrations/000007_risk_state.up.sql`
+- `migrations/000007_risk_state.down.sql`
+- `internal/market/alpaca.go`
+- `internal/risk/options.go` (new)
+- `internal/risk/options_test.go` (new)
+- `internal/market/contract_selector_test.go` (new)
+- `internal/store/store.go`
+- `internal/workflow/activities.go`
+- `internal/workflow/daily.go`
+- `cmd/worker/main.go`
+- `web/static/app.js`
+- `internal/api/handlers.go`
 
 ### Remaining work
-- `RunOpeningConfirmationActivity` and `RunContinuationReviewActivity` do NOT yet
-  check for `bearish_exhaustion_reversal` structural candidates.
-  Currently only `entry_ready` candidates are sent to Claude.
-  TODO: add intraday rejection detection pass for this family before building payload.
-- The `max_scan_status` cap means these names will never auto-confirm without
-  the activity-level promotion code being written.
+- Run `migrate up` in the deployed environment to apply `000007_risk_state`
+- `RunContinuationReviewActivity` does NOT yet run the exhaustion rejection check
+  on fresh 6:30→7:45 bars (exhaustion candidates that didn't reject at 6:42 are
+  not re-evaluated at 7:45)
+- Consider persisting `EvaluateExhaustionRejection` results to `trade_confirmations`
+  for auditability (currently only logged)
+- `execution.BuyOptionPosition` places Alpaca order BEFORE DB insert; consider
+  reversing to DB-first for orphan-prevention
+
+### Exact next step
+Apply DB migration in the target environment:
+```sh
+migrate -path migrations -database $DATABASE_URL up
+```
+Then restart the worker so the new schedules (`makemytrade-mechanical-risk`) register.
+
+---
+
+## Completed: bearish_exhaustion_reversal Opening Confirmation Pass (2026-04-24)
+
+### Objective
+Wire intraday rejection detection for `bearish_exhaustion_reversal` structural candidates
+into the opening-confirmation activity so they can be promoted to `entry_ready` and
+reach the Claude payload.
+
+### What was done
+
+#### 1. `internal/store/store.go` — new query
+- `GetExhaustionReversalStructuralCandidates`: loads `structural_candidate` rows with
+  `setup_family='bearish_exhaustion_reversal'` for a given trade date.
+
+#### 2. `internal/strategy/confirmation.go` — new evaluator
+- `ExhaustionRejectionInput` / `ExhaustionRejectionResult` structs
+- `EvaluateExhaustionRejection`: deterministic, side-effect-free check:
+  - Hard block: any bar with lower wick >= 40% of bar range (bullish recovery = no exhaustion)
+  - Hard block: no intraday bars available
+  - `RejectionConfirmed = (VWAPBreak || ORMidBreak) && RelVolumeOK && MarketNotBullish`
+
+#### 3. `internal/workflow/activities.go` — two edits in `RunOpeningConfirmationActivity`
+- Load exhaustion structural candidates, add their tickers to batch
+- After score-based shortlisting: run `EvaluateExhaustionRejection` for each;
+  if `RejectionConfirmed`, promote `structural_candidate → entry_ready`
+
+### Files changed
+- `internal/store/store.go`
+- `internal/strategy/confirmation.go`
+- `internal/workflow/activities.go`
+
+---
+
+## Completed: bearish_exhaustion_reversal Family (2026-04-24)
+
+### Objective
+Add a new optional PUT-only setup family for overextended bullish names near exhaustion.
 
 ### Files changed
 - `strategy_rules.yaml`
 - `internal/strategy/rules.go`
 - `internal/strategy/engine.go`
+- `internal/store/store.go`
+- `internal/strategy/confirmation.go`
+- `internal/workflow/activities.go`
 
 ---
 
 ## Completed: Trading-Day Schedule Fix (2026-04-24)
 
 ### Objective
-Fix the schedule so the app behaves like a logical autonomous paper options
-trader. First-10-minute opening confirmation must fire at 6:42 PT, not 7:45 PT.
-
-### What was done
-
-#### 1. `strategy_rules.yaml` — `schedule:` block added
-```yaml
-schedule:
-  timezone: America/Los_Angeles
-  daily_scan_time:             "06:25"
-  opening_confirmation_time:   "06:42"
-  opening_confirmation_cutoff: "06:55"
-  first_position_review_time:  "07:15"
-  continuation_review_time:    "07:45"
-  end_of_day_review_time:      "12:45"
-  weekly_review_time:          "07:00"
-```
-Times are PT-local. Changing a time: edit YAML → delete Temporal schedule → restart worker.
-
-#### 2. `internal/strategy/rules.go` — `ScheduleConfig` struct added
-- Mirrors all 7 YAML fields with typed Go struct
-
-#### 3. `cmd/worker/main.go` — 6 schedules, PT-local crons, DST-safe
-- `TimeZoneName: "America/Los_Angeles"` on every schedule (Temporal handles DST)
-- Cron expressions are now PT-local (not UTC conversions)
-- Two new schedules: `makemytrade-first-position-review`, `makemytrade-continuation-review`
-- Times wired from `rules.Schedule` YAML fields with hardcoded fallbacks
-- Old 4 UTC schedules deleted; 6 new PT schedules registered
-
-#### 4. `internal/workflow/daily.go` — 2 new workflow definitions
-- `FirstPositionReviewCycle` — 7:15 PT, calls `RunPositionReviewActivity`
-- `ContinuationReviewCycle` — 7:45 PT, calls `RunContinuationReviewActivity`
-- Updated header comment with full 6-step schedule
-
-#### 5. `internal/workflow/activities.go` — 4 changes
-
-**Staleness guard in `RunOpeningConfirmationActivity`:**
-- If PT time > `opening_confirmation_cutoff` (default 6:55), returns immediately:
-  `"opening_confirmation_stale: ...use continuation review instead"`
-- Prevents first-10-min entry logic from running late as a delayed opening candle
-
-**New `RunContinuationReviewActivity`:**
-- Logs `continuation_review_started` with full `continuation_window=06:30-<now>`
-- Delegates to `RunPositionReviewActivity` (position risk management)
-- TODO comment: full continuation entry logic (VWAP structure, 60-min high/low,
-  second-leg Claude confirmation with fresh payload)
-
-**Log statements added:**
-- `schedule_daily_scan_started` at start of `RunDailyAnalysisActivity`
-- `schedule_opening_confirmation_started opening_confirmation_window=06:30-06:40`
-- `claude_confirmation_time=HH:MM candidates=N vix=X btc_roc=X spy_trend=X`
-- `first_position_review_started` at start of `RunPositionReviewActivity`
-- `continuation_review_started continuation_window=06:30-HH:MM`
+Fix schedule so opening confirmation fires at 6:42 PT.
 
 ### Autonomous trading day (as deployed)
 ```
 06:25 PT  DailyResearchCycle         — overnight scan, classify candidates
 06:42 PT  OpeningConfirmationCycle   — 6:30-6:40 candle, Claude entry (cutoff 6:55)
-07:15 PT  FirstPositionReviewCycle   — early risk management on open positions
+07:15 PT  FirstPositionReviewCycle   — early risk management
 07:45 PT  ContinuationReviewCycle    — fresh intraday bars, position tighten/exit
-12:45 PT  DailyPositionReview        — end-of-day: hold overnight vs exit
+every 10m MechanicalRiskCycle        — hard stops, TP, trailing, EOD exit
+12:45 PT  DailyPositionReview        — EOD: Claude hold approval or force exit
 Sunday 07:00 PT  WeeklyReviewCycle   — performance review + tuning proposals
 ```
 
@@ -141,21 +207,3 @@ Sunday 07:00 PT  WeeklyReviewCycle   — performance review + tuning proposals
 - `cmd/worker/main.go`
 - `internal/workflow/daily.go`
 - `internal/workflow/activities.go`
-
-### Remaining work / TODOs
-- `RunContinuationReviewActivity` currently delegates to `RunPositionReviewActivity`.
-  Future: add real continuation entry logic:
-  - fetch fresh intraday bars 6:30→7:45
-  - evaluate VWAP hold/reclaim, 60-min high/low, higher-low structure
-  - check option spread still acceptable
-  - if still-valid entry_ready setup and no hard blocks → Claude continuation payload
-  - if Claude confirms → execution.BuyOptionPosition (same single lifecycle path)
-- `execution.BuyOptionPosition` places Alpaca order BEFORE DB insert (Alpaca-first).
-  Consider reversing to DB-first in execution/options.go for orphan-prevention.
-- `selectBestContract` in API re-fetches chain at buy time. Acceptable for paper.
-
-### How to change schedule times
-1. Edit `schedule:` block in `strategy_rules.yaml`
-2. Delete old Temporal schedule(s):
-   `go run internal/tools/delete_schedules.go` (or Temporal UI)
-3. Restart worker — new schedules auto-register

@@ -51,6 +51,37 @@ type Rules struct {
 	TradeFrequency     TradeFrequencyConfig     `yaml:"trade_frequency"`
 	ClaudeConfirmation ClaudeConfirmationConfig `yaml:"claude_confirmation"`
 	Schedule           ScheduleConfig           `yaml:"schedule"`
+	Risk               RiskConfig               `yaml:"risk"`
+}
+
+// ── Risk ──────────────────────────────────────────────────────────────────────
+
+// RiskConfig holds the option lifecycle and mechanical exit rules.
+// These are applied universally across all families unless a family overrides DTE.
+type RiskConfig struct {
+	OptionLifecycle OptionLifecycleConfig `yaml:"option_lifecycle"`
+	MechanicalExits MechanicalExitsConfig `yaml:"mechanical_exits"`
+}
+
+// OptionLifecycleConfig defines DTE and contract-count policy for all entries.
+type OptionLifecycleConfig struct {
+	DTEMin            int `yaml:"dte_min"`             // minimum DTE at entry (hard lower bound)
+	DTEMax            int `yaml:"dte_max"`             // maximum DTE at entry (hard upper bound)
+	TargetDTE         int `yaml:"target_dte"`          // preferred DTE; selector ranks by |dte - target|
+	AvoidDTEBelow     int `yaml:"avoid_dte_below"`     // hard floor: never select DTE below this
+	ContractsPerTrade int `yaml:"contracts_per_trade"` // always 1 for paper trading
+}
+
+// MechanicalExitsConfig defines hard exit rules evaluated every risk-check cycle.
+// These are NOT overridable by Claude. Claude can only approve hold_overnight.
+type MechanicalExitsConfig struct {
+	Enabled                         bool    `yaml:"enabled"`
+	PremiumStopLossPct              float64 `yaml:"premium_stop_loss_pct"`                // exit if premium down this % from entry
+	PremiumTakeProfitPct            float64 `yaml:"premium_take_profit_pct"`              // exit if premium up this % from entry
+	PremiumTrailingStartPct         float64 `yaml:"premium_trailing_start_pct"`           // activate trail once premium up this %
+	PremiumTrailingGivebackPct      float64 `yaml:"premium_trailing_giveback_pct"`        // exit if gives back this % from peak after trail starts
+	ForceEODExitUnlessHoldConfirmed bool    `yaml:"force_eod_exit_unless_hold_confirmed"` // exit at EOD unless hold_overnight_approved
+	MaxHoldDaysWithoutReconfirm     int     `yaml:"max_hold_days_without_reconfirm"`      // require reconfirm after N hold days
 }
 
 // ── Global ────────────────────────────────────────────────────────────────────
@@ -585,11 +616,11 @@ func DefaultRules() *Rules {
 			RSIOverextendedBullish: 10, RSIOversoldBearish: 10,
 		},
 		Families: map[string]FamilyConfig{
-			"bullish_continuation":         bullContFamily,
-			"bullish_momentum_breakout":    bullMomFamily,
-			"bearish_continuation":         bearContFamily,
-			"bearish_momentum_breakdown":   bearMomFamily,
-			"bearish_exhaustion_reversal":  bearishExhaustionFamily,
+			"bullish_continuation":        bullContFamily,
+			"bullish_momentum_breakout":   bullMomFamily,
+			"bearish_continuation":        bearContFamily,
+			"bearish_momentum_breakdown":  bearMomFamily,
+			"bearish_exhaustion_reversal": bearishExhaustionFamily,
 		},
 		PatternScoreConfig: PatternScoreConfig{
 			Bullish: map[string]int{
@@ -660,6 +691,21 @@ func DefaultRules() *Rules {
 			UseDeterministicOpeningEvidence:    true,
 			DeterministicSignalsSoftMin:        2,
 			DeterministicAutoRejectIsHardBlock: true,
+		},
+		Risk: RiskConfig{
+			OptionLifecycle: OptionLifecycleConfig{
+				DTEMin: 7, DTEMax: 14, TargetDTE: 10,
+				AvoidDTEBelow: 4, ContractsPerTrade: 1,
+			},
+			MechanicalExits: MechanicalExitsConfig{
+				Enabled:                         true,
+				PremiumStopLossPct:              30,
+				PremiumTakeProfitPct:            50,
+				PremiumTrailingStartPct:         35,
+				PremiumTrailingGivebackPct:      20,
+				ForceEODExitUnlessHoldConfirmed: true,
+				MaxHoldDaysWithoutReconfirm:     1,
+			},
 		},
 	}
 }

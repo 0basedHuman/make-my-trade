@@ -126,6 +126,7 @@ func main() {
 	w.RegisterWorkflow(wf.ContinuationReviewCycle)
 	w.RegisterWorkflow(wf.DailyPositionReview)
 	w.RegisterWorkflow(wf.WeeklyReviewCycle)
+	w.RegisterWorkflow(wf.MechanicalRiskCycle)
 
 	// Register activities (bound to deps so they have DB + API access)
 	w.RegisterActivity(deps.RunDailyAnalysisActivity)
@@ -133,6 +134,8 @@ func main() {
 	w.RegisterActivity(deps.RunPositionReviewActivity)
 	w.RegisterActivity(deps.RunContinuationReviewActivity)
 	w.RegisterActivity(deps.RunWeeklyReviewActivity)
+	w.RegisterActivity(deps.RunMechanicalRiskCheckActivity)
+	w.RegisterActivity(deps.RunEODPositionReviewActivity)
 
 	// ── 8. Start ──────────────────────────────────────────────────────────────
 	if err := w.Start(); err != nil {
@@ -203,6 +206,15 @@ func registerSchedules(ctx context.Context, tc client.Client, rules *strategy.Ru
 			cron:     parseCron(sched.DailyScanTime, "06:25", "1-5"),
 			workflow: wf.DailyResearchCycle,
 			wfID:     "daily-research-run",
+		},
+		// Mechanical risk check every 10 minutes during market hours (06:50–12:50 PT).
+		// Uses a standard cron interval expression: every 10th minute, hours 6–12, weekdays.
+		// Temporal interprets */10 within the hour correctly.
+		{
+			id:       "makemytrade-mechanical-risk",
+			cron:     "*/10 6-12 * * 1-5",
+			workflow: wf.MechanicalRiskCycle,
+			wfID:     "mechanical-risk-run",
 		},
 		{
 			id:       "makemytrade-open-confirmation",

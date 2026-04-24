@@ -56,6 +56,36 @@ trade_frequency:
 
 
 # ============================================================
+# RISK — option lifecycle DTE policy and mechanical exit rules.
+#
+# WHY: 7–14 DTE options decay fast. Hard mechanical exits protect
+#      capital without relying solely on scheduled Claude review.
+#      target_dte=10 is the preferred contract at entry; the
+#      selector ranks by closest to this target.
+#
+# mechanical_exits: runs every 10 minutes during market hours.
+#   All exits are hard — Claude cannot override stop/TP/trail.
+#   Claude CAN approve hold_overnight to prevent EOD forced exit.
+# ============================================================
+risk:
+  option_lifecycle:
+    dte_min: 7              # minimum DTE at entry (hard lower bound)
+    dte_max: 14             # maximum DTE at entry (hard upper bound)
+    target_dte: 10          # preferred DTE; selector ranks by |dte - target_dte|
+    avoid_dte_below: 4      # never select a contract with DTE < this
+    contracts_per_trade: 1  # always 1 contract per paper trade
+
+  mechanical_exits:
+    enabled: true
+    premium_stop_loss_pct: 30          # exit if premium is down 30% from entry
+    premium_take_profit_pct: 50        # exit if premium is up 50% from entry
+    premium_trailing_start_pct: 35     # activate trailing once premium is up 35%
+    premium_trailing_giveback_pct: 20  # exit if premium gives back 20% from peak after trail starts
+    force_eod_exit_unless_hold_confirmed: true  # exit at EOD unless Claude explicitly approves hold
+    max_hold_days_without_reconfirm: 1          # require reconfirm after this many hold days
+
+
+# ============================================================
 # CLAUDE CONFIRMATION — controls Claude's role at opening time.
 # Claude is the final authority after deterministic evidence.
 # ============================================================

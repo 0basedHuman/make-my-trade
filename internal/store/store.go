@@ -33,18 +33,18 @@ import (
 
 // Candidate mirrors the trade_candidates table row.
 type Candidate struct {
-	ID               string    `json:"id"`
-	TradeDate        time.Time `json:"trade_date"`
-	Ticker           string    `json:"ticker"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID        string    `json:"id"`
+	TradeDate time.Time `json:"trade_date"`
+	Ticker    string    `json:"ticker"`
+	CreatedAt time.Time `json:"created_at"`
 
-	GateTrend        bool      `json:"gate_trend"`
-	GateMomentum     bool      `json:"gate_momentum"`
-	GateVolume       bool      `json:"gate_volume"`
-	GateVIX          bool      `json:"gate_vix"`
-	GateBTC          bool      `json:"gate_btc"`
-	GateRSI          bool      `json:"gate_rsi"`
-	AllGatesPassed   bool      `json:"all_gates_passed"`
+	GateTrend      bool `json:"gate_trend"`
+	GateMomentum   bool `json:"gate_momentum"`
+	GateVolume     bool `json:"gate_volume"`
+	GateVIX        bool `json:"gate_vix"`
+	GateBTC        bool `json:"gate_btc"`
+	GateRSI        bool `json:"gate_rsi"`
+	AllGatesPassed bool `json:"all_gates_passed"`
 
 	ClosePrice  float64 `json:"close_price"`
 	EMA20       float64 `json:"ema20"`
@@ -55,17 +55,17 @@ type Candidate struct {
 	VIXLevel    float64 `json:"vix_level"`
 	BTCROC20    float64 `json:"btc_roc20"`
 
-	PatternName      string   `json:"pattern_name"`
-	PatternScore     float64  `json:"pattern_score"`
-	AntiPatterns     []string `json:"anti_patterns"`
-	RejectedByAnti   bool     `json:"rejected_by_anti"`
+	PatternName    string   `json:"pattern_name"`
+	PatternScore   float64  `json:"pattern_score"`
+	AntiPatterns   []string `json:"anti_patterns"`
+	RejectedByAnti bool     `json:"rejected_by_anti"`
 
-	EntryLow    float64 `json:"entry_low"`
-	EntryHigh   float64 `json:"entry_high"`
-	StopLoss    float64 `json:"stop_loss"`
-	Target1     float64 `json:"target1"`
-	Target2     float64 `json:"target2"`
-	RRRatio     float64 `json:"rr_ratio"`
+	EntryLow  float64 `json:"entry_low"`
+	EntryHigh float64 `json:"entry_high"`
+	StopLoss  float64 `json:"stop_loss"`
+	Target1   float64 `json:"target1"`
+	Target2   float64 `json:"target2"`
+	RRRatio   float64 `json:"rr_ratio"`
 
 	HoldDaysMin  int `json:"hold_days_min"`
 	HoldDaysBase int `json:"hold_days_base"`
@@ -110,12 +110,12 @@ type UpsertCandidateInput struct {
 	AntiPatterns   []string
 	RejectedByAnti bool
 
-	EntryLow    float64
-	EntryHigh   float64
-	StopLoss    float64
-	Target1     float64
-	Target2     float64
-	RRRatio     float64
+	EntryLow  float64
+	EntryHigh float64
+	StopLoss  float64
+	Target1   float64
+	Target2   float64
+	RRRatio   float64
 
 	HoldDaysMin  int
 	HoldDaysBase int
@@ -302,25 +302,80 @@ ORDER BY COALESCE(claude_confidence,0) DESC`,
 	return out, rows.Err()
 }
 
+// GetExhaustionReversalStructuralCandidates returns structural_candidate rows for
+// the given date whose setup_family is 'bearish_exhaustion_reversal'.
+// These are loaded by the opening-confirmation activity for the intraday rejection
+// check: if rejection is confirmed, they are promoted to entry_ready in the DB
+// and added to the Claude confirmation payload.
+func GetExhaustionReversalStructuralCandidates(ctx context.Context, pool *pgxpool.Pool, date time.Time) ([]Candidate, error) {
+	rows, err := pool.Query(ctx, `
+SELECT id, trade_date, ticker, created_at,
+       gate_trend, gate_momentum, gate_volume, gate_vix, gate_btc, gate_rsi, all_gates_passed,
+       COALESCE(close_price,0), COALESCE(ema20,0), COALESCE(ema100,0), COALESCE(rsi14,0),
+       COALESCE(macd_hist,0), COALESCE(volume_ratio,0), COALESCE(vix_level,0), COALESCE(btc_roc20,0),
+       COALESCE(pattern_name,''), COALESCE(pattern_score,0), COALESCE(anti_patterns,'{}'), rejected_by_anti,
+       COALESCE(entry_low,0), COALESCE(entry_high,0), COALESCE(stop_loss,0),
+       COALESCE(target1,0), COALESCE(target2,0), COALESCE(rr_ratio,0),
+       COALESCE(hold_days_min,0), COALESCE(hold_days_base,0), COALESCE(hold_days_max,0),
+       COALESCE(claude_action,'PENDING'), COALESCE(claude_confidence,0), COALESCE(claude_rationale,''),
+       COALESCE(reject_reason,''),
+       COALESCE(candidate_status,''), COALESCE(setup_family,''), COALESCE(direction,''),
+       COALESCE(prev_day_volume,0)
+FROM trade_candidates
+WHERE trade_date=$1 AND candidate_status='structural_candidate' AND setup_family='bearish_exhaustion_reversal'
+ORDER BY COALESCE(claude_confidence,0) DESC`,
+		date,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get exhaustion reversal structural candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Candidate
+	for rows.Next() {
+		var c Candidate
+		var tradeDate time.Time
+		err := rows.Scan(
+			&c.ID, &tradeDate, &c.Ticker, &c.CreatedAt,
+			&c.GateTrend, &c.GateMomentum, &c.GateVolume, &c.GateVIX, &c.GateBTC, &c.GateRSI, &c.AllGatesPassed,
+			&c.ClosePrice, &c.EMA20, &c.EMA100, &c.RSI14,
+			&c.MACDHist, &c.VolumeRatio, &c.VIXLevel, &c.BTCROC20,
+			&c.PatternName, &c.PatternScore, &c.AntiPatterns, &c.RejectedByAnti,
+			&c.EntryLow, &c.EntryHigh, &c.StopLoss,
+			&c.Target1, &c.Target2, &c.RRRatio,
+			&c.HoldDaysMin, &c.HoldDaysBase, &c.HoldDaysMax,
+			&c.ClaudeAction, &c.ClaudeConf, &c.ClaudeRationale,
+			&c.RejectReason,
+			&c.CandidateStatus, &c.SetupFamily, &c.Direction, &c.PrevDayVolume,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan exhaustion reversal candidate: %w", err)
+		}
+		c.TradeDate = tradeDate
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // ConfirmationStoreInput carries all fields needed for a trade_confirmations row.
 type ConfirmationStoreInput struct {
-	CandidateID      string
-	Ticker           string
-	TradeDate        time.Time
-	Status           string // "confirmed" or "watch_only"
-	SignalLevelHolds bool
-	SignalOpenRange  bool
+	CandidateID       string
+	Ticker            string
+	TradeDate         time.Time
+	Status            string // "confirmed" or "watch_only"
+	SignalLevelHolds  bool
+	SignalOpenRange   bool
 	SignalNoRejection bool
-	SignalVolumeOK   bool
-	SignalMarketOK   bool
-	SignalsPassed    int
-	AutoRejected     bool
-	AutoRejectReason string
-	OpenPrice        float64
-	First10High      float64
-	First10Low       float64
-	First10Close     float64
-	First10Volume    int64
+	SignalVolumeOK    bool
+	SignalMarketOK    bool
+	SignalsPassed     int
+	AutoRejected      bool
+	AutoRejectReason  string
+	OpenPrice         float64
+	First10High       float64
+	First10Low        float64
+	First10Close      float64
+	First10Volume     int64
 }
 
 // UpsertTradeConfirmation writes a confirmation result row.
@@ -360,19 +415,19 @@ ON CONFLICT (candidate_id) DO UPDATE SET
 
 // DailySummary mirrors the daily_summaries table.
 type DailySummary struct {
-	TradeDate          time.Time `json:"trade_date"`
-	VIXLevel           float64   `json:"vix_level"`
-	BTCROC20           float64   `json:"btc_roc20"`
-	RegimeLabel        string    `json:"regime_label"`
-	SymbolsScanned     int       `json:"symbols_scanned"`
-	CandidatesFound    int       `json:"candidates_found"`
-	CandidatesConfirmed int      `json:"candidates_confirmed"`
-	NoTradeToday       bool      `json:"no_trade_today"`
-	NoTradeReason      string    `json:"no_trade_reason"`
-	RegimeSummary      string    `json:"regime_summary"`
-	WatchTickers       []string  `json:"watch_tickers"`
-	OpenPositions      int       `json:"open_positions"`
-	AnalysisCompleted  bool      `json:"analysis_completed"`
+	TradeDate           time.Time `json:"trade_date"`
+	VIXLevel            float64   `json:"vix_level"`
+	BTCROC20            float64   `json:"btc_roc20"`
+	RegimeLabel         string    `json:"regime_label"`
+	SymbolsScanned      int       `json:"symbols_scanned"`
+	CandidatesFound     int       `json:"candidates_found"`
+	CandidatesConfirmed int       `json:"candidates_confirmed"`
+	NoTradeToday        bool      `json:"no_trade_today"`
+	NoTradeReason       string    `json:"no_trade_reason"`
+	RegimeSummary       string    `json:"regime_summary"`
+	WatchTickers        []string  `json:"watch_tickers"`
+	OpenPositions       int       `json:"open_positions"`
+	AnalysisCompleted   bool      `json:"analysis_completed"`
 }
 
 // UpsertDailySummary inserts or updates a daily summary row.
@@ -425,31 +480,46 @@ FROM daily_summaries WHERE trade_date=$1`, date).Scan(
 
 // ─── paper_positions ─────────────────────────────────────────────────────────
 
-// PaperPosition mirrors the paper_positions table.
+// PaperPosition mirrors the paper_positions table (migrations 000001–000007).
+// Risk-state fields (migration 000007) are included so the UI and API can
+// display full position state without a separate query.
 type PaperPosition struct {
-	ID            string    `json:"id"`
-	Ticker        string    `json:"ticker"`
-	Status        string    `json:"status"`
-	EntryPrice    float64   `json:"entry_price"`
-	EntryDate     time.Time `json:"entry_date"`
-	Shares        float64   `json:"shares"`
-	StopLoss      float64   `json:"stop_loss"`
-	Target1       float64   `json:"target1"`
-	Target2       float64   `json:"target2"`
-	ExitPrice     float64   `json:"exit_price"`
-	RealizedPnLPct float64  `json:"realized_pnl_pct"`
-	OpenedAt      time.Time `json:"opened_at"`
-	Notes         string    `json:"notes"`
+	ID             string    `json:"id"`
+	Ticker         string    `json:"ticker"`
+	Status         string    `json:"status"`
+	EntryPrice     float64   `json:"entry_price"`
+	EntryDate      time.Time `json:"entry_date"`
+	Shares         float64   `json:"shares"`
+	StopLoss       float64   `json:"stop_loss"`
+	Target1        float64   `json:"target1"`
+	Target2        float64   `json:"target2"`
+	ExitPrice      float64   `json:"exit_price"`
+	RealizedPnLPct float64   `json:"realized_pnl_pct"`
+	OpenedAt       time.Time `json:"opened_at"`
+	Notes          string    `json:"notes"`
+
+	// Option tracking (migration 000005)
+	OptionSymbol  string  `json:"option_symbol"`
+	OptionPremium float64 `json:"option_premium"` // premium paid at entry
+
+	// Risk state (migration 000007)
+	PeakOptionPrice       float64 `json:"peak_option_price"`       // highest mid-price seen
+	TrailingActive        bool    `json:"trailing_active"`         // true once +35% hit
+	LastOptionPrice       float64 `json:"last_option_price"`       // last fetched mid
+	HoldOvernightApproved bool    `json:"hold_overnight_approved"` // Claude approved hold
 }
 
-// GetOpenPaperPositions returns all open paper positions.
+// GetOpenPaperPositions returns all open paper positions including risk state.
 func GetOpenPaperPositions(ctx context.Context, pool *pgxpool.Pool) ([]PaperPosition, error) {
 	rows, err := pool.Query(ctx, `
 SELECT id, ticker, status,
        entry_price, entry_date, shares,
        stop_loss, COALESCE(target1,0), COALESCE(target2,0),
        COALESCE(exit_price,0), COALESCE(realized_pnl_pct,0),
-       opened_at, COALESCE(notes,'')
+       opened_at, COALESCE(notes,''),
+       COALESCE(option_symbol,''), COALESCE(option_premium,0),
+       COALESCE(peak_option_price,0), COALESCE(trailing_active,false),
+       COALESCE(last_option_price,0), COALESCE(hold_overnight_approved,false)
 FROM paper_positions WHERE status='open'
 ORDER BY opened_at DESC`)
 	if err != nil {
@@ -466,12 +536,95 @@ ORDER BY opened_at DESC`)
 			&p.StopLoss, &p.Target1, &p.Target2,
 			&p.ExitPrice, &p.RealizedPnLPct,
 			&p.OpenedAt, &p.Notes,
+			&p.OptionSymbol, &p.OptionPremium,
+			&p.PeakOptionPrice, &p.TrailingActive,
+			&p.LastOptionPrice, &p.HoldOvernightApproved,
 		); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// RiskablePosition extends ReviewablePosition with the risk-state columns
+// added by migration 000007. Used by RunMechanicalRiskCheckActivity.
+type RiskablePosition struct {
+	ReviewablePosition
+	PeakOptionPrice       float64
+	TrailingActive        bool
+	LastOptionPrice       float64
+	HoldOvernightApproved bool
+}
+
+// GetOpenPositionsForRiskCheck returns open positions with all columns needed
+// by the mechanical risk check (option_symbol, option_premium + risk state).
+func GetOpenPositionsForRiskCheck(ctx context.Context, pool *pgxpool.Pool) ([]RiskablePosition, error) {
+	rows, err := pool.Query(ctx, `
+SELECT id, ticker, status,
+       entry_price, entry_date, shares,
+       stop_loss, COALESCE(target1,0), COALESCE(target2,0),
+       COALESCE(exit_price,0), COALESCE(realized_pnl_pct,0),
+       opened_at, COALESCE(notes,''),
+       COALESCE(option_type,'call'), COALESCE(setup_family,''),
+       COALESCE(option_symbol,''), COALESCE(option_premium,0),
+       COALESCE(peak_option_price,0), COALESCE(trailing_active,false),
+       COALESCE(last_option_price,0), COALESCE(hold_overnight_approved,false)
+FROM paper_positions WHERE status='open'
+ORDER BY opened_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []RiskablePosition
+	for rows.Next() {
+		var p RiskablePosition
+		if err := rows.Scan(
+			&p.ID, &p.Ticker, &p.Status,
+			&p.EntryPrice, &p.EntryDate, &p.Shares,
+			&p.StopLoss, &p.Target1, &p.Target2,
+			&p.ExitPrice, &p.RealizedPnLPct,
+			&p.OpenedAt, &p.Notes,
+			&p.OptionType, &p.SetupFamily,
+			&p.OptionSymbol, &p.OptionPremium,
+			&p.PeakOptionPrice, &p.TrailingActive,
+			&p.LastOptionPrice, &p.HoldOvernightApproved,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// UpdatePositionRiskState persists the result of a mechanical risk check:
+// the latest mid-price, the updated high-water mark, and trailing state.
+// last_risk_check_at is always set to NOW().
+func UpdatePositionRiskState(ctx context.Context, pool *pgxpool.Pool, positionID string, lastPrice, peakPrice float64, trailingActive bool) error {
+	_, err := pool.Exec(ctx,
+		`UPDATE paper_positions
+		 SET last_option_price=$2,
+		     peak_option_price=$3,
+		     trailing_active=$4,
+		     last_risk_check_at=NOW()
+		 WHERE id=$1`,
+		positionID, lastPrice, peakPrice, trailingActive,
+	)
+	return err
+}
+
+// SetHoldOvernightApproved marks a position as approved (or revoked) for
+// overnight hold. Claude calls this via the EOD review activity.
+func SetHoldOvernightApproved(ctx context.Context, pool *pgxpool.Pool, positionID string, approved bool) error {
+	_, err := pool.Exec(ctx,
+		`UPDATE paper_positions
+		 SET hold_overnight_approved=$2,
+		     hold_overnight_approved_at=CASE WHEN $2 THEN NOW() ELSE NULL END
+		 WHERE id=$1`,
+		positionID, approved,
+	)
+	return err
 }
 
 // ─── auto paper entry ────────────────────────────────────────────────────────
@@ -582,7 +735,7 @@ type PositionReviewInput struct {
 	CurrentPrice    float64
 	PnLPctToday     float64
 	DaysHeld        int
-	SuggestedAction string  // HOLD | HOLD_TIGHTEN_STOP | PARTIAL_TAKE_PROFIT | EXIT | WATCH_CLOSELY
+	SuggestedAction string // HOLD | HOLD_TIGHTEN_STOP | PARTIAL_TAKE_PROFIT | EXIT | WATCH_CLOSELY
 	ActionRationale string
 	NewStop         float64 // 0 means not tightening
 	ActionExecuted  bool

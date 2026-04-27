@@ -637,12 +637,16 @@ func (c *Client) callAPIWithSystem(userMessage, systemPrompt string) (string, er
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		StopReason string `json:"stop_reason"`
 	}
 	if err := json.Unmarshal(respBody, &envelope); err != nil {
 		return "", fmt.Errorf("claude: decode envelope: %w", err)
 	}
 	if len(envelope.Content) == 0 {
 		return "", fmt.Errorf("claude: empty content in response")
+	}
+	if envelope.StopReason == "max_tokens" {
+		return "", fmt.Errorf("claude: response truncated by max_tokens limit — increase CLAUDE_MAX_OUTPUT_TOKENS (current=%d, response_len=%d)", c.maxOutputTokens, len(envelope.Content[0].Text))
 	}
 	return envelope.Content[0].Text, nil
 }

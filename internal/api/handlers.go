@@ -317,10 +317,34 @@ func (h *Handler) RunConfirmation(w http.ResponseWriter, r *http.Request) {
 				optionType = "put"
 			}
 
+			// ── Portfolio limits gate (mirrors Temporal activity) ────────────────
+			pl := rules.Risk.PortfolioLimits
+			if pl.MaxOpenPositions > 0 {
+				if totalOpen, _ := store.GetOpenPositionCount(ctx, h.pool); totalOpen >= pl.MaxOpenPositions {
+					log.Printf("run-confirmation: %s skipped (portfolio_limit: open=%d >= max=%d)", c.Ticker, totalOpen, pl.MaxOpenPositions)
+					continue
+				}
+			}
+			if pl.MaxSameDirection > 0 {
+				if dirCount, _ := store.GetOpenPositionCountByDirection(ctx, h.pool, optionType); dirCount >= pl.MaxSameDirection {
+					log.Printf("run-confirmation: %s skipped (direction_limit: %s open=%d >= max=%d)", c.Ticker, optionType, dirCount, pl.MaxSameDirection)
+					continue
+				}
+			}
+
 			// Select best contract before buying (mirrors Temporal confirmation flow).
 			contractSym, contractPrice := h.selectBestContract(ctx, c.Ticker, optionType, c.ClosePrice)
 			if contractPrice > 0 {
 				entryPrice = contractPrice
+			}
+
+			// Premium budget gate
+			if pl.MaxPremiumPctPortfolio > 0 && pl.PaperPortfolioValue > 0 {
+				maxPremium := pl.PaperPortfolioValue * pl.MaxPremiumPctPortfolio / 100.0
+				if entryPrice > maxPremium {
+					log.Printf("run-confirmation: %s skipped (premium_budget: price=%.2f > max=%.2f)", c.Ticker, entryPrice, maxPremium)
+					continue
+				}
 			}
 
 			buyResult, buyErr := execution.BuyOptionPosition(ctx, h.pool, h.alpaca, execution.BuyInput{

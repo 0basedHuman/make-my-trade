@@ -677,6 +677,77 @@ func HasOpenPositionForTicker(ctx context.Context, pool *pgxpool.Pool, ticker st
 	return exists, err
 }
 
+// GetOpenPositionCount returns the total number of currently open paper positions.
+func GetOpenPositionCount(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	var n int
+	err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM paper_positions WHERE status='open'`,
+	).Scan(&n)
+	return n, err
+}
+
+// GetOpenPositionCountByDirection returns the number of open paper positions
+// for the given option_type ("call" = bullish, "put" = bearish).
+func GetOpenPositionCountByDirection(ctx context.Context, pool *pgxpool.Pool, optionType string) (int, error) {
+	var n int
+	err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM paper_positions WHERE status='open' AND option_type=$1`,
+		optionType,
+	).Scan(&n)
+	return n, err
+}
+
+// SaveIVSnapshot upserts one daily proxy-IV snapshot for the given ticker.
+// proxy_iv = atm_call_ask / (underlying_price * sqrt(dte/252)).
+func SaveIVSnapshot(ctx context.Context, pool *pgxpool.Pool,
+	ticker, snapshotDate, atmSymbol string,
+	atmStrike, underlyingPrice, atmCallAsk float64,
+	dte int, proxyIV float64,
+) error {
+	_, err := pool.Exec(ctx, `
+INSERT INTO iv_snapshots
+    (ticker, snapshot_date, atm_symbol, atm_strike, underlying_price, atm_call_ask, dte, proxy_iv)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+ON CONFLICT (ticker, snapshot_date) DO UPDATE
+    SET atm_symbol       = EXCLUDED.atm_symbol,
+        atm_strike       = EXCLUDED.atm_strike,
+        underlying_price = EXCLUDED.underlying_price,
+        atm_call_ask     = EXCLUDED.atm_call_ask,
+        dte              = EXCLUDED.dte,
+        proxy_iv         = EXCLUDED.proxy_iv`,
+		ticker, snapshotDate, atmSymbol, atmStrike, underlyingPrice, atmCallAsk, dte, proxyIV,
+	)
+	return err
+}
+
+// GetIVRank returns the rolling percentile rank (0–100) of currentProxyIV
+// against the last lookbackDays snapshots for this ticker.
+// Also returns the number of snapshots found (caller can skip the gate if too few).
+// Rank 0 = cheapest volatility seen; 100 = most expensive.
+func GetIVRank(ctx context.Context, pool *pgxpool.Pool,
+	ticker string, currentProxyIV float64, lookbackDays int,
+) (rank float64, snapshots int, err error) {
+	row := pool.QueryRow(ctx, `
+SELECT
+    COUNT(*)                                                             AS total,
+    COUNT(*) FILTER (WHERE proxy_iv <= $3)                              AS at_or_below
+FROM iv_snapshots
+WHERE ticker = $1
+  AND snapshot_date >= CURRENT_DATE - ($2 || ' days')::INTERVAL
+  AND proxy_iv > 0`,
+		ticker, lookbackDays, currentProxyIV,
+	)
+	var total, atOrBelow int
+	if err = row.Scan(&total, &atOrBelow); err != nil {
+		return 0, 0, err
+	}
+	if total == 0 {
+		return 0, 0, nil
+	}
+	rank = float64(atOrBelow) / float64(total) * 100.0
+	return rank, total, nil
+}
+
 // UpdatePositionAlpacaOrderID stores the Alpaca order ID for a paper position.
 // Called after PlaceOptionOrder succeeds so the position row links to the live order.
 func UpdatePositionAlpacaOrderID(ctx context.Context, pool *pgxpool.Pool, positionID, orderID string) error {

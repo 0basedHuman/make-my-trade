@@ -56,12 +56,22 @@ trade_frequency:
 
 
 # ============================================================
-# RISK — option lifecycle DTE policy and mechanical exit rules.
+# RISK — option lifecycle, IV filter, portfolio limits, and
+#        mechanical exit rules.
 #
-# WHY: 7–14 DTE options decay fast. Hard mechanical exits protect
-#      capital without relying solely on scheduled Claude review.
-#      target_dte=10 is the preferred contract at entry; the
-#      selector ranks by closest to this target.
+# WHY (DTE 21-45):  7-14 DTE burns ~$0.10-0.20/day theta on a $5
+#   contract. At 21-45 DTE theta decay is manageable for a 3-7 day
+#   swing hold. Target DTE=30 gives the best balance.
+#
+# WHY (IV rank):  Buying premium when IV is above its 30-day median
+#   is the single biggest edge-destroyer in long options. We skip
+#   entries when proxy IV rank > 50% (above-median volatility).
+#   Proxy IV = ATM_call_ask / (underlying * sqrt(DTE/252)) — a
+#   Black-Scholes ATM approximation that is proportional to real IV.
+#
+# WHY (portfolio limits):  All-one-direction correlated positions
+#   destroy diversification. Cap at 3 open positions total and
+#   max 2 in the same direction (both calls or both puts).
 #
 # mechanical_exits: runs every 10 minutes during market hours.
 #   All exits are hard — Claude cannot override stop/TP/trail.
@@ -69,11 +79,28 @@ trade_frequency:
 # ============================================================
 risk:
   option_lifecycle:
-    dte_min: 7              # minimum DTE at entry (hard lower bound)
-    dte_max: 14             # maximum DTE at entry (hard upper bound)
-    target_dte: 10          # preferred DTE; selector ranks by |dte - target_dte|
-    avoid_dte_below: 4      # never select a contract with DTE < this
+    dte_min: 21             # minimum DTE at entry — enough theta buffer for a swing
+    dte_max: 45             # maximum DTE at entry — avoid overpaying for far-dated premium
+    target_dte: 30          # preferred DTE; selector ranks by |dte - target_dte|
+    avoid_dte_below: 14     # hard floor: never select DTE below this (gamma risk zone)
     contracts_per_trade: 1  # always 1 contract per paper trade
+
+  # Proxy IV rank gate — do not buy expensive premium.
+  # Requires at least min_snapshots_required days of history before the gate activates.
+  # During warmup (< min_snapshots_required days) the gate is skipped with a warning.
+  iv_filter:
+    enabled: true
+    max_iv_rank_pct: 50        # reject entry if IV rank is above 50th percentile
+    ideal_iv_rank_pct: 35      # log "ideal" when rank is below this
+    lookback_days: 30          # rolling window for rank computation
+    min_snapshots_required: 5  # skip gate if fewer than this many snapshots exist
+
+  # Portfolio exposure limits — prevent correlated all-one-direction bets.
+  portfolio_limits:
+    max_open_positions: 3          # hard cap on simultaneous open paper positions
+    max_same_direction: 2          # max calls OR puts open at the same time
+    paper_portfolio_value: 10000   # simulated account size in USD
+    max_premium_pct_portfolio: 5.0 # max premium per trade as % of portfolio ($500)
 
   mechanical_exits:
     enabled: true
@@ -82,7 +109,7 @@ risk:
     premium_trailing_start_pct: 35     # activate trailing once premium is up 35%
     premium_trailing_giveback_pct: 20  # exit if premium gives back 20% from peak after trail starts
     force_eod_exit_unless_hold_confirmed: true  # exit at EOD unless Claude explicitly approves hold
-    max_hold_days_without_reconfirm: 1          # require reconfirm after this many hold days
+    max_hold_days_without_reconfirm: 3          # raised to 3 (30 DTE gives more hold room)
 
 
 # ============================================================
@@ -210,8 +237,8 @@ families:
       extension_max_pct: 10.0
 
     options:
-      dte_min: 10
-      dte_max: 21
+      dte_min: 21
+      dte_max: 45
       delta_min: 0.45
       delta_max: 0.65
 
@@ -276,8 +303,8 @@ families:
       extension_max_pct: 12.0
 
     options:
-      dte_min: 7
-      dte_max: 14
+      dte_min: 21
+      dte_max: 45
       delta_min: 0.45
       delta_max: 0.70
 
@@ -343,8 +370,8 @@ families:
       extension_max_pct: 10.0
 
     options:
-      dte_min: 10
-      dte_max: 21
+      dte_min: 21
+      dte_max: 45
       delta_min: 0.45
       delta_max: 0.65
 
@@ -449,8 +476,8 @@ families:
       extension_max_pct: 999.0       # no upper cap on extension
 
     options:
-      dte_min: 5
-      dte_max: 14
+      dte_min: 14
+      dte_max: 30
       delta_min: 0.35                # slightly lower delta — sharp reversal expected
       delta_max: 0.55
 
@@ -514,8 +541,8 @@ families:
       extension_max_pct: 12.0
 
     options:
-      dte_min: 7
-      dte_max: 14
+      dte_min: 21
+      dte_max: 45
       delta_min: 0.45
       delta_max: 0.70
 

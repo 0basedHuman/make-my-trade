@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -293,20 +294,20 @@ func parseOptionSymbol(symbol, ticker string) (optType, expiration string, strik
 }
 
 // FetchOptionChain fetches option contracts for the given underlying symbol.
-// It targets 7–14 DTE contracts with delta 0.30–0.60 (calls and puts).
+// It fetches a wide 14-55 DTE window so SelectBestContract can apply the
+// family-specific and global DTE band (default 21-45, target 30).
 // If the Alpaca options API is unavailable (403/404 or account not options-enabled),
 // it returns an empty slice without error — the pipeline treats this as
 // "no qualifying chain data" and Claude will classify the setup as structural_candidate.
 func (c *AlpacaClient) FetchOptionChain(ticker string, underlyingPrice float64, today string) ([]OptionContract, error) {
-	// Alpaca options snapshot endpoint with expiration date filter for 7-35 DTE window.
-	// Without the filter, the API returns today-expiring contracts (0 DTE) which are filtered
-	// by the DTE gate below, resulting in 0 qualifying contracts.
+	// Wide fetch window: 14-55 DTE. SelectBestContract applies the narrower
+	// family/global DTE band (21-45) so we never return a stale near-expiry contract.
 	todayTime, _ := time.Parse("2006-01-02", today)
 	if todayTime.IsZero() {
 		todayTime = time.Now()
 	}
-	minExp := todayTime.AddDate(0, 0, 7).Format("2006-01-02")
-	maxExp := todayTime.AddDate(0, 0, 35).Format("2006-01-02")
+	minExp := todayTime.AddDate(0, 0, 14).Format("2006-01-02")
+	maxExp := todayTime.AddDate(0, 0, 55).Format("2006-01-02")
 	reqURL := fmt.Sprintf("%s/v1beta1/options/snapshots/%s?feed=indicative&limit=200&expiration_date_gte=%s&expiration_date_lte=%s",
 		c.dataURL, ticker, minExp, maxExp)
 	req, err := http.NewRequest("GET", reqURL, nil)
@@ -351,7 +352,7 @@ func (c *AlpacaClient) FetchOptionChain(ticker string, underlyingPrice float64, 
 			continue
 		}
 		dte := int(expDate.Sub(todayTime).Hours() / 24)
-		if dte < 7 || dte > 35 {
+		if dte < 14 || dte > 55 {
 			continue
 		}
 
@@ -852,4 +853,36 @@ func (c *AlpacaClient) FetchLatestQuote(ticker string) (float64, error) {
 		return 0, err
 	}
 	return result.Trade.Price, nil
+}
+
+// ComputeProxyIV computes a proxy implied volatility for an option contract.
+// Formula: ask / (underlyingPrice * sqrt(DTE/252))
+// This is the Black-Scholes at-the-money approximation, proportional to
+// annualised IV. A value of 0.25 ≈ 25% annual IV.
+// Returns 0 if inputs are invalid (zero ask, zero underlying, or DTE <= 0).
+func ComputeProxyIV(contract OptionContract, underlyingPrice float64) float64 {
+	if contract.Ask <= 0 || underlyingPrice <= 0 || contract.DTE <= 0 {
+		return 0
+	}
+	return contract.Ask / (underlyingPrice * math.Sqrt(float64(contract.DTE)/252.0))
+}
+
+// FindATMCallContract returns the call contract with delta closest to 0.50
+// from the provided slice. Returns nil if no calls are present.
+// Used to select the contract for the daily IV snapshot.
+func FindATMCallContract(contracts []OptionContract) *OptionContract {
+	var best *OptionContract
+	bestDist := math.MaxFloat64
+	for i := range contracts {
+		c := &contracts[i]
+		if c.Type != "call" {
+			continue
+		}
+		dist := math.Abs(c.Delta - 0.50)
+		if dist < bestDist {
+			bestDist = dist
+			best = c
+		}
+	}
+	return best
 }

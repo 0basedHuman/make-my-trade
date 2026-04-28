@@ -56,11 +56,33 @@ type Rules struct {
 
 // ── Risk ──────────────────────────────────────────────────────────────────────
 
-// RiskConfig holds the option lifecycle and mechanical exit rules.
+// RiskConfig holds the option lifecycle, IV filter, portfolio limits, and mechanical exit rules.
 // These are applied universally across all families unless a family overrides DTE.
 type RiskConfig struct {
 	OptionLifecycle OptionLifecycleConfig `yaml:"option_lifecycle"`
+	IVFilter        IVFilterConfig        `yaml:"iv_filter"`
+	PortfolioLimits PortfolioLimitsConfig `yaml:"portfolio_limits"`
 	MechanicalExits MechanicalExitsConfig `yaml:"mechanical_exits"`
+}
+
+// IVFilterConfig controls the proxy-IV rank gate.
+// Proxy IV = ATM_call_ask / (underlying_price * sqrt(DTE/252)).
+// IV rank = percentile of today's proxy IV vs the last lookback_days snapshots.
+// Entries are rejected when rank > max_iv_rank_pct (buying above-median volatility).
+type IVFilterConfig struct {
+	Enabled              bool    `yaml:"enabled"`
+	MaxIVRankPct         float64 `yaml:"max_iv_rank_pct"`         // 0-100; reject if above this
+	IdealIVRankPct       float64 `yaml:"ideal_iv_rank_pct"`       // 0-100; log "ideal" if below this
+	LookbackDays         int     `yaml:"lookback_days"`           // rolling window for rank
+	MinSnapshotsRequired int     `yaml:"min_snapshots_required"`  // skip gate if fewer snapshots
+}
+
+// PortfolioLimitsConfig caps simultaneous exposure across all open paper positions.
+type PortfolioLimitsConfig struct {
+	MaxOpenPositions      int     `yaml:"max_open_positions"`       // hard cap on total open positions
+	MaxSameDirection      int     `yaml:"max_same_direction"`       // max calls OR max puts at once
+	PaperPortfolioValue   float64 `yaml:"paper_portfolio_value"`    // simulated account size USD
+	MaxPremiumPctPortfolio float64 `yaml:"max_premium_pct_portfolio"` // max premium per trade as % of portfolio
 }
 
 // OptionLifecycleConfig defines DTE and contract-count policy for all entries.
@@ -694,8 +716,21 @@ func DefaultRules() *Rules {
 		},
 		Risk: RiskConfig{
 			OptionLifecycle: OptionLifecycleConfig{
-				DTEMin: 7, DTEMax: 14, TargetDTE: 10,
-				AvoidDTEBelow: 4, ContractsPerTrade: 1,
+				DTEMin: 21, DTEMax: 45, TargetDTE: 30,
+				AvoidDTEBelow: 14, ContractsPerTrade: 1,
+			},
+			IVFilter: IVFilterConfig{
+				Enabled:              true,
+				MaxIVRankPct:         50,
+				IdealIVRankPct:       35,
+				LookbackDays:         30,
+				MinSnapshotsRequired: 5,
+			},
+			PortfolioLimits: PortfolioLimitsConfig{
+				MaxOpenPositions:       3,
+				MaxSameDirection:       2,
+				PaperPortfolioValue:    10000,
+				MaxPremiumPctPortfolio: 5.0,
 			},
 			MechanicalExits: MechanicalExitsConfig{
 				Enabled:                         true,
@@ -704,7 +739,7 @@ func DefaultRules() *Rules {
 				PremiumTrailingStartPct:         35,
 				PremiumTrailingGivebackPct:      20,
 				ForceEODExitUnlessHoldConfirmed: true,
-				MaxHoldDaysWithoutReconfirm:     1,
+				MaxHoldDaysWithoutReconfirm:     3,
 			},
 		},
 	}

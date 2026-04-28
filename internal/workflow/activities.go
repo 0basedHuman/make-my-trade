@@ -634,6 +634,44 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 		log.Printf("activity: contract_selected_before_claude: ticker=%s family=%s contract=%s strike=%.2f dte=%d dte_range=%d-%d target_dte=%d delta=%.3f mid=%.2f spread=%.1f%% oi=%d vol=%d",
 			c.Ticker, c.SetupFamily, best.Symbol, best.Strike, best.DTE, selOpts.DTEMin, selOpts.DTEMax, selOpts.TargetDTE, best.Delta, limitPrice, best.SpreadPct, best.OpenInterest, best.OptionVolume)
 
+		// ── b2. Save daily IV snapshot (best-effort; never blocks entry) ────────────
+		// Proxy IV = ask / (underlying * sqrt(DTE/252)). Used for rolling IV rank.
+		proxyIV := market.ComputeProxyIV(*best, c.ClosePrice)
+		if proxyIV > 0 {
+			if err := store.SaveIVSnapshot(ctx, d.Pool,
+				c.Ticker, tradeDate.Format("2006-01-02"),
+				best.Symbol, best.Strike, c.ClosePrice, best.Ask,
+				best.DTE, proxyIV,
+			); err != nil {
+				log.Printf("activity: iv_snapshot save %s: %v (non-fatal)", c.Ticker, err)
+			}
+		}
+
+		// ── b3. IV rank gate — reject if buying above-median volatility ─────────────
+		ivf := rules.Risk.IVFilter
+		if ivf.Enabled && proxyIV > 0 {
+			ivRank, ivSnaps, ivErr := store.GetIVRank(ctx, d.Pool, c.Ticker, proxyIV, ivf.LookbackDays)
+			if ivErr != nil {
+				log.Printf("activity: iv_rank query %s: %v (skipping gate)", c.Ticker, ivErr)
+			} else if ivSnaps < ivf.MinSnapshotsRequired {
+				log.Printf("activity: iv_rank %s: only %d snapshots (need %d) — warmup, gate skipped proxy_iv=%.4f",
+					c.Ticker, ivSnaps, ivf.MinSnapshotsRequired, proxyIV)
+			} else if ivRank > ivf.MaxIVRankPct {
+				log.Printf("activity: %s → watch_only (iv_rank=%.0f%% > max=%.0f%% proxy_iv=%.4f snaps=%d — expensive premium)",
+					c.Ticker, ivRank, ivf.MaxIVRankPct, proxyIV, ivSnaps)
+				_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only")
+				watchOnlyCount++
+				continue
+			} else {
+				qualifier := ""
+				if ivRank <= ivf.IdealIVRankPct {
+					qualifier = " [IDEAL]"
+				}
+				log.Printf("activity: iv_rank %s: %.0f%% proxy_iv=%.4f snaps=%d%s",
+					c.Ticker, ivRank, proxyIV, ivSnaps, qualifier)
+			}
+		}
+
 		// ── c. Build opening context from intraday bars ──────────────────────────
 		var oc claudeclient.OpeningContext
 		if bars := barsMap[c.Ticker]; len(bars) > 0 {
@@ -863,6 +901,36 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			log.Printf("activity: %s already has open position — skipping buy", c.Ticker)
 			confirmedCount++
 			continue
+		}
+
+		// ── Portfolio limits gate ────────────────────────────────────────────────
+		pl := rules.Risk.PortfolioLimits
+		if pl.MaxOpenPositions > 0 {
+			totalOpen, _ := store.GetOpenPositionCount(ctx, d.Pool)
+			if totalOpen >= pl.MaxOpenPositions {
+				log.Printf("activity: %s → skipped (portfolio_limit: open=%d >= max=%d)",
+					c.Ticker, totalOpen, pl.MaxOpenPositions)
+				confirmedCount++
+				continue
+			}
+		}
+		if pl.MaxSameDirection > 0 {
+			dirCount, _ := store.GetOpenPositionCountByDirection(ctx, d.Pool, ev.optionType)
+			if dirCount >= pl.MaxSameDirection {
+				log.Printf("activity: %s → skipped (direction_limit: %s open=%d >= max=%d)",
+					c.Ticker, ev.optionType, dirCount, pl.MaxSameDirection)
+				confirmedCount++
+				continue
+			}
+		}
+		if pl.MaxPremiumPctPortfolio > 0 && pl.PaperPortfolioValue > 0 {
+			maxPremium := pl.PaperPortfolioValue * pl.MaxPremiumPctPortfolio / 100.0
+			if ev.limitPrice > maxPremium {
+				log.Printf("activity: %s → skipped (premium_budget: limit=%.2f > max=%.2f (%.1f%% of $%.0f))",
+					c.Ticker, ev.limitPrice, maxPremium, pl.MaxPremiumPctPortfolio, pl.PaperPortfolioValue)
+				confirmedCount++
+				continue
+			}
 		}
 
 		// ── 7b. Buy via shared execution service (DB-first, single lifecycle owner) ─

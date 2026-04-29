@@ -35,7 +35,14 @@ import (
 )
 
 // DailyResearchCycle is the main daily workflow.
-// Runs at 6:30 AM PT weekdays. Fetches data, runs analysis, calls Claude.
+// Runs at 5:30 AM PT weekdays (must finish before 6:30 AM open).
+//
+// Recovery path: after analysis completes, immediately attempts opening
+// confirmation as a non-fatal step. On normal days the too-early guard
+// (before 6:40 AM) causes it to return cleanly and the scheduled
+// OpeningConfirmationCycle at 6:42 handles it. On late-start days
+// (worker was offline, Temporal replayed the missed schedule), this
+// step runs confirmation right after research within the 8:30 cutoff.
 func DailyResearchCycle(ctx workflow.Context) error {
 	logger := workflow.GetLogger(ctx)
 	logger.Info("DailyResearchCycle: starting")
@@ -51,15 +58,30 @@ func DailyResearchCycle(ctx workflow.Context) error {
 	}
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
-	// Step 1: Run the full analysis pipeline
-	// Activity is registered as method on ActivityDeps — reference by name string.
+	// Step 1: Run the full analysis pipeline.
 	var result string
 	if err := workflow.ExecuteActivity(ctx, "RunDailyAnalysisActivity").Get(ctx, &result); err != nil {
 		logger.Error("DailyResearchCycle: RunDailyAnalysis failed", "error", err)
 		return err
 	}
+	logger.Info("DailyResearchCycle: analysis complete", "result", result)
 
-	logger.Info("DailyResearchCycle: complete", "result", result)
+	// Step 2: Late-start recovery confirmation.
+	// Uses a 5-min timeout and a single attempt — non-fatal.
+	confirmAO := workflow.ActivityOptions{
+		StartToCloseTimeout: 5 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 1,
+		},
+	}
+	confirmCtx := workflow.WithActivityOptions(ctx, confirmAO)
+	var confirmResult string
+	if err := workflow.ExecuteActivity(confirmCtx, "RunOpeningConfirmationActivity").Get(confirmCtx, &confirmResult); err != nil {
+		logger.Warn("DailyResearchCycle: late-start confirmation failed (non-fatal)", "error", err)
+	} else {
+		logger.Info("DailyResearchCycle: late-start confirmation", "result", confirmResult)
+	}
+
 	return nil
 }
 

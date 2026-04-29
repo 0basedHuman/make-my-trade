@@ -363,11 +363,23 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 	log.Printf("schedule_opening_confirmation_started date=%s time=%s opening_confirmation_window=06:30-06:40",
 		tradeDate.Format("2006-01-02"), now.Format("15:04"))
 
+	// ── Too-early guard ──────────────────────────────────────────────────────────
+	// Opening bars (6:30–6:40 candle) are not available before 6:40 AM.
+	// DailyResearchCycle triggers this activity as a recovery step after finishing
+	// analysis — on normal days research finishes before 6:30, so this guard fires
+	// and returns cleanly; the scheduled OpeningConfirmationCycle at 6:42 handles it.
+	earlyCheck := time.Date(now.Year(), now.Month(), now.Day(), 6, 40, 0, 0, loc)
+	if now.Before(earlyCheck) {
+		msg := fmt.Sprintf("opening_confirmation_early: PT time %s before 06:40 — opening bars not yet available",
+			now.Format("15:04"))
+		log.Printf("activity: %s", msg)
+		return msg, nil
+	}
+
 	// ── Staleness guard ──────────────────────────────────────────────────────────
-	// The first-10-minute candle evidence is only meaningful at open (6:30–6:40 PT).
-	// If this activity runs late (retry storm, scheduler lag), reject it so stale
-	// opening-candle logic is never used as a substitute for continuation context.
-	cutoffHour, cutoffMin := 6, 55
+	// Reject runs past the configured cutoff so stale opening-candle logic is never
+	// used. Cutoff is 08:30 to support late-start recovery (worker offline scenario).
+	cutoffHour, cutoffMin := 8, 30
 	rules := d.Rules
 	if rules == nil {
 		rules = strategy.DefaultRules()

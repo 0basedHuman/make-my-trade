@@ -716,8 +716,8 @@ func DefaultRules() *Rules {
 		},
 		Risk: RiskConfig{
 			OptionLifecycle: OptionLifecycleConfig{
-				DTEMin: 21, DTEMax: 45, TargetDTE: 30,
-				AvoidDTEBelow: 14, ContractsPerTrade: 1,
+				DTEMin: 14, DTEMax: 21, TargetDTE: 17,
+				AvoidDTEBelow: 7, ContractsPerTrade: 1,
 			},
 			IVFilter: IVFilterConfig{
 				Enabled:              true,

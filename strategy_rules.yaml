@@ -7,9 +7,9 @@ version: 7
 # ============================================================
 schedule:
   timezone: America/Los_Angeles
-  daily_scan_time:             "06:25"   # overnight bars ready; scan + classify
+  daily_scan_time:             "05:30"   # must finish before 6:30 AM open; 1-hour buffer
   opening_confirmation_time:   "06:42"   # 6:30-6:40 candle complete; Claude entry
-  opening_confirmation_cutoff: "06:55"   # stale guard — abort if PT time exceeds this
+  opening_confirmation_cutoff: "08:30"   # extended for late-start recovery (worker offline)
   first_position_review_time:  "07:15"   # early risk management on open positions
   continuation_review_time:    "07:45"   # fresh intraday bars; continuation / tighten
   end_of_day_review_time:      "12:45"   # hold overnight vs exit decision
@@ -79,10 +79,10 @@ trade_frequency:
 # ============================================================
 risk:
   option_lifecycle:
-    dte_min: 21             # minimum DTE at entry — enough theta buffer for a swing
-    dte_max: 45             # maximum DTE at entry — avoid overpaying for far-dated premium
-    target_dte: 30          # preferred DTE; selector ranks by |dte - target_dte|
-    avoid_dte_below: 14     # hard floor: never select DTE below this (gamma risk zone)
+    dte_min: 14             # minimum DTE; Alpaca paper feed provides ~2 near-term expirations
+    dte_max: 21             # maximum DTE; targets the nearest monthly/weekly
+    target_dte: 17          # preferred DTE; selector ranks by |dte - target_dte|
+    avoid_dte_below: 7      # hard floor: never select DTE below this (gamma risk zone)
     contracts_per_trade: 1  # always 1 contract per paper trade
 
   # Proxy IV rank gate — do not buy expensive premium.
@@ -237,8 +237,8 @@ families:
       extension_max_pct: 10.0
 
     options:
-      dte_min: 21
-      dte_max: 45
+      dte_min: 14
+      dte_max: 21
       delta_min: 0.45
       delta_max: 0.65
 
@@ -303,8 +303,8 @@ families:
       extension_max_pct: 12.0
 
     options:
-      dte_min: 21
-      dte_max: 45
+      dte_min: 14
+      dte_max: 21
       delta_min: 0.45
       delta_max: 0.70
 
@@ -370,8 +370,8 @@ families:
       extension_max_pct: 10.0
 
     options:
-      dte_min: 21
-      dte_max: 45
+      dte_min: 14
+      dte_max: 21
       delta_min: 0.45
       delta_max: 0.65
 
@@ -477,7 +477,7 @@ families:
 
     options:
       dte_min: 14
-      dte_max: 30
+      dte_max: 21
       delta_min: 0.35                # slightly lower delta — sharp reversal expected
       delta_max: 0.55
 
@@ -541,8 +541,8 @@ families:
       extension_max_pct: 12.0
 
     options:
-      dte_min: 21
-      dte_max: 45
+      dte_min: 14
+      dte_max: 21
       delta_min: 0.45
       delta_max: 0.70
 

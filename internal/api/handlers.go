@@ -487,6 +487,11 @@ func (h *Handler) ForceConfirm(w http.ResponseWriter, r *http.Request) {
 
 	// Select best contract before buying (single lifecycle path via execution service).
 	contractSym, contractPrice := h.selectBestContract(ctx, found.Ticker, optionType, found.ClosePrice)
+	if contractSym == "" {
+		writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf(
+			"no qualifying %s contract found for %s — check DTE range and chain liquidity", optionType, found.Ticker))
+		return
+	}
 	if contractPrice > 0 {
 		entryPrice = contractPrice
 	}

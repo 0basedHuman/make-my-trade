@@ -263,11 +263,28 @@ func registerSchedules(ctx context.Context, tc client.Client, rules *strategy.Ru
 				TaskQueue: TaskQueue,
 			},
 		})
-		if err != nil {
-			// "already exists" is expected on restarts — not fatal
-			log.Printf("worker: schedule %q: %v", s.id, err)
-		} else {
+		if err == nil {
 			log.Printf("worker: schedule %q registered (%s %s)", s.id, s.cron, tz)
+			continue
+		}
+
+		// Schedule already exists — update its cron spec so YAML changes take
+		// effect on restart without needing manual Temporal schedule deletion.
+		handle := sc.GetHandle(ctx, s.id)
+		updateErr := handle.Update(ctx, client.ScheduleUpdateOptions{
+			DoUpdate: func(inp client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
+				inp.Description.Schedule.Spec = &client.ScheduleSpec{
+					CronExpressions: []string{s.cron},
+					TimeZoneName:    tz,
+					Jitter:          20 * time.Second,
+				}
+				return &client.ScheduleUpdate{Schedule: &inp.Description.Schedule}, nil
+			},
+		})
+		if updateErr != nil {
+			log.Printf("worker: schedule %q update failed: %v", s.id, updateErr)
+		} else {
+			log.Printf("worker: schedule %q updated (%s %s)", s.id, s.cron, tz)
 		}
 	}
 }

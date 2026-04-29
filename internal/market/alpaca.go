@@ -294,20 +294,19 @@ func parseOptionSymbol(symbol, ticker string) (optType, expiration string, strik
 }
 
 // FetchOptionChain fetches option contracts for the given underlying symbol.
-// It fetches a wide 14-55 DTE window so SelectBestContract can apply the
-// family-specific and global DTE band (default 21-45, target 30).
+// Fetch window is 7-25 DTE to match Alpaca's paper indicative feed which only
+// provides the two nearest expirations (~14 and ~17 DTE for SPY weeklies/monthly).
+// SelectBestContract applies the narrower family/global DTE band on top.
 // If the Alpaca options API is unavailable (403/404 or account not options-enabled),
 // it returns an empty slice without error — the pipeline treats this as
 // "no qualifying chain data" and Claude will classify the setup as structural_candidate.
 func (c *AlpacaClient) FetchOptionChain(ticker string, underlyingPrice float64, today string) ([]OptionContract, error) {
-	// Wide fetch window: 14-55 DTE. SelectBestContract applies the narrower
-	// family/global DTE band (21-45) so we never return a stale near-expiry contract.
 	todayTime, _ := time.Parse("2006-01-02", today)
 	if todayTime.IsZero() {
 		todayTime = time.Now()
 	}
-	minExp := todayTime.AddDate(0, 0, 14).Format("2006-01-02")
-	maxExp := todayTime.AddDate(0, 0, 55).Format("2006-01-02")
+	minExp := todayTime.AddDate(0, 0, 7).Format("2006-01-02")
+	maxExp := todayTime.AddDate(0, 0, 25).Format("2006-01-02")
 	reqURL := fmt.Sprintf("%s/v1beta1/options/snapshots/%s?feed=indicative&limit=200&expiration_date_gte=%s&expiration_date_lte=%s",
 		c.dataURL, ticker, minExp, maxExp)
 	req, err := http.NewRequest("GET", reqURL, nil)
@@ -352,7 +351,7 @@ func (c *AlpacaClient) FetchOptionChain(ticker string, underlyingPrice float64, 
 			continue
 		}
 		dte := int(expDate.Sub(todayTime).Hours() / 24)
-		if dte < 14 || dte > 55 {
+		if dte < 7 || dte > 25 {
 			continue
 		}
 

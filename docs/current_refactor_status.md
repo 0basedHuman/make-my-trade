@@ -1,5 +1,53 @@
 # Current Refactor Status
 
+## Completed: Market Signal Fixes — Chain-Based P/C Ratios (2026-04-28)
+
+### Objective
+Replace three broken external market data sources (CBOE CSV stale, FINRA OTC-only, Yahoo Finance 401) with Alpaca option chain-derived P/C ratios.
+
+### What was done
+
+#### 1. `internal/market/alpaca.go` — new `ChainPCRatio` + `ComputeChainPCRatio`
+- `ChainPCRatio` struct: `CallVol`, `PutVol`, `PCRatio`, `Bias`
+- `ComputeChainPCRatio(contracts []OptionContract)` — sums `OptionVolume` by type, computes P/C ratio, sets bias thresholds (put_heavy ≥1.2, call_heavy ≤0.6)
+- Uses `OptionVolume` as proxy (OI unavailable on indicative feed)
+
+#### 2. `internal/workflow/activities.go` — 4 changes
+- Removed `market.FetchEquityPCRatio()` (CBOE CSV stale since 2019)
+- Removed `finra`/`yahoo` from `tickerSignals` struct; removed FINRA + Yahoo pre-fetch calls
+- Per-ticker chain loop now also calls `market.ComputeChainPCRatio(contracts)` before quality filter → `chainPC` map
+- After chain loop: fetches SPY option chain, calls `ComputeChainPCRatio` → `spyPC` for market-wide context
+- Candidate builder: `TickerPCRatio/Bias` now from `chainPC[ticker]`; `MarketContext.EquityPCRatio/Bias` from `spyPC`
+
+### Signals now active after this fix
+| Signal | Source | Status |
+|---|---|---|
+| Pre-market gap | Alpaca SIP 5-min bars | ✅ working |
+| Short float % | Finviz HTML scrape | ✅ working (fixed regex) |
+| Short ratio | Finviz HTML scrape | ✅ working |
+| News headlines | Finviz + Finnhub | ✅ working |
+| Per-ticker P/C ratio | Alpaca chain OptionVolume | ✅ fixed (was Yahoo 401) |
+| Market-wide P/C | SPY Alpaca chain | ✅ fixed (was CBOE 2019 CSV) |
+
+### Files changed
+- `internal/market/alpaca.go`
+- `internal/workflow/activities.go`
+
+### Remaining work
+- `internal/market/cboe.go`, `finra.go`, `yahoo.go` — dead code, safe to delete later
+- Run smoke test to confirm Finviz short float > 0 for watchlist tickers
+- Rebuild and restart worker/server binaries after deployment
+
+### Exact next step
+Restart worker and server with new binaries, then check next morning's scan logs for:
+```
+activity: extended signals fetched for N tickers
+```
+And verify Claude payload includes `short_float_pct > 0` and `ticker_pc_ratio > 0`.
+
+---
+
+
 ## Completed: Mechanical Exits + 7–14 DTE Enforcement (2026-04-24)
 
 ### Objective

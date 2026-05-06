@@ -157,7 +157,9 @@ ON CONFLICT (trade_date, ticker) DO UPDATE SET
     entry_low=$22, entry_high=$23, stop_loss=$24, target1=$25, target2=$26, rr_ratio=$27,
     hold_days_min=$28, hold_days_base=$29, hold_days_max=$30,
     reject_reason=$31,
-    candidate_status=$32, setup_family=$33, direction=$34, prev_day_volume=$35
+    candidate_status=CASE WHEN trade_candidates.candidate_status IN ('entry_ready','confirmed')
+                          THEN trade_candidates.candidate_status ELSE $32 END,
+    setup_family=$33, direction=$34, prev_day_volume=$35
 RETURNING id`
 
 	antiPatterns := in.AntiPatterns

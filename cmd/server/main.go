@@ -119,7 +119,7 @@ func main() {
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 120 * time.Second, // long because run-analysis can take 60s
+		WriteTimeout: 8 * time.Minute, // analysis pipeline: signals + chains + Claude
 		IdleTimeout:  60 * time.Second,
 	}
 

@@ -115,17 +115,28 @@ func EvaluateMechanicalExit(pos PositionRiskState, currentPremium float64, rules
 		dec.TrailingActive = true
 	}
 
+	// Minimum hold window: never exit mechanically before min_hold_days.
+	// Stop loss and EOD exit are both suppressed while in the protected window.
+	// Take profit and trailing giveback still fire (locking in gains is always ok).
+	minHold := rules.MinHoldDays
+	if minHold <= 0 {
+		minHold = 0
+	}
+	inProtectedWindow := pos.DaysHeld < minHold
+
 	// ── Exit rules (evaluated in priority order) ──────────────────────────────
 
-	// 1. Stop loss: down ≥ stop_pct from entry
-	stopFloor := entry * (1.0 - rules.PremiumStopLossPct/100.0)
-	if currentPremium <= stopFloor {
-		dec.ShouldExit = true
-		dec.Reason = ExitReasonPremiumStopLoss
-		return dec
+	// 1. Stop loss: down ≥ stop_pct from entry (suppressed in protected window)
+	if !inProtectedWindow {
+		stopFloor := entry * (1.0 - rules.PremiumStopLossPct/100.0)
+		if currentPremium <= stopFloor {
+			dec.ShouldExit = true
+			dec.Reason = ExitReasonPremiumStopLoss
+			return dec
+		}
 	}
 
-	// 2. Take profit: up ≥ take_profit_pct from entry
+	// 2. Take profit: up ≥ take_profit_pct from entry (always active)
 	tpCeiling := entry * (1.0 + rules.PremiumTakeProfitPct/100.0)
 	if currentPremium >= tpCeiling {
 		dec.ShouldExit = true
@@ -133,7 +144,7 @@ func EvaluateMechanicalExit(pos PositionRiskState, currentPremium float64, rules
 		return dec
 	}
 
-	// 3. Trailing giveback: trail active AND current ≤ peak * (1 - giveback_pct/100)
+	// 3. Trailing giveback: trail active AND current ≤ peak * (1 - giveback_pct/100) (always active)
 	if dec.TrailingActive && dec.PeakPremium > 0 {
 		trailFloor := dec.PeakPremium * (1.0 - rules.PremiumTrailingGivebackPct/100.0)
 		if currentPremium <= trailFloor {
@@ -143,9 +154,8 @@ func EvaluateMechanicalExit(pos PositionRiskState, currentPremium float64, rules
 		}
 	}
 
-	// 4. EOD exit: within 30 minutes of 13:00 PT (market close 13:00) and hold not approved.
-	//    Market closes at 13:00 PT. We force exit at 12:45 PT or later unless approved.
-	if rules.ForceEODExitUnlessHoldConfirmed && !pos.HoldOvernightApproved {
+	// 4. EOD exit: suppressed in protected window; otherwise requires hold approval.
+	if !inProtectedWindow && rules.ForceEODExitUnlessHoldConfirmed && !pos.HoldOvernightApproved {
 		eodCutoff := time.Date(nowPT.Year(), nowPT.Month(), nowPT.Day(), 12, 45, 0, 0, nowPT.Location())
 		if nowPT.After(eodCutoff) || nowPT.Equal(eodCutoff) {
 			dec.ShouldExit = true

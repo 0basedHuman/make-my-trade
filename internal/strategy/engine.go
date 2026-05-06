@@ -795,6 +795,29 @@ func scoreTrendStructure(name string, cfg FamilyConfig, f Features) float64 {
 		}
 	}
 
+	// Sleeve 4: 20-day relative strength vs SPY.
+	// Bullish families: outperforming SPY boosts score; underperforming penalises.
+	// Bearish families: underperforming SPY is a positive signal (weak stock = good put).
+	if f.RelStrength != 0 {
+		isBull := isBullishFamily(name)
+		rs := f.RelStrength
+		if !isBull {
+			rs = -rs // flip sign: underperformance is positive for bearish setups
+		}
+		switch {
+		case rs >= 8.0:
+			base = math.Min(1.0, base+0.15) // strongly outperforming — high follow-through
+		case rs >= 4.0:
+			base = math.Min(1.0, base+0.08)
+		case rs >= 1.5:
+			base = math.Min(1.0, base+0.03)
+		case rs <= -4.0:
+			base = math.Max(0, base-0.10) // lagging the market — lower conviction
+		case rs <= -1.5:
+			base = math.Max(0, base-0.04)
+		}
+	}
+
 	return clamp01(base)
 }
 

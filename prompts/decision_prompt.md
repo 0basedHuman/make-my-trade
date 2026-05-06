@@ -53,15 +53,42 @@ Apply five scoring categories:
 
 | Category | Weight | What to assess |
 |---|---|---|
-| trend_structure | 30 | Family structural alignment (EMA20/EMA100 for continuation, slope for momentum); price not overextended (> 15% from EMA20) |
+| trend_structure | 30 | Family structural alignment (EMA20/EMA100 for continuation, slope for momentum); price not overextended (> 15% from EMA20); **`relative_strength_20d` is a primary signal here** |
 | catalyst_sentiment | 25 | Credible near-term catalyst, sector tailwind, or sentiment signal |
-| volume_participation | 20 | Relative volume ≥ family minimum (1.2× for continuation, 1.5× for momentum) |
+| volume_participation | 20 | Relative volume ≥ family minimum (1.2× for continuation, 1.5× for momentum); **opening RVOL from `opening_5min_bars` is the strongest real-time volume signal** |
 | indicator_alignment | 15 | RSI within family range, MACD aligned with direction, all in sync |
 | fundamental_context | 10 | Sector constructive over the short horizon |
 
 Use `regime_fit` (0–100) to express direction alignment with today's regime.
 
 Use `pattern_score` from the payload as an additional signal — higher integer scores indicate stronger structural patterns from the YAML scoring table.
+
+### Relative strength rule (applies to all families)
+
+`relative_strength_20d` = ticker 20-day return minus SPY 20-day return.
+
+| RS value | Meaning | Score impact |
+|---|---|---|
+| > +8% | Strongly outperforming (bullish) / strongly underperforming (bearish) | +10–15 pts |
+| +4% to +8% | Moderate outperform/underperform | +5–8 pts |
+| -4% to +4% | Market neutral | no change |
+| < -4% | Lagging (bullish) / leading higher (bearish) | −8–12 pts |
+
+**For bullish setups**: positive RS is required for `entry_ready`. A stock lagging SPY by > 4% cannot be `entry_ready` regardless of other signals.
+**For bearish setups**: negative RS (stock weaker than SPY) is the equivalent requirement.
+
+### Opening 5-min candle RVOL rule (hard rule when `opening_5min_bars` is present)
+
+When `opening_5min_bars` is in the payload, compute RVOL as first-candle volume relative to the ticker's average opening-candle volume (use `relative_volume` from daily data as a proxy).
+
+| First candle RVOL | Interpretation | Action |
+|---|---|---|
+| ≥ 1.5× | Real breakout — institutional participation | Required for `entry_ready`; strongly supports `confirmed` |
+| 1.0–1.5× | Normal volume | May be `entry_ready` if all other signals strong |
+| < 0.8× | Trap — low conviction move | Cannot be `entry_ready`; add `volume_weak` reason code |
+
+**If first candle RVOL < 0.8× and direction matches setup, set status to `structural_candidate` and add `volume_weak` to reason_codes.**
+**If all 3 opening candles have RVOL < 1.0× and price is not holding key levels, set status to `watch_only`.**
 
 ---
 
@@ -89,12 +116,15 @@ For `entry_ready` and `confirmed` only.
 
 **Use preferred DTE and delta ranges from strategy_rules.yaml by setup family:**
 
-| Family | DTE range | Delta range |
-|---|---|---|
-| `bullish_continuation` | 21–35 DTE | Δ 0.45–0.65 |
-| `bullish_momentum_breakout` | 7–14 DTE | Δ 0.35–0.60 |
-| `bearish_continuation` | 21–35 DTE | Δ 0.45–0.65 |
-| `bearish_momentum_breakdown` | 7–14 DTE | Δ 0.35–0.60 |
+| Family | DTE range | Target DTE | Delta range |
+|---|---|---|---|
+| `bullish_continuation` | 14–45 DTE | 30 | Δ 0.45–0.65 |
+| `bullish_momentum_breakout` | 14–45 DTE | 30 | Δ 0.45–0.70 |
+| `bearish_continuation` | 14–45 DTE | 30 | Δ 0.45–0.65 |
+| `bearish_momentum_breakdown` | 14–45 DTE | 30 | Δ 0.45–0.70 |
+| `bearish_exhaustion_reversal` | 14–45 DTE | 21 | Δ 0.35–0.55 |
+
+**Target DTE 30**: reduces theta drag from ~$0.20/day (14 DTE) to ~$0.08/day (30 DTE). Stops will not fire from time decay alone.
 
 Within the qualifying contracts in the payload:
 - Prefer delta near the middle of the range
@@ -167,7 +197,7 @@ For each entry in `open_positions`:
 
 Populate `reason_codes` array from the YAML reason_codes enum. Include at least one code per candidate. Use these consistently:
 
-`trend_down`, `trend_up`, `below_ema20`, `above_ema20`, `macd_negative`, `macd_positive`, `vix_too_high`, `btc_regime_negative`, `volume_weak`, `volume_strong`, `rsi_extended`, `rsi_too_weak`, `entry_too_extended`, `reward_risk_poor`, `anti_pattern_detected`, `event_blackout_earnings`, `event_blackout_binary`, `awaiting_open_confirmation`, `open_confirmation_failed`, `options_not_allowed_liquidity`, `options_not_allowed_iv`, `options_not_allowed_event_risk`, `no_trade_today`
+`trend_down`, `trend_up`, `below_ema20`, `above_ema20`, `macd_negative`, `macd_positive`, `vix_too_high`, `btc_regime_negative`, `volume_weak`, `volume_strong`, `rsi_extended`, `rsi_too_weak`, `entry_too_extended`, `reward_risk_poor`, `anti_pattern_detected`, `event_blackout_earnings`, `event_blackout_binary`, `awaiting_open_confirmation`, `open_confirmation_failed`, `options_not_allowed_liquidity`, `options_not_allowed_iv`, `options_not_allowed_event_risk`, `no_trade_today`, `rs_outperforming`, `rs_lagging`, `opening_rvol_confirmed`, `opening_rvol_weak`, `opening_direction_aligned`, `opening_direction_against`
 
 ---
 

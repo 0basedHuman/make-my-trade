@@ -7,8 +7,8 @@ version: 7
 # ============================================================
 schedule:
   timezone: America/Los_Angeles
-  daily_scan_time:             "05:30"   # must finish before 6:30 AM open; 1-hour buffer
-  opening_confirmation_time:   "06:42"   # 6:30-6:40 candle complete; Claude entry
+  daily_scan_time:             "06:45"   # after first 3 5-min candles (9:30/9:35/9:40 ET candles complete)
+  opening_confirmation_time:   "07:00"   # 15 min after open; uses same opening bars already in payload
   opening_confirmation_cutoff: "08:30"   # extended for late-start recovery (worker offline)
   first_position_review_time:  "07:15"   # early risk management on open positions
   continuation_review_time:    "07:45"   # fresh intraday bars; continuation / tighten
@@ -79,9 +79,9 @@ trade_frequency:
 # ============================================================
 risk:
   option_lifecycle:
-    dte_min: 14             # minimum DTE; Alpaca paper feed provides ~2 near-term expirations
-    dte_max: 21             # maximum DTE; targets the nearest monthly/weekly
-    target_dte: 17          # preferred DTE; selector ranks by |dte - target_dte|
+    dte_min: 14             # minimum DTE; 14+ avoids worst gamma/theta at expiry
+    dte_max: 45             # maximum DTE; captures full swing window without too much extrinsic
+    target_dte: 30          # preferred DTE; 30d theta decay is ~half of 14d for same move
     avoid_dte_below: 7      # hard floor: never select DTE below this (gamma risk zone)
     contracts_per_trade: 1  # always 1 contract per paper trade
 
@@ -104,12 +104,13 @@ risk:
 
   mechanical_exits:
     enabled: true
-    premium_stop_loss_pct: 30          # exit if premium is down 30% from entry
-    premium_take_profit_pct: 50        # exit if premium is up 50% from entry
-    premium_trailing_start_pct: 35     # activate trailing once premium is up 35%
-    premium_trailing_giveback_pct: 20  # exit if premium gives back 20% from peak after trail starts
-    force_eod_exit_unless_hold_confirmed: true  # exit at EOD unless Claude explicitly approves hold
-    max_hold_days_without_reconfirm: 3          # raised to 3 (30 DTE gives more hold room)
+    min_hold_days: 2                           # never exit on day 0 or 1 — give the setup room
+    premium_stop_loss_pct: 30                  # exit if premium is down 30% from entry
+    premium_take_profit_pct: 50                # exit if premium is up 50% from entry
+    premium_trailing_start_pct: 10             # arm trailing once premium is up 10% from entry
+    premium_trailing_giveback_pct: 15          # exit if premium gives back 15% from peak after trail starts
+    force_eod_exit_unless_hold_confirmed: true # exit at EOD unless Claude explicitly approves hold
+    max_hold_days_without_reconfirm: 5         # allow Claude to approve hold for up to 5 days
 
 
 # ============================================================
@@ -238,7 +239,7 @@ families:
 
     options:
       dte_min: 14
-      dte_max: 21
+      dte_max: 45
       delta_min: 0.45
       delta_max: 0.65
 
@@ -304,7 +305,7 @@ families:
 
     options:
       dte_min: 14
-      dte_max: 21
+      dte_max: 45
       delta_min: 0.45
       delta_max: 0.70
 
@@ -371,7 +372,7 @@ families:
 
     options:
       dte_min: 14
-      dte_max: 21
+      dte_max: 45
       delta_min: 0.45
       delta_max: 0.65
 
@@ -477,7 +478,7 @@ families:
 
     options:
       dte_min: 14
-      dte_max: 21
+      dte_max: 45
       delta_min: 0.35                # slightly lower delta — sharp reversal expected
       delta_max: 0.55
 
@@ -542,7 +543,7 @@ families:
 
     options:
       dte_min: 14
-      dte_max: 21
+      dte_max: 45
       delta_min: 0.45
       delta_max: 0.70
 

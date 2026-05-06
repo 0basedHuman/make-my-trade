@@ -427,8 +427,21 @@ func (h *Handler) ForceConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If not in entry_ready, check if there is an open paper position (any recent date)
-	// and a matching confirmed candidate — handles re-order after date rollover.
+	// If not in entry_ready, fall back to any candidate for today (structural, watch, etc.)
+	// The user explicitly clicked PAPER TRADE NOW, so we honour the override.
+	if found == nil {
+		allToday, err2 := store.GetCandidatesForDate(ctx, h.pool, tradeDate)
+		if err2 == nil {
+			for i := range allToday {
+				if allToday[i].Ticker == req.Ticker && allToday[i].CandidateStatus != "rejected" {
+					found = &allToday[i]
+					break
+				}
+			}
+		}
+	}
+
+	// If still not found, check for an open paper position (handles re-order after date rollover).
 	if found == nil {
 		var posID string
 		var posClosePrice float64
@@ -463,7 +476,7 @@ func (h *Handler) ForceConfirm(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		writeError(w, http.StatusNotFound, fmt.Sprintf("%s not in entry_ready for today and no open position found", req.Ticker))
+		writeError(w, http.StatusNotFound, fmt.Sprintf("%s not found in today's candidates", req.Ticker))
 		return
 	}
 
@@ -654,9 +667,10 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 
 	// ── Step 6: Prescreen symbols in parallel ────────────────────────────────
 	type prescreenResult struct {
-		ticker   string
-		analysis strategy.SymbolAnalysis
-		candID   string
+		ticker           string
+		analysis         strategy.SymbolAnalysis
+		candID           string
+		finnhubHeadlines []string
 	}
 
 	var mu sync.Mutex
@@ -685,7 +699,20 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 			defer func() { <-sem }()
 
 			earningsRisk := market.HasEarningsWithin(earningsEvents, t, today, 5)
-			sentiment := market.SentimentData{Symbol: t}
+
+			time.Sleep(time.Second) // Finnhub rate limit — 60 req/min
+			sentiment, _ := h.finnhub.FetchSocialSentiment(t)
+
+			newsItems, _ := h.finnhub.FetchCompanyNews(t, today.AddDate(0, 0, -3), today)
+			var finnhubHeadlines []string
+			for i, n := range newsItems {
+				if i >= 8 {
+					break
+				}
+				if n.Headline != "" {
+					finnhubHeadlines = append(finnhubHeadlines, n.Headline)
+				}
+			}
 
 			a := h.engine.Analyze(t, todayStr, b, regime, spyBars, earningsRisk, sentiment)
 
@@ -741,12 +768,67 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 			}
 
 			mu.Lock()
-			prescreened = append(prescreened, prescreenResult{ticker: t, analysis: a, candID: candID})
+			prescreened = append(prescreened, prescreenResult{ticker: t, analysis: a, candID: candID, finnhubHeadlines: finnhubHeadlines})
 			mu.Unlock()
 		}(ticker, bars)
 	}
 	wg.Wait()
 	log.Printf("pipeline: prescreened %d symbols", len(prescreened))
+
+	// ── Step 6b: Shortlist top 10 eligible by score for Claude ───────────────
+	// Sort eligible by PatternScoreInt descending so the strongest setups go
+	// to Claude. Non-eligible still flow to the rejected/blocked buckets below.
+	const maxClaudeCandidates = 10
+	type scoredResult struct {
+		r     prescreenResult
+		score int
+	}
+	var eligible []scoredResult
+	for _, r := range prescreened {
+		if r.analysis.Eligible {
+			eligible = append(eligible, scoredResult{r: r, score: r.analysis.PatternScoreInt})
+		}
+	}
+	// Simple insertion-sort (list is small — ≤26 tickers)
+	for i := 1; i < len(eligible); i++ {
+		for j := i; j > 0 && eligible[j].score > eligible[j-1].score; j-- {
+			eligible[j], eligible[j-1] = eligible[j-1], eligible[j]
+		}
+	}
+	shortlisted := make(map[string]bool)
+	for i, s := range eligible {
+		if i >= maxClaudeCandidates {
+			break
+		}
+		shortlisted[s.r.ticker] = true
+	}
+	log.Printf("pipeline: shortlisted %d of %d eligible for Claude", len(shortlisted), len(eligible))
+
+	// ── Step 6c: Extended signals for shortlisted tickers only ───────────────
+	// Runs sequentially after goroutines to avoid Finviz rate limits.
+	// Scoped to shortlisted tickers only (was all 26 — now ≤10).
+	type tickerSig struct {
+		premarket market.PremarketSnapshot
+		finviz    market.FinvizSnapshot
+	}
+	sigMap := make(map[string]tickerSig)
+	for _, r := range prescreened {
+		if !shortlisted[r.ticker] {
+			continue
+		}
+		bars := barsMap[r.ticker]
+		var priorClose float64
+		if len(bars) > 0 {
+			priorClose = bars[len(bars)-1].Close
+		}
+		sig := tickerSig{}
+		sig.premarket, _ = h.alpaca.FetchPremarketSnapshot(r.ticker, priorClose, today)
+		time.Sleep(100 * time.Millisecond)
+		sig.finviz, _ = market.FetchFinvizSnapshot(r.ticker)
+		time.Sleep(600 * time.Millisecond)
+		sigMap[r.ticker] = sig
+	}
+	log.Printf("pipeline: extended signals fetched for %d tickers", len(sigMap))
 
 	// ── Step 7: Fetch option chains for eligible symbols ─────────────────────
 	type chainResult struct {
@@ -781,48 +863,127 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 	}
 	chainWG.Wait()
 
-	// ── Step 8: Build slim candidate list for Claude ────────────────────────
+	// ── Step 8: Compute chain P/C ratios + SPY market-wide P/C ─────────────
+	chainPC := make(map[string]market.ChainPCRatio)
+	for t, contracts := range chains {
+		chainPC[t] = market.ComputeChainPCRatio(contracts)
+	}
+	var spyPrice float64
+	if len(spyBars) > 0 {
+		spyPrice = spyBars[len(spyBars)-1].Close
+	}
+	spyContracts, spyChainErr := h.alpaca.FetchOptionChain("SPY", spyPrice, todayStr)
+	if spyChainErr != nil {
+		log.Printf("pipeline: SPY chain P/C warning: %v", spyChainErr)
+	}
+	spyPC := market.ComputeChainPCRatio(spyContracts)
+
+	// ── Step 8b: Fetch first 3 opening 5-min candles for shortlisted tickers ────
+	// Available after 6:45 AM PT (9:45 AM ET). Before that returns empty map silently.
+	var shortlistedList []string
+	for t := range shortlisted {
+		shortlistedList = append(shortlistedList, t)
+	}
+	openingBarsMap, openingErr := h.alpaca.FetchOpening5MinBars(shortlistedList, today, 3)
+	if openingErr != nil {
+		log.Printf("pipeline: opening 5-min bars warning: %v (continuing without)", openingErr)
+		openingBarsMap = map[string][]market.Opening5MinBar{}
+	} else if len(openingBarsMap) > 0 {
+		log.Printf("pipeline: opening 5-min bars fetched for %d/%d tickers", len(openingBarsMap), len(shortlistedList))
+	}
+
+	// ── Step 9: Build full candidate list for Claude (shortlisted only) ───────
 	lf := h.rules.OptionsTranslation.LiquidityFilters
-	var slimCandidates []claudeclient.SlimCandidate
+	scanTimePT := time.Now().In(loc).Format("15:04")
+	var fullCandidates []claudeclient.CandidateInput
 	for _, r := range prescreened {
-		if !r.analysis.Eligible {
+		if !shortlisted[r.ticker] {
 			continue
 		}
 		a := r.analysis
 		contracts := filterChainQuality(chains[r.ticker], lf)
-		slimCandidates = append(slimCandidates, claudeclient.SlimCandidate{
-			T:     r.ticker,
-			Fam:   a.SetupFamily,
-			Score: a.PatternScoreInt,
-			Px:    a.ClosePrice,
-			RSI:   a.RSI14,
-			MACD:  a.MACDHist,
-			RVol:  a.VolumeRatio,
-			Trend: a.TrendBias,
-			T1:    a.BaseTarget,
-			T2:    a.StretchTarget,
-			RC:    a.ReasonCodes,
-			Earn:  a.EarningsRisk,
-			Opts:  len(contracts) > 0,
+		optionsStatus := "options_not_allowed"
+		if len(contracts) > 0 {
+			optionsStatus = "options_ready"
+		}
+		// Limit to 5 best contracts — Claude needs liquidity/spread signal, not the full chain
+		if len(contracts) > 5 {
+			contracts = contracts[:5]
+		}
+		hwBase := a.HoldDaysBase
+		if hwBase == 0 {
+			hwBase = 10
+		}
+		sig := sigMap[r.ticker]
+		allHeadlines := append(sig.finviz.Headlines, r.finnhubHeadlines...)
+		if len(allHeadlines) > 6 {
+			allHeadlines = allHeadlines[:6]
+		}
+		fullCandidates = append(fullCandidates, claudeclient.CandidateInput{
+			Ticker:          r.ticker,
+			Price:           a.ClosePrice,
+			Daily20EMA:      a.EMA20,
+			Daily50EMA:      a.EMA50,
+			RSI14:           a.RSI14,
+			MACDHist:        a.MACDHist,
+			RelativeVolume:  a.VolumeRatio,
+			PremktHigh:      sig.premarket.High,
+			PremktLow:       sig.premarket.Low,
+			PriorDayHigh:    a.PriorDayHigh,
+			PriorDayLow:     a.PriorDayLow,
+			TrendBias:       a.TrendBias,
+			Sentiment:       a.Sentiment,
+			EarningsRisk:    a.EarningsRisk,
+			AntiPatterns:    a.AntiPatterns,
+			Options:         contracts,
+			SetupFamily:     a.SetupFamily,
+			PatternScore:    a.PatternScoreInt,
+			ReasonCodes:     a.ReasonCodes,
+			HoldWindowBase:  hwBase,
+			BaseTarget:      a.BaseTarget,
+			StretchTarget:   a.StretchTarget,
+			OptionsStatus:   optionsStatus,
+			PremarketGapPct: sig.premarket.GapPct,
+			PremarketGapDir: sig.premarket.GapDir,
+			PremarketVol:    sig.premarket.Volume,
+			ShortFloatPct:   sig.finviz.ShortFloatPct,
+			ShortRatioDays:  sig.finviz.ShortRatio,
+			ShortTrend:      "",
+			TickerPCRatio:   chainPC[r.ticker].PCRatio,
+			TickerPCBias:    chainPC[r.ticker].Bias,
+			NewsHeadlines:   allHeadlines,
+			// v4: first 3 5-min candles — populated after 6:45 AM PT, empty otherwise
+			Opening5MinBars:     openingBarsMap[r.ticker],
+			RelativeStrength20d: r.analysis.RelativeStrength,
 		})
 	}
 
-	// ── Step 9: Call Claude (single slim call — all candidates, ~80 chars each) ─
+	// ── Step 10: Call Claude with full RuntimePayload ───────────────────────
+	systemPrompt := claudeclient.BuildSystemPrompt()
 	claudeCli := claudeclient.NewClient(
 		h.cfg.AnthropicAPIKey,
 		"claude-sonnet-4-6",
 		h.cfg.ClaudeMaxOutputTokens,
-		"", // system prompt embedded in ReviewCandidates
+		systemPrompt,
 	)
-
-	spyRegime := deriveTrendBias(barsMap["SPY"])
-	log.Printf("pipeline: calling Claude with %d candidates", len(slimCandidates))
-	slimResp, claudeErr := claudeCli.ReviewCandidates(vixLevel, btcROC, spyRegime, slimCandidates)
+	log.Printf("pipeline: calling Claude with %d candidates", len(fullCandidates))
+	decision, claudeErr := claudeCli.DecideOptions(claudeclient.RuntimePayload{
+		ScanTimePT: scanTimePT,
+		MarketContext: claudeclient.MarketContext{
+			VIX:           vixLevel,
+			BTCRoc20:      btcROC,
+			MacroNewsBias: "neutral",
+			EquityPCRatio: spyPC.PCRatio,
+			PCRatioBias:   spyPC.Bias,
+		},
+		OpenPositions: []claudeclient.PositionInput{},
+		Candidates:    fullCandidates,
+	})
 	if claudeErr != nil {
 		log.Printf("pipeline: Claude error: %v", claudeErr)
 	}
 
-	// ── Step 10: Build decision lookup from slim response ─────────────────────
+	// ── Step 11: Build decision lookup ───────────────────────────────────────
 	type miniDecision struct {
 		status string
 		dir    string
@@ -832,14 +993,18 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 		rc     []string
 	}
 	decisionByTicker := make(map[string]miniDecision)
-	for _, r := range slimResp.C {
-		decisionByTicker[r.T] = miniDecision{
-			status: r.Status, dir: r.Dir, score: r.Score,
-			fd: r.FD, why: r.Why, rc: r.RC,
+	for _, cd := range decision.Candidates {
+		why := cd.Thesis.CatalystSentiment
+		if why == "" {
+			why = cd.Thesis.TrendStructure
+		}
+		decisionByTicker[cd.Ticker] = miniDecision{
+			status: cd.Status, dir: cd.Direction, score: cd.Score,
+			fd: cd.FinalDecision, why: why, rc: cd.ReasonCodes,
 		}
 	}
-	actionBias := slimResp.Bias
-	regimeSummary := slimResp.Regime
+	actionBias := decision.DailySummary.ActionBias
+	regimeSummary := decision.MarketRegime.Label
 
 	// Per-status buckets matching YAML ui_rules.sections.
 	var confirmed []CandidateResponse
@@ -1535,9 +1700,11 @@ func (h *Handler) selectBestContract(ctx context.Context, ticker, optionType str
 		return "", 0
 	}
 
-	limitPrice := (best.Bid + best.Ask) / 2.0
-	if best.Bid <= 0 {
-		limitPrice = best.Ask
+	// Use ask price for paper trading — mid-price limit orders sit unfilled
+	// because market makers quote bid/ask and don't cross to the mid.
+	limitPrice := best.Ask
+	if limitPrice <= 0 {
+		limitPrice = best.Bid
 	}
 
 	log.Printf("select-contract: %s %s %s strike=%.2f dte=%d delta=%.3f limit=%.2f",

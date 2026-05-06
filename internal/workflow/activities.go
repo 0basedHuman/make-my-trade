@@ -55,9 +55,10 @@ type ActivityDeps struct {
 // This is the Temporal-managed version of POST /api/run-analysis.
 func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, error) {
 	loc, _ := time.LoadLocation("America/Los_Angeles")
-	today := time.Now().In(loc)
+	todayRaw := time.Now().In(loc)
+	today := time.Date(todayRaw.Year(), todayRaw.Month(), todayRaw.Day(), 0, 0, 0, 0, loc)
 	todayStr := today.Format("2006-01-02")
-	scanTime := today.Format("15:04")
+	scanTime := todayRaw.Format("15:04")
 
 	log.Printf("schedule_daily_scan_started date=%s time=%s", todayStr, today.Format("15:04"))
 
@@ -91,11 +92,39 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 	regimeLabel := strategy.RegimeLabel(vixLevel, btcROC)
 	earningsEvents, _ := d.Finnhub.FetchUpcomingEarnings(today, today.AddDate(0, 0, 7))
 
+	// ── Per-ticker extended signals (pre-fetched sequentially with rate limiting) ─
+	type tickerSignals struct {
+		premarket market.PremarketSnapshot
+		finviz    market.FinvizSnapshot
+	}
+	sigMap := make(map[string]tickerSignals)
+
+	for _, t := range tickers {
+		bars, ok := barsMap[t]
+		var priorClose float64
+		if ok && len(bars) > 0 {
+			priorClose = bars[len(bars)-1].Close
+		}
+		sig := tickerSignals{}
+
+		// Pre-market gap (Alpaca SIP — same credentials, no extra cost)
+		sig.premarket, _ = d.Alpaca.FetchPremarketSnapshot(t, priorClose, today)
+		time.Sleep(100 * time.Millisecond)
+
+		// Finviz short interest + news
+		sig.finviz, _ = market.FetchFinvizSnapshot(t)
+		time.Sleep(600 * time.Millisecond) // respect Finviz rate limit
+
+		sigMap[t] = sig
+	}
+	log.Printf("activity: extended signals fetched for %d tickers", len(sigMap))
+
 	// Prescreen symbols in parallel
 	type symResult struct {
-		ticker   string
-		analysis strategy.SymbolAnalysis
-		candID   string
+		ticker           string
+		analysis         strategy.SymbolAnalysis
+		candID           string
+		finnhubHeadlines []string
 	}
 
 	var mu sync.Mutex
@@ -121,6 +150,18 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 			time.Sleep(time.Second)
 			sentiment, _ := d.Finnhub.FetchSocialSentiment(t)
 
+			// Fetch Finnhub company news (last 3 days) — already built, wired here
+			newsItems, _ := d.Finnhub.FetchCompanyNews(t, today.AddDate(0, 0, -3), today)
+			var finnhubHeadlines []string
+			for i, n := range newsItems {
+				if i >= 8 {
+					break
+				}
+				if n.Headline != "" {
+					finnhubHeadlines = append(finnhubHeadlines, n.Headline)
+				}
+			}
+
 			a := d.Engine.Analyze(t, todayStr, b, regime, spyBars, earningsRisk, sentiment)
 
 			dir := "bullish"
@@ -133,7 +174,7 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 			}
 
 			candID, upsertErr := store.UpsertCandidate(ctx, d.Pool, store.UpsertCandidateInput{
-				TradeDate:       today.Truncate(24 * time.Hour),
+				TradeDate:       today,
 				Ticker:          t,
 				GateTrend:       a.GateTrend.Passed,
 				GateMomentum:    a.GateMomentum.Passed,
@@ -174,7 +215,12 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 			}
 
 			mu.Lock()
-			allResults = append(allResults, symResult{ticker: t, analysis: a, candID: candID})
+			allResults = append(allResults, symResult{
+				ticker:          t,
+				analysis:        a,
+				candID:          candID,
+				finnhubHeadlines: finnhubHeadlines,
+			})
 			mu.Unlock()
 		}(ticker, bars)
 	}
@@ -188,6 +234,7 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 	lf := rules.OptionsTranslation.LiquidityFilters
 
 	chains := make(map[string][]market.OptionContract)
+	chainPC := make(map[string]market.ChainPCRatio)
 	for _, r := range allResults {
 		if !r.analysis.Eligible {
 			continue
@@ -197,18 +244,76 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 			log.Printf("activity: option chain %s: %v", r.ticker, chainErr)
 			contracts = []market.OptionContract{}
 		}
+		chainPC[r.ticker] = market.ComputeChainPCRatio(contracts) // before quality filter
 		chains[r.ticker] = filterChainQuality(contracts, lf)
 		time.Sleep(200 * time.Millisecond) // conservative rate limiting
+	}
+
+	// Market-wide P/C from SPY option chain (replaces CBOE CSV which is stale)
+	var spyPrice float64
+	if len(spyBars) > 0 {
+		spyPrice = spyBars[len(spyBars)-1].Close
+	}
+	spyContracts, spyChainErr := d.Alpaca.FetchOptionChain("SPY", spyPrice, todayStr)
+	if spyChainErr != nil {
+		log.Printf("activity: SPY chain P/C warning: %v", spyChainErr)
+	}
+	spyPC := market.ComputeChainPCRatio(spyContracts)
+
+	// Shortlist top 10 eligible by score before sending to Claude
+	const maxClaudeCandidates = 10
+	type scoredResult struct {
+		r     symResult
+		score int
+	}
+	var eligibleResults []scoredResult
+	for _, r := range allResults {
+		if r.analysis.Eligible {
+			eligibleResults = append(eligibleResults, scoredResult{r: r, score: r.analysis.PatternScoreInt})
+		}
+	}
+	for i := 1; i < len(eligibleResults); i++ {
+		for j := i; j > 0 && eligibleResults[j].score > eligibleResults[j-1].score; j-- {
+			eligibleResults[j], eligibleResults[j-1] = eligibleResults[j-1], eligibleResults[j]
+		}
+	}
+	shortlistedActivity := make(map[string]bool)
+	for i, s := range eligibleResults {
+		if i >= maxClaudeCandidates {
+			break
+		}
+		shortlistedActivity[s.r.ticker] = true
+	}
+	log.Printf("activity: shortlisted %d of %d eligible for Claude", len(shortlistedActivity), len(eligibleResults))
+
+	// Fetch first 3 5-min opening candles for shortlisted tickers.
+	// Only available after 9:45 AM ET (6:45 AM PT). Before that the map is empty
+	// and Claude payload just omits the field — no error.
+	var shortlistedTickers []string
+	for t := range shortlistedActivity {
+		shortlistedTickers = append(shortlistedTickers, t)
+	}
+	openingBarsMap, openingErr := d.Alpaca.FetchOpening5MinBars(shortlistedTickers, today, 3)
+	if openingErr != nil {
+		log.Printf("activity: opening 5-min bars warning: %v (continuing without)", openingErr)
+		openingBarsMap = map[string][]market.Opening5MinBar{}
+	} else {
+		log.Printf("activity: opening 5-min bars fetched for %d/%d tickers", len(openingBarsMap), len(shortlistedTickers))
 	}
 
 	// Build RuntimePayload
 	var candidates []claudeclient.CandidateInput
 	for _, r := range allResults {
-		if !r.analysis.Eligible {
+		if !shortlistedActivity[r.ticker] {
 			continue
 		}
 		a := r.analysis
 		contracts := chains[r.ticker]
+
+		// Limit to 5 best contracts for Claude payload
+		if len(contracts) > 5 {
+			contracts = contracts[:5]
+		}
 
 		optionsStatus := "options_not_allowed"
 		if len(contracts) > 0 {
@@ -220,6 +325,14 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 			hwBase = 10
 		}
 
+		sig := sigMap[r.ticker]
+
+		// Merge Finviz + Finnhub headlines — cap at 6 to keep payload compact
+		allHeadlines := append(sig.finviz.Headlines, r.finnhubHeadlines...)
+		if len(allHeadlines) > 6 {
+			allHeadlines = allHeadlines[:6]
+		}
+
 		candidates = append(candidates, claudeclient.CandidateInput{
 			Ticker:         r.ticker,
 			Price:          a.ClosePrice,
@@ -228,6 +341,8 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 			RSI14:          a.RSI14,
 			MACDHist:       a.MACDHist,
 			RelativeVolume: a.VolumeRatio,
+			PremktHigh:     sig.premarket.High,
+			PremktLow:      sig.premarket.Low,
 			PriorDayHigh:   a.PriorDayHigh,
 			PriorDayLow:    a.PriorDayLow,
 			TrendBias:      a.TrendBias,
@@ -243,6 +358,19 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 			BaseTarget:     a.BaseTarget,
 			StretchTarget:  a.StretchTarget,
 			OptionsStatus:  optionsStatus,
+			// v3 fields — external market signals
+			PremarketGapPct: sig.premarket.GapPct,
+			PremarketGapDir: sig.premarket.GapDir,
+			PremarketVol:    sig.premarket.Volume,
+			ShortFloatPct:   sig.finviz.ShortFloatPct,
+			ShortRatioDays:  sig.finviz.ShortRatio,
+			ShortTrend:      "",
+			TickerPCRatio:   chainPC[r.ticker].PCRatio,
+			TickerPCBias:    chainPC[r.ticker].Bias,
+			NewsHeadlines:   allHeadlines,
+			// v4 fields — first 3 5-min opening candles (empty before 6:45 AM PT)
+			Opening5MinBars:     openingBarsMap[r.ticker],
+			RelativeStrength20d: a.RelativeStrength,
 		})
 	}
 
@@ -260,6 +388,8 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 				VIX:           vixLevel,
 				BTCRoc20:      btcROC,
 				MacroNewsBias: "neutral",
+				EquityPCRatio: spyPC.PCRatio,
+				PCRatioBias:   spyPC.Bias,
 			},
 			OpenPositions: []claudeclient.PositionInput{},
 			Candidates:    candidates,
@@ -307,7 +437,7 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 	}
 
 	store.UpsertDailySummary(ctx, d.Pool, store.DailySummary{
-		TradeDate:         today.Truncate(24 * time.Hour),
+		TradeDate:         today,
 		VIXLevel:          vixLevel,
 		BTCROC20:          btcROC,
 		RegimeLabel:       regimeLabel,
@@ -638,7 +768,8 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			continue
 		}
 
-		limitPrice := (best.Bid + best.Ask) / 2.0
+		// Use ask price — mid-price limits sit unfilled in paper trading
+		limitPrice := best.Ask
 		if best.Bid <= 0 {
 			limitPrice = best.Ask
 		}

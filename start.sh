@@ -25,16 +25,13 @@ nohup caffeinate -i > /dev/null 2>&1 &
 echo $! > logs/caffeinate.pid
 echo "[✓] Sleep prevention active (PID $(cat logs/caffeinate.pid))"
 
-# ── 2. Build binaries only if missing ───────────────────────────────────────
-if [ ! -f bin/server ] || [ ! -f bin/worker ]; then
-    echo "[~] Binaries not found — building (one-time, takes ~1 min)..."
-    go build -o bin/server ./cmd/server/ &
-    go build -o bin/worker ./cmd/worker/ &
-    wait
-    echo "[✓] Binaries built"
-else
-    echo "[✓] Binaries ready"
-fi
+# ── 2. Always rebuild binaries ───────────────────────────────────────────────
+# Rebuild every start so code changes take effect without manual steps.
+echo "[~] Building binaries..."
+go build -o bin/server ./cmd/server/ &
+go build -o bin/worker ./cmd/worker/ &
+wait
+echo "[✓] Binaries built"
 
 # ── 3. Start Docker services ─────────────────────────────────────────────────
 echo "[~] Starting Docker services..."

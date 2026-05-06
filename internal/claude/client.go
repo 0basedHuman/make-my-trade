@@ -57,7 +57,7 @@ func NewClient(apiKey, model string, maxOutputTokens int, systemPrompt string) *
 		model:           model,
 		maxOutputTokens: maxOutputTokens,
 		systemPrompt:    systemPrompt,
-		http:            &http.Client{Timeout: 180 * time.Second},
+		http:            &http.Client{Timeout: 5 * time.Minute},
 	}
 }
 
@@ -115,6 +115,10 @@ type MarketContext struct {
 	BreadthTone   string  `json:"breadth_tone"`
 	VIX           float64 `json:"vix"`
 	BTCRoc20      float64 `json:"btc_roc20"`
+
+	// Market-wide options sentiment (CBOE equity put/call ratio)
+	EquityPCRatio float64 `json:"equity_pc_ratio,omitempty"` // puts/calls; >1.0 = fear
+	PCRatioBias   string  `json:"pc_ratio_bias,omitempty"`   // "fear" | "complacency" | "neutral"
 }
 
 // CandidateInput is one prescreened ticker in the runtime payload.
@@ -147,6 +151,21 @@ type CandidateInput struct {
 	BaseTarget     float64  `json:"base_target"`            // structure-based (ATR/swing)
 	StretchTarget  float64  `json:"stretch_target"`         // structure-based extended target
 	OptionsStatus  string   `json:"options_status"`         // options_not_allowed | options_ready
+
+	// v3 fields — external market signals fetched at analysis time
+	PremarketGapPct   float64  `json:"premarket_gap_pct,omitempty"`   // % gap vs prior close; + = gap up
+	PremarketGapDir   string   `json:"premarket_gap_dir,omitempty"`   // "up" | "down" | "flat"
+	PremarketVol      int64    `json:"premarket_volume,omitempty"`    // pre-market share volume
+	ShortFloatPct     float64  `json:"short_float_pct,omitempty"`     // % of float sold short (Finviz)
+	ShortRatioDays    float64  `json:"short_ratio_days,omitempty"`    // days to cover (Finviz)
+	ShortTrend        string   `json:"short_trend,omitempty"`         // "rising" | "falling" | "flat" (FINRA)
+	TickerPCRatio     float64  `json:"ticker_pc_ratio,omitempty"`     // per-ticker put/call OI ratio (Yahoo)
+	TickerPCBias      string   `json:"ticker_pc_bias,omitempty"`      // "put_heavy" | "call_heavy" | "balanced"
+	NewsHeadlines     []string `json:"news_headlines,omitempty"`      // recent headlines (Finviz + Finnhub)
+
+	// v4 fields — opening session data (only populated when analysis runs after market open)
+	Opening5MinBars     []market.Opening5MinBar `json:"opening_5min_bars,omitempty"` // first 3 candles of regular session
+	RelativeStrength20d float64                 `json:"relative_strength_20d,omitempty"` // ticker 20d return minus SPY 20d return; positive = outperforming
 }
 
 // PositionInput describes an open paper position for daily review.

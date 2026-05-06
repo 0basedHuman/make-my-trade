@@ -113,7 +113,7 @@ func (c *AlpacaClient) fetchBatch(tickers []string, start, end time.Time, limit 
 		params.Set("start", start.Format("2006-01-02"))
 		params.Set("end", end.Format("2006-01-02"))
 		params.Set("limit", fmt.Sprintf("%d", limit))
-		params.Set("feed", "iex")
+		params.Set("feed", "sip")
 		params.Set("sort", "asc")
 		if pageToken != "" {
 			params.Set("page_token", pageToken)
@@ -294,8 +294,7 @@ func parseOptionSymbol(symbol, ticker string) (optType, expiration string, strik
 }
 
 // FetchOptionChain fetches option contracts for the given underlying symbol.
-// Fetch window is 7-25 DTE to match Alpaca's paper indicative feed which only
-// provides the two nearest expirations (~14 and ~17 DTE for SPY weeklies/monthly).
+// Fetch window is 4-25 DTE to match Alpaca's paper indicative feed.
 // SelectBestContract applies the narrower family/global DTE band on top.
 // If the Alpaca options API is unavailable (403/404 or account not options-enabled),
 // it returns an empty slice without error — the pipeline treats this as
@@ -305,7 +304,7 @@ func (c *AlpacaClient) FetchOptionChain(ticker string, underlyingPrice float64, 
 	if todayTime.IsZero() {
 		todayTime = time.Now()
 	}
-	minExp := todayTime.AddDate(0, 0, 7).Format("2006-01-02")
+	minExp := todayTime.AddDate(0, 0, 4).Format("2006-01-02")
 	maxExp := todayTime.AddDate(0, 0, 25).Format("2006-01-02")
 	reqURL := fmt.Sprintf("%s/v1beta1/options/snapshots/%s?feed=indicative&limit=200&expiration_date_gte=%s&expiration_date_lte=%s",
 		c.dataURL, ticker, minExp, maxExp)
@@ -351,7 +350,7 @@ func (c *AlpacaClient) FetchOptionChain(ticker string, underlyingPrice float64, 
 			continue
 		}
 		dte := int(expDate.Sub(todayTime).Hours() / 24)
-		if dte < 7 || dte > 25 {
+		if dte < 4 || dte > 25 {
 			continue
 		}
 
@@ -406,6 +405,211 @@ func truncateBody(b []byte, maxLen int) string {
 	return string(b[:maxLen]) + "..."
 }
 
+// PremarketSnapshot captures the pre-market session (4:00–9:30 AM ET) price action.
+type PremarketSnapshot struct {
+	Ticker     string
+	High       float64 // highest print in pre-market
+	Low        float64 // lowest print in pre-market
+	Close      float64 // last pre-market print before open
+	Volume     int64   // pre-market volume
+	GapPct     float64 // (Close - PriorClose) / PriorClose * 100; positive = gap up
+	GapDir     string  // "up" | "down" | "flat"
+}
+
+// FetchPremarketSnapshot fetches 5-min SIP bars for the pre-market window
+// (4:00 AM – 9:25 AM ET) and returns a summary snapshot.
+// Uses feed=sip which includes extended-hours data (IEX does not).
+// priorClose is the previous regular-session close used to compute the gap.
+func (c *AlpacaClient) FetchPremarketSnapshot(ticker string, priorClose float64, date time.Time) (PremarketSnapshot, error) {
+	snap := PremarketSnapshot{Ticker: ticker}
+
+	// ET is UTC-4 (EDT) or UTC-5 (EST); use UTC offsets for simplicity.
+	// Alpaca accepts UTC RFC3339 — convert 4:00 AM ET and 9:25 AM ET.
+	et, _ := time.LoadLocation("America/New_York")
+	pmStart := time.Date(date.Year(), date.Month(), date.Day(), 4, 0, 0, 0, et)
+	pmEnd := time.Date(date.Year(), date.Month(), date.Day(), 9, 25, 0, 0, et)
+
+	params := url.Values{}
+	params.Set("symbols", ticker)
+	params.Set("timeframe", "5Min")
+	params.Set("start", pmStart.UTC().Format(time.RFC3339))
+	params.Set("end", pmEnd.UTC().Format(time.RFC3339))
+	params.Set("feed", "sip")
+	params.Set("sort", "asc")
+	params.Set("limit", "200")
+
+	reqURL := fmt.Sprintf("%s/v2/stocks/bars?%s", c.dataURL, params.Encode())
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return snap, err
+	}
+	req.Header.Set("APCA-API-KEY-ID", c.apiKey)
+	req.Header.Set("APCA-API-SECRET-KEY", c.secretKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return snap, fmt.Errorf("alpaca premarket %s: %w", ticker, err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return snap, fmt.Errorf("alpaca premarket %s HTTP %d: %s", ticker, resp.StatusCode, truncateBody(body, 100))
+	}
+
+	var parsed alpacaBarsResp
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return snap, fmt.Errorf("alpaca premarket decode %s: %w", ticker, err)
+	}
+
+	bars := parsed.Bars[ticker]
+	if len(bars) == 0 {
+		return snap, nil // no pre-market activity — not an error
+	}
+
+	snap.High = bars[0].High
+	snap.Low = bars[0].Low
+	for _, b := range bars {
+		if b.High > snap.High {
+			snap.High = b.High
+		}
+		if b.Low < snap.Low {
+			snap.Low = b.Low
+		}
+		snap.Volume += int64(b.Volume)
+	}
+	snap.Close = bars[len(bars)-1].Close
+
+	if priorClose > 0 {
+		snap.GapPct = (snap.Close - priorClose) / priorClose * 100.0
+	}
+	switch {
+	case snap.GapPct > 0.5:
+		snap.GapDir = "up"
+	case snap.GapPct < -0.5:
+		snap.GapDir = "down"
+	default:
+		snap.GapDir = "flat"
+	}
+	return snap, nil
+}
+
+// Opening5MinBar is a single 5-minute bar from the regular session open.
+type Opening5MinBar struct {
+	Time   string  `json:"time"`   // "09:30", "09:35", "09:40"
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Volume int64   `json:"volume"`
+}
+
+// FetchOpening5MinBars fetches the first nBars 5-minute candles of the regular
+// session (starting 9:30 AM ET) for multiple tickers in one API call.
+// Returns a map of ticker → []Opening5MinBar (up to nBars entries).
+func (c *AlpacaClient) FetchOpening5MinBars(tickers []string, date time.Time, nBars int) (map[string][]Opening5MinBar, error) {
+	result := make(map[string][]Opening5MinBar)
+	if len(tickers) == 0 {
+		return result, nil
+	}
+
+	et, _ := time.LoadLocation("America/New_York")
+	start := time.Date(date.Year(), date.Month(), date.Day(), 9, 30, 0, 0, et)
+	end := start.Add(time.Duration(nBars)*5*time.Minute + time.Minute) // +1 min buffer
+
+	params := url.Values{}
+	params.Set("symbols", strings.Join(tickers, ","))
+	params.Set("timeframe", "5Min")
+	params.Set("start", start.UTC().Format(time.RFC3339))
+	params.Set("end", end.UTC().Format(time.RFC3339))
+	params.Set("feed", "sip")
+	params.Set("sort", "asc")
+	params.Set("limit", "1000")
+
+	reqURL := fmt.Sprintf("%s/v2/stocks/bars?%s", c.dataURL, params.Encode())
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return result, err
+	}
+	req.Header.Set("APCA-API-KEY-ID", c.apiKey)
+	req.Header.Set("APCA-API-SECRET-KEY", c.secretKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return result, fmt.Errorf("alpaca opening bars: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return result, fmt.Errorf("alpaca opening bars HTTP %d: %s", resp.StatusCode, truncateBody(body, 100))
+	}
+
+	var parsed alpacaBarsResp
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return result, fmt.Errorf("alpaca opening bars decode: %w", err)
+	}
+
+	for ticker, bars := range parsed.Bars {
+		var out []Opening5MinBar
+		for i, b := range bars {
+			if i >= nBars {
+				break
+			}
+			// Parse bar time for display label
+			t, _ := time.Parse(time.RFC3339, b.Time)
+			label := t.In(et).Format("15:04")
+			out = append(out, Opening5MinBar{
+				Time:   label,
+				Open:   b.Open,
+				High:   b.High,
+				Low:    b.Low,
+				Close:  b.Close,
+				Volume: int64(b.Volume),
+			})
+		}
+		if len(out) > 0 {
+			result[ticker] = out
+		}
+	}
+	return result, nil
+}
+
+// ChainPCRatio holds a put/call volume ratio computed from an option chain.
+// We use OptionVolume as the proxy because the Alpaca indicative feed does not
+// provide open interest.
+type ChainPCRatio struct {
+	CallVol int
+	PutVol  int
+	PCRatio float64 // PutVol / CallVol; 0 if no call volume
+	Bias    string  // "put_heavy" | "call_heavy" | "balanced"
+}
+
+// ComputeChainPCRatio derives put/call volume ratio from a pre-filtered chain.
+// Use for both market-wide (SPY chain) and per-ticker signals.
+func ComputeChainPCRatio(contracts []OptionContract) ChainPCRatio {
+	var callVol, putVol int
+	for _, c := range contracts {
+		switch c.Type {
+		case "call":
+			callVol += c.OptionVolume
+		case "put":
+			putVol += c.OptionVolume
+		}
+	}
+	r := ChainPCRatio{CallVol: callVol, PutVol: putVol, Bias: "balanced"}
+	if callVol > 0 {
+		r.PCRatio = float64(putVol) / float64(callVol)
+	}
+	switch {
+	case r.PCRatio >= 1.2:
+		r.Bias = "put_heavy"
+	case r.PCRatio <= 0.6 && callVol > 0:
+		r.Bias = "call_heavy"
+	}
+	return r
+}
+
 // FetchIntradayBars fetches 1-minute bars for each ticker in the window
 // [openTime, openTime+windowMinutes). openTime should be the market open
 // timestamp in the local timezone (e.g. 6:30 AM PT on the trade date).
@@ -456,7 +660,7 @@ func (c *AlpacaClient) fetchIntradayBatch(tickers []string, start, end time.Time
 		params.Set("start", start.UTC().Format(time.RFC3339))
 		params.Set("end", end.UTC().Format(time.RFC3339))
 		params.Set("limit", "1000") // 10 bars × 40 tickers = 400 max; 1000 is safe
-		params.Set("feed", "iex")
+		params.Set("feed", "sip")
 		params.Set("sort", "asc")
 		if pageToken != "" {
 			params.Set("page_token", pageToken)

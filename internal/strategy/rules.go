@@ -98,6 +98,7 @@ type OptionLifecycleConfig struct {
 // These are NOT overridable by Claude. Claude can only approve hold_overnight.
 type MechanicalExitsConfig struct {
 	Enabled                         bool    `yaml:"enabled"`
+	MinHoldDays                     int     `yaml:"min_hold_days"`                        // never exit (EOD or mechanical) before this many days held
 	PremiumStopLossPct              float64 `yaml:"premium_stop_loss_pct"`                // exit if premium down this % from entry
 	PremiumTakeProfitPct            float64 `yaml:"premium_take_profit_pct"`              // exit if premium up this % from entry
 	PremiumTrailingStartPct         float64 `yaml:"premium_trailing_start_pct"`           // activate trail once premium up this %
@@ -716,8 +717,8 @@ func DefaultRules() *Rules {
 		},
 		Risk: RiskConfig{
 			OptionLifecycle: OptionLifecycleConfig{
-				DTEMin: 14, DTEMax: 21, TargetDTE: 17,
-				AvoidDTEBelow: 7, ContractsPerTrade: 1,
+				DTEMin: 7, DTEMax: 21, TargetDTE: 14,
+				AvoidDTEBelow: 4, ContractsPerTrade: 1,
 			},
 			IVFilter: IVFilterConfig{
 				Enabled:              true,
@@ -734,12 +735,13 @@ func DefaultRules() *Rules {
 			},
 			MechanicalExits: MechanicalExitsConfig{
 				Enabled:                         true,
+				MinHoldDays:                     2,
 				PremiumStopLossPct:              30,
 				PremiumTakeProfitPct:            50,
-				PremiumTrailingStartPct:         35,
-				PremiumTrailingGivebackPct:      20,
+				PremiumTrailingStartPct:         10,
+				PremiumTrailingGivebackPct:      15,
 				ForceEODExitUnlessHoldConfirmed: true,
-				MaxHoldDaysWithoutReconfirm:     3,
+				MaxHoldDaysWithoutReconfirm:     5,
 			},
 		},
 	}

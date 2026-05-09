@@ -6,11 +6,26 @@ cd "$PROJECT_DIR"
 
 echo "Stopping MakeMyTrade..."
 
-[ -f logs/server.pid ]     && kill "$(cat logs/server.pid)"     2>/dev/null && echo "[✓] Server stopped"
-[ -f logs/worker.pid ]     && kill "$(cat logs/worker.pid)"     2>/dev/null && echo "[✓] Worker stopped"
-[ -f logs/caffeinate.pid ] && kill "$(cat logs/caffeinate.pid)" 2>/dev/null && echo "[✓] Sleep prevention stopped"
+stop_pid() {
+    local name="$1"
+    local pidfile="$2"
+    if [ -f "$pidfile" ]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if kill "$pid" 2>/dev/null; then
+            echo "[✓] $name stopped (PID $pid)"
+        else
+            echo "[~] $name was already stopped"
+        fi
+        rm -f "$pidfile"
+    fi
+}
 
-rm -f logs/server.pid logs/worker.pid logs/caffeinate.pid
+stop_pid "Server"           logs/server.pid
+stop_pid "Worker"           logs/worker.pid
+stop_pid "Sleep prevention" logs/caffeinate.pid
 
-echo "Done. Docker services still running (data preserved)."
-echo "To also stop Docker: docker compose down"
+echo ""
+echo "Docker services still running (data preserved)."
+echo "To also stop Docker:  docker compose down"
+echo ""

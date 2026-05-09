@@ -42,8 +42,8 @@ type Candidate struct {
 	GateMomentum   bool `json:"gate_momentum"`
 	GateVolume     bool `json:"gate_volume"`
 	GateVIX        bool `json:"gate_vix"`
-	GateBTC        bool `json:"gate_btc"`
-	GateRSI        bool `json:"gate_rsi"`
+	GateRelativeStrength bool `json:"gate_relative_strength"`
+	GateRSI              bool `json:"gate_rsi"` // unused; column retained for schema compat
 	AllGatesPassed bool `json:"all_gates_passed"`
 
 	ClosePrice  float64 `json:"close_price"`
@@ -88,13 +88,13 @@ type Candidate struct {
 type UpsertCandidateInput struct {
 	TradeDate    time.Time
 	Ticker       string
-	GateTrend    bool
-	GateMomentum bool
-	GateVolume   bool
-	GateVIX      bool
-	GateBTC      bool
-	GateRSI      bool
-	AllGates     bool
+	GateTrend            bool
+	GateMomentum         bool
+	GateVolume           bool
+	GateVIX              bool
+	GateRelativeStrength bool
+	GateRSI              bool
+	AllGates             bool
 
 	ClosePrice  float64
 	EMA20       float64
@@ -136,7 +136,7 @@ func UpsertCandidate(ctx context.Context, pool *pgxpool.Pool, in UpsertCandidate
 	q := `
 INSERT INTO trade_candidates (
     trade_date, ticker,
-    gate_trend, gate_momentum, gate_volume, gate_vix, gate_btc, gate_rsi, all_gates_passed,
+    gate_trend, gate_momentum, gate_volume, gate_vix, gate_relative_strength, gate_rsi, all_gates_passed,
     close_price, ema20, ema100, rsi14, macd_hist, volume_ratio, vix_level, btc_roc20,
     pattern_name, pattern_score, anti_patterns, rejected_by_anti,
     entry_low, entry_high, stop_loss, target1, target2, rr_ratio,
@@ -149,7 +149,7 @@ INSERT INTO trade_candidates (
     $32,$33,$34,$35
 )
 ON CONFLICT (trade_date, ticker) DO UPDATE SET
-    gate_trend=$3, gate_momentum=$4, gate_volume=$5, gate_vix=$6, gate_btc=$7, gate_rsi=$8,
+    gate_trend=$3, gate_momentum=$4, gate_volume=$5, gate_vix=$6, gate_relative_strength=$7, gate_rsi=$8,
     all_gates_passed=$9,
     close_price=$10, ema20=$11, ema100=$12, rsi14=$13, macd_hist=$14,
     volume_ratio=$15, vix_level=$16, btc_roc20=$17,
@@ -157,7 +157,7 @@ ON CONFLICT (trade_date, ticker) DO UPDATE SET
     entry_low=$22, entry_high=$23, stop_loss=$24, target1=$25, target2=$26, rr_ratio=$27,
     hold_days_min=$28, hold_days_base=$29, hold_days_max=$30,
     reject_reason=$31,
-    candidate_status=CASE WHEN trade_candidates.candidate_status IN ('entry_ready','confirmed')
+    candidate_status=CASE WHEN trade_candidates.candidate_status IN ('entry_ready','confirmed','stock_signal_passed','option_blocked')
                           THEN trade_candidates.candidate_status ELSE $32 END,
     setup_family=$33, direction=$34, prev_day_volume=$35
 RETURNING id`
@@ -170,7 +170,7 @@ RETURNING id`
 	var id string
 	err := pool.QueryRow(ctx, q,
 		in.TradeDate, in.Ticker,
-		in.GateTrend, in.GateMomentum, in.GateVolume, in.GateVIX, in.GateBTC, in.GateRSI, in.AllGates,
+		in.GateTrend, in.GateMomentum, in.GateVolume, in.GateVIX, in.GateRelativeStrength, in.GateRSI, in.AllGates,
 		in.ClosePrice, in.EMA20, in.EMA100, in.RSI14, in.MACDHist, in.VolumeRatio, in.VIXLevel, in.BTCROC20,
 		in.PatternName, in.PatternScore, antiPatterns, in.RejectedByAnti,
 		in.EntryLow, in.EntryHigh, in.StopLoss, in.Target1, in.Target2, in.RRRatio,
@@ -195,7 +195,7 @@ func UpdateCandidateClaudeReview(ctx context.Context, pool *pgxpool.Pool, id, ac
 func GetCandidatesForDate(ctx context.Context, pool *pgxpool.Pool, date time.Time) ([]Candidate, error) {
 	rows, err := pool.Query(ctx, `
 SELECT id, trade_date, ticker, created_at,
-       gate_trend, gate_momentum, gate_volume, gate_vix, gate_btc, gate_rsi, all_gates_passed,
+       gate_trend, gate_momentum, gate_volume, gate_vix, gate_relative_strength, gate_rsi, all_gates_passed,
        COALESCE(close_price,0), COALESCE(ema20,0), COALESCE(ema100,0), COALESCE(rsi14,0),
        COALESCE(macd_hist,0), COALESCE(volume_ratio,0), COALESCE(vix_level,0), COALESCE(btc_roc20,0),
        COALESCE(pattern_name,''), COALESCE(pattern_score,0), COALESCE(anti_patterns,'{}'), rejected_by_anti,
@@ -222,7 +222,7 @@ ORDER BY all_gates_passed DESC, COALESCE(claude_confidence,0) DESC`,
 		var tradeDate time.Time
 		err := rows.Scan(
 			&c.ID, &tradeDate, &c.Ticker, &c.CreatedAt,
-			&c.GateTrend, &c.GateMomentum, &c.GateVolume, &c.GateVIX, &c.GateBTC, &c.GateRSI, &c.AllGatesPassed,
+			&c.GateTrend, &c.GateMomentum, &c.GateVolume, &c.GateVIX, &c.GateRelativeStrength, &c.GateRSI, &c.AllGatesPassed,
 			&c.ClosePrice, &c.EMA20, &c.EMA100, &c.RSI14,
 			&c.MACDHist, &c.VolumeRatio, &c.VIXLevel, &c.BTCROC20,
 			&c.PatternName, &c.PatternScore, &c.AntiPatterns, &c.RejectedByAnti,
@@ -257,7 +257,7 @@ func UpdateCandidateStatus(ctx context.Context, pool *pgxpool.Pool, id, status s
 func GetEntryReadyCandidates(ctx context.Context, pool *pgxpool.Pool, date time.Time) ([]Candidate, error) {
 	rows, err := pool.Query(ctx, `
 SELECT id, trade_date, ticker, created_at,
-       gate_trend, gate_momentum, gate_volume, gate_vix, gate_btc, gate_rsi, all_gates_passed,
+       gate_trend, gate_momentum, gate_volume, gate_vix, gate_relative_strength, gate_rsi, all_gates_passed,
        COALESCE(close_price,0), COALESCE(ema20,0), COALESCE(ema100,0), COALESCE(rsi14,0),
        COALESCE(macd_hist,0), COALESCE(volume_ratio,0), COALESCE(vix_level,0), COALESCE(btc_roc20,0),
        COALESCE(pattern_name,''), COALESCE(pattern_score,0), COALESCE(anti_patterns,'{}'), rejected_by_anti,
@@ -284,7 +284,7 @@ ORDER BY COALESCE(claude_confidence,0) DESC`,
 		var tradeDate time.Time
 		err := rows.Scan(
 			&c.ID, &tradeDate, &c.Ticker, &c.CreatedAt,
-			&c.GateTrend, &c.GateMomentum, &c.GateVolume, &c.GateVIX, &c.GateBTC, &c.GateRSI, &c.AllGatesPassed,
+			&c.GateTrend, &c.GateMomentum, &c.GateVolume, &c.GateVIX, &c.GateRelativeStrength, &c.GateRSI, &c.AllGatesPassed,
 			&c.ClosePrice, &c.EMA20, &c.EMA100, &c.RSI14,
 			&c.MACDHist, &c.VolumeRatio, &c.VIXLevel, &c.BTCROC20,
 			&c.PatternName, &c.PatternScore, &c.AntiPatterns, &c.RejectedByAnti,
@@ -312,7 +312,7 @@ ORDER BY COALESCE(claude_confidence,0) DESC`,
 func GetExhaustionReversalStructuralCandidates(ctx context.Context, pool *pgxpool.Pool, date time.Time) ([]Candidate, error) {
 	rows, err := pool.Query(ctx, `
 SELECT id, trade_date, ticker, created_at,
-       gate_trend, gate_momentum, gate_volume, gate_vix, gate_btc, gate_rsi, all_gates_passed,
+       gate_trend, gate_momentum, gate_volume, gate_vix, gate_relative_strength, gate_rsi, all_gates_passed,
        COALESCE(close_price,0), COALESCE(ema20,0), COALESCE(ema100,0), COALESCE(rsi14,0),
        COALESCE(macd_hist,0), COALESCE(volume_ratio,0), COALESCE(vix_level,0), COALESCE(btc_roc20,0),
        COALESCE(pattern_name,''), COALESCE(pattern_score,0), COALESCE(anti_patterns,'{}'), rejected_by_anti,
@@ -339,7 +339,7 @@ ORDER BY COALESCE(claude_confidence,0) DESC`,
 		var tradeDate time.Time
 		err := rows.Scan(
 			&c.ID, &tradeDate, &c.Ticker, &c.CreatedAt,
-			&c.GateTrend, &c.GateMomentum, &c.GateVolume, &c.GateVIX, &c.GateBTC, &c.GateRSI, &c.AllGatesPassed,
+			&c.GateTrend, &c.GateMomentum, &c.GateVolume, &c.GateVIX, &c.GateRelativeStrength, &c.GateRSI, &c.AllGatesPassed,
 			&c.ClosePrice, &c.EMA20, &c.EMA100, &c.RSI14,
 			&c.MACDHist, &c.VolumeRatio, &c.VIXLevel, &c.BTCROC20,
 			&c.PatternName, &c.PatternScore, &c.AntiPatterns, &c.RejectedByAnti,

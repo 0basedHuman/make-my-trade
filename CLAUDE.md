@@ -54,9 +54,6 @@ If strategy behavior changes, update YAML first.
 When resuming work:
 - read `docs/current_refactor_status.md`
 
-When working on architecture or migration:
-- read `docs/refactor_to_options_engine.md`
-
 When working on weekly review, paper-trade performance analysis, or tuning proposals:
 - read `docs/weekly_review_protocol.md`
 
@@ -272,3 +269,106 @@ This phase is done only when:
 - new trades for already-open tickers are suppressed
 - weekly review summary is generated
 - one month of autonomous paper trading is operational
+
+---
+
+## RSVE-O Strategy Summary
+
+RSVE-O (Relative Strength Volatility Expansion — Options) is the **sole gate engine** as of 2026-05-06.
+13 binary gates per branch. **All must pass** or ticker is rejected. Score (0-100) ranks survivors only — never a gate.
+
+### Bullish branch gates (in order)
+```
+1.  vix_regime          VIX < 24
+2.  market_uptrend      SPY close > SPY EMA50
+3.  no_earnings         earnings > 5 days away
+4.  relative_strength   20d RS > +2% vs SPY
+5.  ema_structure       EMA20 > EMA50
+6.  close_above_ema20   close > EMA20
+7.  volume_expansion    RVOL >= 1.2x
+8.  vol_squeeze         BB width percentile <= 30% (63d range)
+9.  breakout_trigger    close > highest high (prior 20 bars)
+10. rsi_range           RSI 40-78
+11. iv_rank_ok          IV rank < 70   (skip if -1)
+12. spread_quality      spread < 10%   (skip if -1)
+13. oi_minimum          OI >= 100      (skip if -1)
+```
+
+Bearish branch mirrors with: `market_downtrend`, `relative_weakness`, `close_below_ema20`, `breakdown_trigger`.
+
+Source of truth: `strategy_rules.yaml` → `rsve:` block
+Implementation: `internal/strategy/rsve.go`
+Tests: `internal/strategy/rsve_test.go`
+
+### Gate-to-DB column mapping (legacy boolean columns)
+| RSVE gate | DB column |
+|-----------|-----------|
+| vix_regime | GateVIX |
+| market_uptrend / market_downtrend | GateTrend |
+| volume_expansion | GateVolume |
+| vol_squeeze | GateMomentum |
+| rsi_range | GateRSI |
+| relative_strength / relative_weakness | GateBTC |
+
+---
+
+## Daily Workflow Timeline
+
+```
+06:25 PT  DailyResearchCycle         RSVE gates all tickers → entry_ready or rejected
+06:42 PT  OpeningConfirmationCycle   deterministic signals ≥ 3/5 → confirmed; else → watch_only
+07:15 PT  FirstPositionReviewCycle   Claude reviews open positions: HOLD/TIGHTEN/EXIT
+07:45 PT  ContinuationReviewCycle    fresh intraday bars, position tighten/exit
+every 10m MechanicalRiskCycle        stop 0.70x, TP 1.50x, trailing 1.35x/0.80x, EOD exit 12:45
+12:45 PT  DailyPositionReview        Claude EOD hold approval or force exit
+Sun 07:00 WeeklyReviewCycle          performance summary + tuning proposals (NOT auto-applied)
+```
+
+Confirmation type logged: `rsve_deterministic` (Claude removed from confirmation path 2026-05-06).
+
+---
+
+## Infrastructure Component Status
+
+| Component | Status | File / Notes |
+|-----------|--------|--------------|
+| Temporal worker | ✅ | `cmd/worker/main.go` |
+| API server | ✅ | `cmd/server/main.go` |
+| PostgreSQL + TimescaleDB | ✅ | Docker; migrations in `migrations/` |
+| Redis | ✅ | Docker |
+| Alpaca market data | ✅ | `internal/market/alpaca.go` |
+| RSVE gate engine | ✅ | `internal/strategy/rsve.go` |
+| Daily analysis pipeline | ✅ | `activities.go` → `RunDailyAnalysisActivity` |
+| Opening confirmation | ✅ deterministic | Claude removed 2026-05-06 |
+| Mechanical exits | ✅ | `MechanicalRiskCycle` every 10 min |
+| Position review (daily) | ✅ Claude | `RunDailyPositionReviewActivity` |
+| Weekly review command | ⬜ not yet | `cmd/weeklyreview/` — not written |
+| Backtest | ✅ RSVE-based | `cmd/backtest/main.go` |
+
+---
+
+## Context Management
+
+### Files to read on every session start (in order)
+1. `CLAUDE.md` — this file (boundaries, rules, strategy summary)
+2. `docs/checkpoint.md` — what was in progress at last compaction or save
+3. `docs/history.md` — full session history table; see what was built and why
+4. `docs/current_refactor_status.md` — latest completed work and exact next step
+
+**Do not scan the repo broadly until you have read all four files above.**
+
+### checkpoint.md rules
+- Location: `docs/checkpoint.md`
+- **On each new session start:** overwrite with a clean snapshot of current state before doing any work.
+- Contents: current task, files being changed, build status, exact next step, open questions.
+- **Auto-save at ~70% context:** proactively update `docs/checkpoint.md` mid-session without being asked.
+- **At 95% token exhaustion (hourly or weekly limit):** APPEND to `docs/checkpoint.md` — do NOT overwrite.
+  Use a `---` separator with a timestamp so previous checkpoint is preserved as fallback.
+  This captures the last known-good progress before tokens run out.
+
+### history.md rules
+- Location: `docs/history.md`
+- **At end of each session:** APPEND a new row to the table — never overwrite existing rows.
+- Compress "User Prompt" to ≤15 words. Keep "Claude Achieved" factual and ≤20 words.
+- This is the project's institutional memory. Read it when you need to understand why something was built.
+- Do not summarize or reformat old rows — only add new ones.

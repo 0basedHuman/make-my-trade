@@ -353,13 +353,15 @@ func (e *Engine) Analyze(
 		a.ReasonCodes = appendUniq(a.ReasonCodes, "anti_pattern_detected")
 	}
 
-	// ── LAYER 4: Score all 5 families ────────────────────────────────────────
+	// ── LAYER 4: Score all 4 families ────────────────────────────────────────
+	// bearish_exhaustion_reversal removed: backtest showed 42% win rate and
+	// -0.7% expectancy across 845 signals. The family fires on overextended
+	// names during rallies and loses consistently in bull-market regimes.
 	familyOrder := []string{
 		"bullish_continuation",
 		"bullish_momentum_breakout",
 		"bearish_continuation",
 		"bearish_momentum_breakdown",
-		"bearish_exhaustion_reversal",
 	}
 
 	var allScores []FamilyScore
@@ -1270,13 +1272,14 @@ func (e *Engine) fillTargets(a *SymbolAnalysis, bars []indicators.Bar, family st
 		}
 	}
 
-	// Prefer nearest structural level over ATR if available
+	// Use structural level only if it extends the target further than ATR already computed.
+	// Never shrink the ATR target with a nearby resistance — that was killing R/R.
 	if isBull {
-		if nr := indicators.NearestResistance(bars, a.ClosePrice, 30); nr > 0 {
+		if nr := indicators.NearestResistance(bars, a.ClosePrice, 30); nr > base {
 			base = nr
 		}
 	} else {
-		if ns := indicators.NearestSupport(bars, a.ClosePrice, 30); ns > 0 {
+		if ns := indicators.NearestSupport(bars, a.ClosePrice, 30); ns > 0 && ns < base {
 			base = ns
 		}
 	}

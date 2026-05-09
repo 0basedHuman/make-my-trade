@@ -13,11 +13,9 @@
 // AUTONOMOUS TRADING DAY (America/Los_Angeles):
 //
 //   06:25  DailyResearchCycle         — overnight scan, classify candidates
-//   06:42  OpeningConfirmationCycle   — first 10-min candle, Claude entry
-//   07:15  FirstPositionReviewCycle   — early risk management
-//   07:45  ContinuationReviewCycle    — fresh intraday bars, continuation / tighten
-//   12:45  DailyPositionReview        — end-of-day: hold overnight vs exit
-//   Sunday 07:00  WeeklyReviewCycle   — performance review + tuning proposals
+//   06:42  OpeningConfirmationCycle   — first 10-min candle, deterministic confirmation
+//   every 10m MechanicalRiskCycle    — stop/TP/trail/time-stop checks
+//   12:45  DailyPositionReview        — end-of-day: log overnight holds
 //
 // WHAT BREAKS: If the task queue name in the workflow schedule doesn't match
 //              TaskQueue in cmd/worker/main.go, the workflow never executes.
@@ -110,31 +108,6 @@ func OpeningConfirmationCycle(ctx workflow.Context) error {
 	return nil
 }
 
-// WeeklyReviewCycle runs once per week (Sunday morning) to generate the
-// weekly paper-trade performance review and strategy tuning proposals.
-func WeeklyReviewCycle(ctx workflow.Context) error {
-	logger := workflow.GetLogger(ctx)
-	logger.Info("WeeklyReviewCycle: starting")
-
-	ao := workflow.ActivityOptions{
-		StartToCloseTimeout: 15 * time.Minute,
-		RetryPolicy: &temporal.RetryPolicy{
-			MaximumAttempts: 2,
-			InitialInterval: 60 * time.Second,
-		},
-	}
-	ctx = workflow.WithActivityOptions(ctx, ao)
-
-	var result string
-	if err := workflow.ExecuteActivity(ctx, "RunWeeklyReviewActivity").Get(ctx, &result); err != nil {
-		logger.Error("WeeklyReviewCycle: failed", "error", err)
-		return err
-	}
-
-	logger.Info("WeeklyReviewCycle: complete", "result", result)
-	return nil
-}
-
 // FirstPositionReviewCycle runs at 7:15 AM PT for early risk management.
 // Reviews open positions using current option mid-prices. Applies HOLD/EXIT
 // decisions before the first hour of trading is complete.
@@ -189,8 +162,8 @@ func ContinuationReviewCycle(ctx workflow.Context) error {
 }
 
 // DailyPositionReview runs at 12:45 PM PT (before close) for end-of-day decisions.
-// Uses RunEODPositionReviewActivity: mechanical checks first, then Claude hold approval,
-// then force-exits anything without hold approval.
+// Uses RunEODPositionReviewActivity: mechanical checks first, then logs overnight holds.
+// 21-45 DTE swings hold overnight by default — no forced exits.
 func DailyPositionReview(ctx workflow.Context) error {
 	logger := workflow.GetLogger(ctx)
 	logger.Info("DailyPositionReview: starting")

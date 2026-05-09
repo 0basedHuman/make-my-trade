@@ -102,7 +102,23 @@ func (c *AlpacaClient) FetchDailyBars(tickers []string, startDate, endDate time.
 	return result, nil
 }
 
+// fetchBatch fetches daily bars for a batch of tickers.
+// Tries SIP first (accurate consolidated tape volume). If the free-tier
+// subscription error fires for recent data, retries with IEX automatically.
+// Historical SIP data (any date before today) is always free on Alpaca.
 func (c *AlpacaClient) fetchBatch(tickers []string, start, end time.Time, limit int) (map[string][]indicators.Bar, error) {
+	result, err := c.fetchBatchWithFeed(tickers, start, end, limit, "sip")
+	if err != nil && strings.Contains(err.Error(), "subscription does not permit querying recent SIP data") {
+		// SIP blocked for today's data — fall back to IEX.
+		// Volume will be ~0.1% of real market volume for today's bar only;
+		// all prior bars were already fetched via SIP with accurate volume.
+		fmt.Printf("alpaca: SIP unavailable for recent date, retrying with IEX feed\n")
+		result, err = c.fetchBatchWithFeed(tickers, start, end, limit, "iex")
+	}
+	return result, err
+}
+
+func (c *AlpacaClient) fetchBatchWithFeed(tickers []string, start, end time.Time, limit int, feed string) (map[string][]indicators.Bar, error) {
 	result := make(map[string][]indicators.Bar)
 	pageToken := ""
 
@@ -113,7 +129,7 @@ func (c *AlpacaClient) fetchBatch(tickers []string, start, end time.Time, limit 
 		params.Set("start", start.Format("2006-01-02"))
 		params.Set("end", end.Format("2006-01-02"))
 		params.Set("limit", fmt.Sprintf("%d", limit))
-		params.Set("feed", "sip")
+		params.Set("feed", feed)
 		params.Set("sort", "asc")
 		if pageToken != "" {
 			params.Set("page_token", pageToken)
@@ -160,8 +176,6 @@ func (c *AlpacaClient) fetchBatch(tickers []string, start, end time.Time, limit 
 		}
 		pageToken = *parsed.NextPageToken
 	}
-
-	// Bars come sorted asc from Alpaca (sort=asc param). No re-sort needed.
 
 	return result, nil
 }
@@ -522,7 +536,7 @@ func (c *AlpacaClient) FetchOpening5MinBars(tickers []string, date time.Time, nB
 	params.Set("timeframe", "5Min")
 	params.Set("start", start.UTC().Format(time.RFC3339))
 	params.Set("end", end.UTC().Format(time.RFC3339))
-	params.Set("feed", "sip")
+	params.Set("feed", "iex") // real-time intraday; SIP requires paid subscription
 	params.Set("sort", "asc")
 	params.Set("limit", "1000")
 
@@ -660,7 +674,7 @@ func (c *AlpacaClient) fetchIntradayBatch(tickers []string, start, end time.Time
 		params.Set("start", start.UTC().Format(time.RFC3339))
 		params.Set("end", end.UTC().Format(time.RFC3339))
 		params.Set("limit", "1000") // 10 bars × 40 tickers = 400 max; 1000 is safe
-		params.Set("feed", "sip")
+		params.Set("feed", "iex")  // intraday is real-time; IEX is the free tier option
 		params.Set("sort", "asc")
 		if pageToken != "" {
 			params.Set("page_token", pageToken)

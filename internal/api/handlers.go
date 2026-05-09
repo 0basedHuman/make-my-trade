@@ -86,6 +86,15 @@ type GateDetail struct {
 	Value  float64 `json:"value"`
 }
 
+// RSVEGateDiagnostic is one gate from the 13-gate RSVE binary evaluator.
+type RSVEGateDiagnostic struct {
+	Name        string `json:"name"`
+	Passed      bool   `json:"passed"`
+	Blocking    bool   `json:"blocking,omitempty"`
+	ActualValue string `json:"actual_value,omitempty"`
+	Threshold   string `json:"threshold,omitempty"`
+}
+
 // CandidateResponse is a per-symbol result row in the API response.
 // It combines preprocessing indicators with Claude's options decision.
 type CandidateResponse struct {
@@ -129,7 +138,7 @@ type CandidateResponse struct {
 	ScreenReason   string   `json:"screen_reason,omitempty"`
 	WhatIsMissing  string   `json:"what_is_missing,omitempty"` // human-readable for structural/blocked cards
 
-	// Gate details for UI display
+	// Gate details for UI display (mapped from RSVE gates for backward compat)
 	Gates struct {
 		Trend    GateDetail `json:"trend"`
 		Momentum GateDetail `json:"momentum"`
@@ -138,6 +147,12 @@ type CandidateResponse struct {
 		BTC      GateDetail `json:"btc"`
 		RSI      GateDetail `json:"rsi"`
 	} `json:"gates"`
+
+	// Full 13-gate RSVE diagnostics
+	RSVEDirection  string               `json:"rsve_direction,omitempty"`
+	RSVEScore      float64              `json:"rsve_score,omitempty"`
+	RSVERejectGate string               `json:"rsve_reject_gate,omitempty"`
+	RSVEGates      []RSVEGateDiagnostic `json:"rsve_gates,omitempty"`
 
 	// Option chain info
 	OptionCount int `json:"option_contracts_available"`
@@ -648,27 +663,20 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 	}
 	log.Printf("pipeline: VIX = %.1f (date: %s)", vixLevel, vixDate)
 
-	// ── Step 4: Fetch BTC 20-day ROC ─────────────────────────────────────────
-	btcROC := 0.0
-	btcBars, btcErr := h.alpaca.FetchCryptoDailyBars("BTC/USD", today.AddDate(0, -2, 0), 60)
-	if btcErr == nil && len(btcBars) >= 21 {
-		btcCloses := indicators.Closes(btcBars)
-		if roc, ok := indicators.ROCLast(btcCloses, 20); ok {
-			btcROC = roc
-		}
-	}
-	log.Printf("pipeline: BTC 20d ROC = %.2f%%", btcROC)
-
-	regime := strategy.Regime{VIX: vixLevel, BTCROC20: btcROC, VIXDate: vixDate}
+	btcROC := 0.0 // BTC regime block removed; retained for summary/logging compat
+	regime := strategy.Regime{VIX: vixLevel, BTCROC20: 0.0, VIXDate: vixDate}
 	regimeLabel := strategy.RegimeLabel(vixLevel, btcROC)
 
 	// ── Step 5: Fetch earnings calendar ──────────────────────────────────────
 	earningsEvents, _ := h.finnhub.FetchUpcomingEarnings(today, today.AddDate(0, 0, 7))
 
 	// ── Step 6: Prescreen symbols in parallel ────────────────────────────────
+	rsveConfig := h.rules.RSVE
+
 	type prescreenResult struct {
 		ticker           string
 		analysis         strategy.SymbolAnalysis
+		rsve             strategy.RSVEResult
 		candID           string
 		finnhubHeadlines []string
 	}
@@ -716,11 +724,49 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 
 			a := h.engine.Analyze(t, todayStr, b, regime, spyBars, earningsRisk, sentiment)
 
-			// Persist preprocessing result to DB
-			dir := "bullish"
-			if strings.Contains(strings.ToLower(a.SetupFamily), "bearish") {
-				dir = "bearish"
+			// RSVE gate evaluation — replaces 5-family gate decisions.
+			earningsDaysAway := -1
+			if earningsRisk {
+				earningsDaysAway = 0
 			}
+			rsveResult := strategy.EvaluateRSVE(strategy.RSVEInput{
+				Ticker:           t,
+				Date:             todayStr,
+				Bars:             b,
+				SPYBars:          spyBars,
+				VIX:              vixLevel,
+				EarningsDaysAway: earningsDaysAway,
+				IVRank:           -1,
+				BidAskSpreadPct:  -1,
+				OpenInterest:     -1,
+			}, rsveConfig)
+
+			dailyStatus := rsveResult.Status
+			if rsveResult.AllPass {
+				dailyStatus = "entry_ready"
+			}
+			a.Eligible = rsveResult.AllPass
+			a.CandidateStatus = dailyStatus
+			a.SetupFamily = "rsve_" + rsveResult.Direction
+			a.PatternScoreInt = int(rsveResult.Score)
+			a.PatternScore = rsveResult.Score
+
+			var gateTrend, gateMomentum, gateVolume, gateVIX, gateRS bool
+			for _, g := range rsveResult.Gates {
+				switch g.Name {
+				case "vix_regime":
+					gateVIX = g.Passed
+				case "market_uptrend", "market_downtrend":
+					gateTrend = g.Passed
+				case "volume_expansion":
+					gateVolume = g.Passed
+				case "vol_squeeze":
+					gateMomentum = g.Passed
+				case "relative_strength", "relative_weakness":
+					gateRS = g.Passed
+				}
+			}
+
 			var prevVol int64
 			if len(bars) > 0 {
 				prevVol = int64(bars[len(bars)-1].Volume)
@@ -729,13 +775,13 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 			candID, err := store.UpsertCandidate(ctx, h.pool, store.UpsertCandidateInput{
 				TradeDate:       today,
 				Ticker:          t,
-				GateTrend:       a.GateTrend.Passed,
-				GateMomentum:    a.GateMomentum.Passed,
-				GateVolume:      a.GateVolume.Passed,
-				GateVIX:         a.GateVIX.Passed,
-				GateBTC:         a.GateBTC.Passed,
-				GateRSI:         a.GateRSI.Passed,
-				AllGates:        a.Eligible, // eligible for options review
+				GateTrend:       gateTrend,
+				GateMomentum:    gateMomentum,
+				GateVolume:      gateVolume,
+				GateVIX:         gateVIX,
+				GateRelativeStrength: gateRS,
+				GateRSI:              false,
+				AllGates:        rsveResult.AllPass,
 				ClosePrice:      a.ClosePrice,
 				EMA20:           a.EMA20,
 				EMA100:          a.EMA100,
@@ -744,10 +790,10 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 				VolumeRatio:     a.VolumeRatio,
 				VIXLevel:        vixLevel,
 				BTCROC20:        btcROC,
-				PatternName:     a.PatternName,
-				PatternScore:    a.PatternScore,
-				AntiPatterns:    a.AntiPatterns,
-				RejectedByAnti:  a.RejectedByAnti,
+				PatternName:     "rsve_" + rsveResult.Direction,
+				PatternScore:    rsveResult.Score,
+				AntiPatterns:    nil,
+				RejectedByAnti:  false,
 				EntryLow:        a.EntryLow,
 				EntryHigh:       a.EntryHigh,
 				StopLoss:        a.StopLoss,
@@ -757,10 +803,10 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 				HoldDaysMin:     a.HoldDaysMin,
 				HoldDaysBase:    a.HoldDaysBase,
 				HoldDaysMax:     a.HoldDaysMax,
-				RejectReason:    a.ScreenReason,
-				CandidateStatus: a.CandidateStatus,
+				RejectReason:    rsveResult.RejectGate,
+				CandidateStatus: dailyStatus,
 				SetupFamily:     a.SetupFamily,
-				Direction:       dir,
+				Direction:       rsveResult.Direction,
 				PrevDayVolume:   prevVol,
 			})
 			if err != nil {
@@ -768,7 +814,7 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 			}
 
 			mu.Lock()
-			prescreened = append(prescreened, prescreenResult{ticker: t, analysis: a, candID: candID, finnhubHeadlines: finnhubHeadlines})
+			prescreened = append(prescreened, prescreenResult{ticker: t, analysis: a, rsve: rsveResult, candID: candID, finnhubHeadlines: finnhubHeadlines})
 			mu.Unlock()
 		}(ticker, bars)
 	}
@@ -804,12 +850,9 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 	}
 	log.Printf("pipeline: shortlisted %d of %d eligible for Claude", len(shortlisted), len(eligible))
 
-	// ── Step 6c: Extended signals for shortlisted tickers only ───────────────
-	// Runs sequentially after goroutines to avoid Finviz rate limits.
-	// Scoped to shortlisted tickers only (was all 26 — now ≤10).
+	// ── Step 6c: Premarket signals for shortlisted tickers ───────────────────
 	type tickerSig struct {
 		premarket market.PremarketSnapshot
-		finviz    market.FinvizSnapshot
 	}
 	sigMap := make(map[string]tickerSig)
 	for _, r := range prescreened {
@@ -824,11 +867,8 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 		sig := tickerSig{}
 		sig.premarket, _ = h.alpaca.FetchPremarketSnapshot(r.ticker, priorClose, today)
 		time.Sleep(100 * time.Millisecond)
-		sig.finviz, _ = market.FetchFinvizSnapshot(r.ticker)
-		time.Sleep(600 * time.Millisecond)
 		sigMap[r.ticker] = sig
 	}
-	log.Printf("pipeline: extended signals fetched for %d tickers", len(sigMap))
 
 	// ── Step 7: Fetch option chains for eligible symbols ─────────────────────
 	type chainResult struct {
@@ -876,7 +916,7 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 	if spyChainErr != nil {
 		log.Printf("pipeline: SPY chain P/C warning: %v", spyChainErr)
 	}
-	spyPC := market.ComputeChainPCRatio(spyContracts)
+	_ = market.ComputeChainPCRatio(spyContracts)
 
 	// ── Step 8b: Fetch first 3 opening 5-min candles for shortlisted tickers ────
 	// Available after 6:45 AM PT (9:45 AM ET). Before that returns empty map silently.
@@ -892,96 +932,8 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 		log.Printf("pipeline: opening 5-min bars fetched for %d/%d tickers", len(openingBarsMap), len(shortlistedList))
 	}
 
-	// ── Step 9: Build full candidate list for Claude (shortlisted only) ───────
-	lf := h.rules.OptionsTranslation.LiquidityFilters
-	scanTimePT := time.Now().In(loc).Format("15:04")
-	var fullCandidates []claudeclient.CandidateInput
-	for _, r := range prescreened {
-		if !shortlisted[r.ticker] {
-			continue
-		}
-		a := r.analysis
-		contracts := filterChainQuality(chains[r.ticker], lf)
-		optionsStatus := "options_not_allowed"
-		if len(contracts) > 0 {
-			optionsStatus = "options_ready"
-		}
-		// Limit to 5 best contracts — Claude needs liquidity/spread signal, not the full chain
-		if len(contracts) > 5 {
-			contracts = contracts[:5]
-		}
-		hwBase := a.HoldDaysBase
-		if hwBase == 0 {
-			hwBase = 10
-		}
-		sig := sigMap[r.ticker]
-		allHeadlines := append(sig.finviz.Headlines, r.finnhubHeadlines...)
-		if len(allHeadlines) > 6 {
-			allHeadlines = allHeadlines[:6]
-		}
-		fullCandidates = append(fullCandidates, claudeclient.CandidateInput{
-			Ticker:          r.ticker,
-			Price:           a.ClosePrice,
-			Daily20EMA:      a.EMA20,
-			Daily50EMA:      a.EMA50,
-			RSI14:           a.RSI14,
-			MACDHist:        a.MACDHist,
-			RelativeVolume:  a.VolumeRatio,
-			PremktHigh:      sig.premarket.High,
-			PremktLow:       sig.premarket.Low,
-			PriorDayHigh:    a.PriorDayHigh,
-			PriorDayLow:     a.PriorDayLow,
-			TrendBias:       a.TrendBias,
-			Sentiment:       a.Sentiment,
-			EarningsRisk:    a.EarningsRisk,
-			AntiPatterns:    a.AntiPatterns,
-			Options:         contracts,
-			SetupFamily:     a.SetupFamily,
-			PatternScore:    a.PatternScoreInt,
-			ReasonCodes:     a.ReasonCodes,
-			HoldWindowBase:  hwBase,
-			BaseTarget:      a.BaseTarget,
-			StretchTarget:   a.StretchTarget,
-			OptionsStatus:   optionsStatus,
-			PremarketGapPct: sig.premarket.GapPct,
-			PremarketGapDir: sig.premarket.GapDir,
-			PremarketVol:    sig.premarket.Volume,
-			ShortFloatPct:   sig.finviz.ShortFloatPct,
-			ShortRatioDays:  sig.finviz.ShortRatio,
-			ShortTrend:      "",
-			TickerPCRatio:   chainPC[r.ticker].PCRatio,
-			TickerPCBias:    chainPC[r.ticker].Bias,
-			NewsHeadlines:   allHeadlines,
-			// v4: first 3 5-min candles — populated after 6:45 AM PT, empty otherwise
-			Opening5MinBars:     openingBarsMap[r.ticker],
-			RelativeStrength20d: r.analysis.RelativeStrength,
-		})
-	}
-
-	// ── Step 10: Call Claude with full RuntimePayload ───────────────────────
-	systemPrompt := claudeclient.BuildSystemPrompt()
-	claudeCli := claudeclient.NewClient(
-		h.cfg.AnthropicAPIKey,
-		"claude-sonnet-4-6",
-		h.cfg.ClaudeMaxOutputTokens,
-		systemPrompt,
-	)
-	log.Printf("pipeline: calling Claude with %d candidates", len(fullCandidates))
-	decision, claudeErr := claudeCli.DecideOptions(claudeclient.RuntimePayload{
-		ScanTimePT: scanTimePT,
-		MarketContext: claudeclient.MarketContext{
-			VIX:           vixLevel,
-			BTCRoc20:      btcROC,
-			MacroNewsBias: "neutral",
-			EquityPCRatio: spyPC.PCRatio,
-			PCRatioBias:   spyPC.Bias,
-		},
-		OpenPositions: []claudeclient.PositionInput{},
-		Candidates:    fullCandidates,
-	})
-	if claudeErr != nil {
-		log.Printf("pipeline: Claude error: %v", claudeErr)
-	}
+	// Claude removed from analysis path — no API calls.
+	var decision claudeclient.OptionsDecision
 
 	// ── Step 11: Build decision lookup ───────────────────────────────────────
 	type miniDecision struct {
@@ -1015,7 +967,7 @@ func (h *Handler) runPipeline(ctx context.Context) (AnalysisResponse, error) {
 	var rejectedItems []CandidateResponse
 
 	for _, r := range prescreened {
-		cr := toCandidateResponse(r.analysis)
+		cr := toCandidateResponse(r.analysis, r.rsve)
 		cr.OptionCount = len(chains[r.ticker])
 
 		// blocked_by_event is ineligible for Claude but has its own UI section.
@@ -1225,7 +1177,7 @@ func filterChainQuality(contracts []market.OptionContract, lf strategy.Liquidity
 func candidateStatusLabel(status string) string {
 	switch status {
 	case "entry_ready":
-		return "WAITING FOR CLAUDE CONFIRMATION"
+		return "AWAITING OPENING CONFIRMATION"
 	case "confirmed":
 		return "PAPER POSITION OPEN"
 	case "structural_candidate":
@@ -1241,7 +1193,7 @@ func candidateStatusLabel(status string) string {
 	}
 }
 
-func toCandidateResponse(a strategy.SymbolAnalysis) CandidateResponse {
+func toCandidateResponse(a strategy.SymbolAnalysis, rsve strategy.RSVEResult) CandidateResponse {
 	cr := CandidateResponse{
 		Ticker:       a.Ticker,
 		Eligible:     a.Eligible,
@@ -1254,7 +1206,7 @@ func toCandidateResponse(a strategy.SymbolAnalysis) CandidateResponse {
 		VolumeRatio:  a.VolumeRatio,
 		PatternName:  a.PatternName,
 		AntiPatterns: a.AntiPatterns,
-		ScreenReason: a.ScreenReason,
+		ScreenReason: rsve.RejectGate,
 		// v2 fields
 		SetupFamily:    a.SetupFamily,
 		ReasonCodes:    a.ReasonCodes,
@@ -1262,13 +1214,41 @@ func toCandidateResponse(a strategy.SymbolAnalysis) CandidateResponse {
 		StretchTarget:  a.StretchTarget,
 		DecisionStatus: a.CandidateStatus,
 		StatusLabel:    candidateStatusLabel(a.CandidateStatus),
+		// RSVE diagnostics
+		RSVEDirection:  rsve.Direction,
+		RSVEScore:      rsve.Score,
+		RSVERejectGate: rsve.RejectGate,
 	}
-	cr.Gates.Trend = GateDetail{Passed: a.GateTrend.Passed, Reason: a.GateTrend.Reason, Value: a.GateTrend.Value}
-	cr.Gates.Momentum = GateDetail{Passed: a.GateMomentum.Passed, Reason: a.GateMomentum.Reason, Value: a.GateMomentum.Value}
-	cr.Gates.Volume = GateDetail{Passed: a.GateVolume.Passed, Reason: a.GateVolume.Reason, Value: a.GateVolume.Value}
-	cr.Gates.VIX = GateDetail{Passed: a.GateVIX.Passed, Reason: a.GateVIX.Reason, Value: a.GateVIX.Value}
-	cr.Gates.BTC = GateDetail{Passed: a.GateBTC.Passed, Reason: a.GateBTC.Reason, Value: a.GateBTC.Value}
-	cr.Gates.RSI = GateDetail{Passed: a.GateRSI.Passed, Reason: a.GateRSI.Reason, Value: a.GateRSI.Value}
+
+	// Map RSVE gates → legacy gate display (backward compat with UI)
+	for _, g := range rsve.Gates {
+		gd := GateDetail{Passed: g.Passed, Reason: g.ActualValue}
+		switch g.Name {
+		case "market_uptrend", "market_downtrend":
+			cr.Gates.Trend = gd
+		case "vol_squeeze":
+			cr.Gates.Momentum = gd
+		case "volume_expansion":
+			cr.Gates.Volume = gd
+		case "vix_regime":
+			cr.Gates.VIX = gd
+		case "relative_strength", "relative_weakness":
+			cr.Gates.BTC = gd
+		case "rsi_range":
+			cr.Gates.RSI = gd
+		}
+	}
+
+	// Full RSVE diagnostics for API consumers
+	for _, g := range rsve.Gates {
+		cr.RSVEGates = append(cr.RSVEGates, RSVEGateDiagnostic{
+			Name:        g.Name,
+			Passed:      g.Passed,
+			Blocking:    g.Blocking,
+			ActualValue: g.ActualValue,
+			Threshold:   g.Threshold,
+		})
+	}
 	return cr
 }
 
@@ -1536,15 +1516,17 @@ func buildAnalysisResponseFromDB(candidates []store.Candidate, summary *store.Da
 			ScreenReason: c.RejectReason,
 			// Populate family + targets from engine-computed DB columns so cards
 			// render correctly even for rows without a Claude decision.
-			SetupFamily:   c.SetupFamily,
-			BaseTarget:    c.Target1,
-			StretchTarget: c.Target2,
+			SetupFamily:    c.SetupFamily,
+			BaseTarget:     c.Target1,
+			StretchTarget:  c.Target2,
+			RSVEDirection:  c.Direction,
+			RSVERejectGate: c.RejectReason,
 		}
 		cr.Gates.Trend = GateDetail{Passed: c.GateTrend}
 		cr.Gates.Momentum = GateDetail{Passed: c.GateMomentum}
 		cr.Gates.Volume = GateDetail{Passed: c.GateVolume}
 		cr.Gates.VIX = GateDetail{Passed: c.GateVIX}
-		cr.Gates.BTC = GateDetail{Passed: c.GateBTC}
+		cr.Gates.BTC = GateDetail{Passed: c.GateRelativeStrength}
 		cr.Gates.RSI = GateDetail{Passed: c.GateRSI}
 
 		// Re-parse stored Claude decision JSON (eligible rows only).
@@ -1803,24 +1785,8 @@ func (h *Handler) RunPositionReview(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	vixLevel, _, _ := h.fred.FetchLatestVIX()
-	systemPrompt := claudeclient.BuildSystemPrompt()
-	claudeCli := claudeclient.NewClient(h.cfg.AnthropicAPIKey, "claude-sonnet-4-6", h.cfg.ClaudeMaxOutputTokens, systemPrompt)
-	payload := claudeclient.RuntimePayload{
-		ScanTimePT:    now.Format("15:04"),
-		MarketContext: claudeclient.MarketContext{VIX: vixLevel, MacroNewsBias: "neutral"},
-		OpenPositions: posInputs,
-		Candidates:    []claudeclient.CandidateInput{},
-	}
-	decision, claudeErr := claudeCli.DecideOptions(payload)
+	// Claude removed — all positions default to HOLD; mechanical exits handle hard cases.
 	reviewByTicker := make(map[string]claudeclient.PositionReview)
-	if claudeErr != nil {
-		log.Printf("position-review: Claude error: %v — defaulting to HOLD", claudeErr)
-	} else {
-		for _, rv := range decision.OpenPositionReview {
-			reviewByTicker[rv.Ticker] = rv
-		}
-	}
 
 	type reviewResult struct {
 		Ticker string  `json:"ticker"`

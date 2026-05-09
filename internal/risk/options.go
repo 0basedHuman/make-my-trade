@@ -2,38 +2,34 @@
 //
 // WHAT: Deterministic mechanical exit evaluator for paper option positions.
 //
-// WHY:  7–14 DTE options decay quickly. Relying solely on scheduled Claude
-//       review (07:15, 07:45, 12:45 PT) is too slow for hard stops and take
-//       profits. This package provides a pure function that evaluates every
-//       mechanical exit rule for a single position given its current premium.
-//
-//       Claude is the final authority for ENTRY and can APPROVE hold overnight.
-//       Claude CANNOT override mechanical stop, take-profit, or trailing exits.
+// WHY:  21-45 DTE options. All exits are mechanical — no Claude involvement.
+//       This package provides a pure function that evaluates every mechanical
+//       exit rule for a single position given its current premium.
 //
 // HOW:  EvaluateMechanicalExit is called by RunMechanicalRiskCheckActivity
 //       every 10 minutes during market hours. It never touches the database
 //       or network — it takes values and returns a decision.
 //
 // Exit rule hierarchy (evaluated in order; first match wins):
-//   1. PREMIUM_STOP_LOSS       — down ≥ stop_pct from entry
-//   2. PREMIUM_TAKE_PROFIT     — up ≥ take_profit_pct from entry
-//   3. PREMIUM_TRAILING_GIVEBACK — trail active AND gives back ≥ giveback_pct from peak
-//   4. EOD_EXIT_NO_HOLD_APPROVAL — near EOD, hold_overnight_approved=false
-//   5. no exit (position stays open)
+//   1. PREMIUM_STOP_LOSS         — down ≥ 25% from entry (entry×0.75)
+//   2. PREMIUM_TAKE_PROFIT       — up ≥ 70% from entry
+//   3. PREMIUM_TRAILING_GIVEBACK — trail active AND gives back ≥ 10% from peak
+//   4. TIME_STOP                 — days_held ≥ time_stop_days AND no trailing activated
+//   5. MAX_HOLD_DAYS             — days_held ≥ max_hold_days (hard time limit)
+//   6. STRUCTURE_INVALIDATION    — underlying closes below breakout level (bullish) or above breakdown level (bearish)
+//   7. no exit (position stays open; overnight hold is default for 21-45 DTE swings)
 //
-// Trailing state update (side-effect-free; caller persists these):
-//   - if currentPremium >= entryPremium * (1 + trailing_start_pct/100):
-//       TrailingActive = true
-//   - if currentPremium > previousPeak:
-//       NewPeakPremium = currentPremium
+// Trailing state:
+//   - arm trailing once premium up ≥ 35% from entry (trailing_start_pct)
+//   - exit if premium gives back ≥ 10% from peak (trailing_giveback_pct)
 //
 // WHAT BREAKS: If entryPremium is 0, all percentage checks are skipped and no
 //              exit fires. Callers must verify option_premium > 0 before calling.
 //
 // VERIFY:
-//   entry=5.00 current=3.50 → (3.50-5.00)/5.00 = -30% → PREMIUM_STOP_LOSS
-//   entry=5.00 current=7.50 → (7.50-5.00)/5.00 = +50% → PREMIUM_TAKE_PROFIT
-//   entry=5.00 current=6.80 → +36%: trail activates. peak=6.80, current=5.44 → -20% from peak → PREMIUM_TRAILING_GIVEBACK
+//   entry=5.00 current=3.75 → (3.75-5.00)/5.00 = -25% → PREMIUM_STOP_LOSS
+//   entry=5.00 current=8.50 → (8.50-5.00)/5.00 = +70% → PREMIUM_TAKE_PROFIT
+//   entry=5.00 current=6.75 → +35%: trail activates. peak=6.75, current=6.08 → -10% from peak → PREMIUM_TRAILING_GIVEBACK
 
 package risk
 
@@ -48,21 +44,30 @@ const (
 	ExitReasonPremiumStopLoss         = "PREMIUM_STOP_LOSS"
 	ExitReasonPremiumTakeProfit       = "PREMIUM_TAKE_PROFIT"
 	ExitReasonPremiumTrailingGiveback = "PREMIUM_TRAILING_GIVEBACK"
-	ExitReasonEODNoHoldApproval       = "EOD_EXIT_NO_HOLD_APPROVAL"
+	ExitReasonTimeStop                = "TIME_STOP_NO_FOLLOWTHROUGH"
+	ExitReasonMaxHoldDays             = "MAX_HOLD_DAYS_REACHED"
+	ExitReasonStructureInvalidation   = "STRUCTURE_INVALIDATION"
 )
 
 // PositionRiskState carries the mutable per-position state needed by
 // EvaluateMechanicalExit. Loaded from the paper_positions row.
 type PositionRiskState struct {
-	PositionID            string
-	Ticker                string
-	OptionSymbol          string
-	EntryPremium          float64   // option_premium at entry
-	PeakOptionPrice       float64   // highest mid-price seen; 0 if not yet updated
-	TrailingActive        bool      // true once +trailing_start_pct reached
-	HoldOvernightApproved bool      // Claude approved hold overnight for current day
-	EntryDate             time.Time // entry_date from paper_positions
-	DaysHeld              int       // caller computes (now - entry_date).Days()
+	PositionID      string
+	Ticker          string
+	OptionSymbol    string
+	EntryPremium    float64   // option_premium at entry
+	PeakOptionPrice float64   // highest mid-price seen; 0 if not yet updated
+	TrailingActive  bool      // true once +trailing_start_pct reached
+	EntryDate       time.Time // entry_date from paper_positions
+	DaysHeld        int       // caller computes (now - entry_date).Days()
+
+	// Structure invalidation fields (rule 6).
+	// Direction: "bullish" or "bearish" (derived from option_type).
+	// BreakoutLevel: underlying price at entry — proxy for the RSVE breakout level.
+	// UnderlyingClose: current underlying mid-price (0 = skip rule).
+	Direction       string
+	BreakoutLevel   float64
+	UnderlyingClose float64
 }
 
 // MechanicalExitDecision is the output of EvaluateMechanicalExit.
@@ -115,28 +120,17 @@ func EvaluateMechanicalExit(pos PositionRiskState, currentPremium float64, rules
 		dec.TrailingActive = true
 	}
 
-	// Minimum hold window: never exit mechanically before min_hold_days.
-	// Stop loss and EOD exit are both suppressed while in the protected window.
-	// Take profit and trailing giveback still fire (locking in gains is always ok).
-	minHold := rules.MinHoldDays
-	if minHold <= 0 {
-		minHold = 0
-	}
-	inProtectedWindow := pos.DaysHeld < minHold
-
 	// ── Exit rules (evaluated in priority order) ──────────────────────────────
 
-	// 1. Stop loss: down ≥ stop_pct from entry (suppressed in protected window)
-	if !inProtectedWindow {
-		stopFloor := entry * (1.0 - rules.PremiumStopLossPct/100.0)
-		if currentPremium <= stopFloor {
-			dec.ShouldExit = true
-			dec.Reason = ExitReasonPremiumStopLoss
-			return dec
-		}
+	// 1. Stop loss: down ≥ stop_pct from entry
+	stopFloor := entry * (1.0 - rules.PremiumStopLossPct/100.0)
+	if currentPremium <= stopFloor {
+		dec.ShouldExit = true
+		dec.Reason = ExitReasonPremiumStopLoss
+		return dec
 	}
 
-	// 2. Take profit: up ≥ take_profit_pct from entry (always active)
+	// 2. Take profit: up ≥ take_profit_pct from entry
 	tpCeiling := entry * (1.0 + rules.PremiumTakeProfitPct/100.0)
 	if currentPremium >= tpCeiling {
 		dec.ShouldExit = true
@@ -144,7 +138,7 @@ func EvaluateMechanicalExit(pos PositionRiskState, currentPremium float64, rules
 		return dec
 	}
 
-	// 3. Trailing giveback: trail active AND current ≤ peak * (1 - giveback_pct/100) (always active)
+	// 3. Trailing giveback: trail active AND current ≤ peak * (1 - giveback_pct/100)
 	if dec.TrailingActive && dec.PeakPremium > 0 {
 		trailFloor := dec.PeakPremium * (1.0 - rules.PremiumTrailingGivebackPct/100.0)
 		if currentPremium <= trailFloor {
@@ -154,13 +148,37 @@ func EvaluateMechanicalExit(pos PositionRiskState, currentPremium float64, rules
 		}
 	}
 
-	// 4. EOD exit: suppressed in protected window; otherwise requires hold approval.
-	if !inProtectedWindow && rules.ForceEODExitUnlessHoldConfirmed && !pos.HoldOvernightApproved {
-		eodCutoff := time.Date(nowPT.Year(), nowPT.Month(), nowPT.Day(), 12, 45, 0, 0, nowPT.Location())
-		if nowPT.After(eodCutoff) || nowPT.Equal(eodCutoff) {
-			dec.ShouldExit = true
-			dec.Reason = ExitReasonEODNoHoldApproval
-			return dec
+	// 4. Time stop: no follow-through within time_stop_days — breakout failed.
+	if rules.TimeStopDays > 0 && pos.DaysHeld >= rules.TimeStopDays && !dec.TrailingActive {
+		dec.ShouldExit = true
+		dec.Reason = ExitReasonTimeStop
+		return dec
+	}
+
+	// 5. Max hold days: hard time limit regardless of trailing or follow-through.
+	maxHold := rules.MaxHoldDaysWithoutReconfirm
+	if maxHold > 0 && pos.DaysHeld >= maxHold {
+		dec.ShouldExit = true
+		dec.Reason = ExitReasonMaxHoldDays
+		return dec
+	}
+
+	// 6. Structure invalidation: underlying closes back through breakout/breakdown level.
+	// Only fires when UnderlyingClose is populated by the caller (> 0) and BreakoutLevel is set.
+	if pos.UnderlyingClose > 0 && pos.BreakoutLevel > 0 {
+		switch pos.Direction {
+		case "bullish":
+			if pos.UnderlyingClose < pos.BreakoutLevel {
+				dec.ShouldExit = true
+				dec.Reason = ExitReasonStructureInvalidation
+				return dec
+			}
+		case "bearish":
+			if pos.UnderlyingClose > pos.BreakoutLevel {
+				dec.ShouldExit = true
+				dec.Reason = ExitReasonStructureInvalidation
+				return dec
+			}
 		}
 	}
 

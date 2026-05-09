@@ -122,18 +122,12 @@ func main() {
 	// Register workflows
 	w.RegisterWorkflow(wf.DailyResearchCycle)
 	w.RegisterWorkflow(wf.OpeningConfirmationCycle)
-	w.RegisterWorkflow(wf.FirstPositionReviewCycle)
-	w.RegisterWorkflow(wf.ContinuationReviewCycle)
 	w.RegisterWorkflow(wf.DailyPositionReview)
-	w.RegisterWorkflow(wf.WeeklyReviewCycle)
 	w.RegisterWorkflow(wf.MechanicalRiskCycle)
 
 	// Register activities (bound to deps so they have DB + API access)
 	w.RegisterActivity(deps.RunDailyAnalysisActivity)
 	w.RegisterActivity(deps.RunOpeningConfirmationActivity)
-	w.RegisterActivity(deps.RunPositionReviewActivity)
-	w.RegisterActivity(deps.RunContinuationReviewActivity)
-	w.RegisterActivity(deps.RunWeeklyReviewActivity)
 	w.RegisterActivity(deps.RunMechanicalRiskCheckActivity)
 	w.RegisterActivity(deps.RunEODPositionReviewActivity)
 
@@ -156,7 +150,7 @@ func main() {
 	log.Println("worker: stopped")
 }
 
-// registerSchedules creates the six autonomous Temporal schedules.
+// registerSchedules creates the four autonomous Temporal schedules.
 //
 // All cron expressions are in America/Los_Angeles PT-local time.
 // Temporal handles DST automatically via TimeZoneName — no UTC conversion needed.
@@ -166,10 +160,8 @@ func main() {
 //
 //	DailyResearchCycle         06:25 PT  weekdays  — overnight scan
 //	OpeningConfirmationCycle   06:42 PT  weekdays  — first-10-min entry (stale guard at 06:55)
-//	FirstPositionReviewCycle   07:15 PT  weekdays  — early risk management
-//	ContinuationReviewCycle    07:45 PT  weekdays  — fresh intraday review
+//	MechanicalRiskCycle        every 10m weekdays  — stop/TP/trail checks
 //	DailyPositionReview        12:45 PT  weekdays  — end-of-day: hold vs exit
-//	WeeklyReviewCycle          07:00 PT  Sunday    — performance + tuning proposals
 //
 // Each call is idempotent: if a schedule already exists the error is logged and
 // the worker continues — the existing schedule is not touched.
@@ -223,28 +215,10 @@ func registerSchedules(ctx context.Context, tc client.Client, rules *strategy.Ru
 			wfID:     "open-confirmation-run",
 		},
 		{
-			id:       "makemytrade-first-position-review",
-			cron:     parseCron(sched.FirstPositionReviewTime, "07:15", "1-5"),
-			workflow: wf.FirstPositionReviewCycle,
-			wfID:     "first-position-review-run",
-		},
-		{
-			id:       "makemytrade-continuation-review",
-			cron:     parseCron(sched.ContinuationReviewTime, "07:45", "1-5"),
-			workflow: wf.ContinuationReviewCycle,
-			wfID:     "continuation-review-run",
-		},
-		{
 			id:       "makemytrade-position-review",
 			cron:     parseCron(sched.EndOfDayReviewTime, "12:45", "1-5"),
 			workflow: wf.DailyPositionReview,
 			wfID:     "position-review-run",
-		},
-		{
-			id:       "makemytrade-weekly-review",
-			cron:     parseCron(sched.WeeklyReviewTime, "07:00", "0"),
-			workflow: wf.WeeklyReviewCycle,
-			wfID:     "weekly-review-run",
 		},
 	}
 

@@ -50,17 +50,25 @@ type ConfirmationInput struct {
 	SPYBars       []indicators.Bar // SPY 1-min bars for the same window
 }
 
+// ConfirmationDiagnostics captures which required and optional checks passed/failed.
+type ConfirmationDiagnostics struct {
+	RequiredChecksPassed bool     // true when ALL required signals passed
+	OptionalChecksPassed int      // count of optional signals that passed
+	FailedRequired       []string // names of required signals that did NOT pass
+	FailedOptional       []string // names of optional signals that did NOT pass
+}
+
 // ConfirmationResult is the per-candidate output of EvaluateConfirmation.
 // Every field maps directly to a column in trade_confirmations.
 type ConfirmationResult struct {
 	Ticker string
 
 	// Individual signal results
-	SignalLevelHolds  bool // breakout_or_reclaim_holds
-	SignalOpenRange   bool // opening_range midpoint check
-	SignalNoRejection bool // no immediate rejection wick
-	SignalVolumeOK    bool // opening_volume_support
-	SignalMarketOK    bool // market_open_alignment (SPY)
+	SignalLevelHolds  bool // breakout_or_reclaim_holds (required)
+	SignalOpenRange   bool // opening_range midpoint check (optional)
+	SignalNoRejection bool // no immediate rejection wick (optional)
+	SignalVolumeOK    bool // opening_volume_support (optional)
+	SignalMarketOK    bool // market_open_alignment — SPY (required)
 
 	SignalsPassed int
 
@@ -68,9 +76,12 @@ type ConfirmationResult struct {
 	AutoRejected     bool
 	AutoRejectReason string
 
+	// Structured diagnostics for logging and persistence
+	Diagnostics ConfirmationDiagnostics
+
 	// Final status
-	// "confirmed"  → signals_passed >= min AND no auto_reject
-	// "watch_only" → signals_passed < min OR auto_reject fired
+	// "confirmed"  → all required signals pass AND ≥ min_optional optional signals pass
+	// "watch_only" → any required signal fails OR too few optional signals pass
 	Status string
 
 	// Bar data snapshot for persistence
@@ -313,7 +324,7 @@ func EvaluateConfirmation(in ConfirmationInput, cfg OpenConfirmationConfig) Conf
 		}
 	}
 
-	// ── Count passed signals ─────────────────────────────────────────────────
+	// ── Count all signals ─────────────────────────────────────────────────────
 	passed := 0
 	if res.SignalLevelHolds {
 		passed++
@@ -332,14 +343,73 @@ func EvaluateConfirmation(in ConfirmationInput, cfg OpenConfirmationConfig) Conf
 	}
 	res.SignalsPassed = passed
 
-	min := cfg.MinTrueSignalsToConfirm
-	if min <= 0 {
-		min = 3 // YAML default
-	}
-	if passed >= min {
-		res.Status = "confirmed"
+	// ── Required + optional check logic ──────────────────────────────────────
+	// When RequiredChecks are configured: level_holds AND market_aligned must both pass.
+	// Then at least MinOptionalSignals of the remaining 3 must pass.
+	// Falls back to legacy min-signals-of-N when RequiredChecks are not set.
+	useRequiredOptional := cfg.RequiredChecks.LevelHolds || cfg.RequiredChecks.MarketAligned
+
+	if useRequiredOptional {
+		var failedReq, failedOpt []string
+
+		// Required signals
+		if cfg.RequiredChecks.LevelHolds && !res.SignalLevelHolds {
+			failedReq = append(failedReq, "level_holds")
+		}
+		if cfg.RequiredChecks.MarketAligned && !res.SignalMarketOK {
+			failedReq = append(failedReq, "market_aligned")
+		}
+
+		// Optional signals: volume, no_rejection_wick, opening_range_midpoint
+		optPassed := 0
+		if res.SignalVolumeOK {
+			optPassed++
+		} else {
+			failedOpt = append(failedOpt, "volume_supports_direction")
+		}
+		if res.SignalNoRejection {
+			optPassed++
+		} else {
+			if bullish {
+				failedOpt = append(failedOpt, "no_rejection_wick")
+			} else {
+				failedOpt = append(failedOpt, "no_reversal_tail")
+			}
+		}
+		if res.SignalOpenRange {
+			optPassed++
+		} else {
+			failedOpt = append(failedOpt, "opening_range_midpoint_close")
+		}
+
+		minOpt := cfg.MinOptionalSignals
+		if minOpt <= 0 {
+			minOpt = 1
+		}
+
+		res.Diagnostics = ConfirmationDiagnostics{
+			RequiredChecksPassed: len(failedReq) == 0,
+			OptionalChecksPassed: optPassed,
+			FailedRequired:       failedReq,
+			FailedOptional:       failedOpt,
+		}
+
+		if len(failedReq) == 0 && optPassed >= minOpt {
+			res.Status = "confirmed"
+		} else {
+			res.Status = "watch_only"
+		}
 	} else {
-		res.Status = "watch_only"
+		// Legacy mode: any N of M signals
+		min := cfg.MinTrueSignalsToConfirm
+		if min <= 0 {
+			min = 3
+		}
+		if passed >= min {
+			res.Status = "confirmed"
+		} else {
+			res.Status = "watch_only"
+		}
 	}
 
 	return res

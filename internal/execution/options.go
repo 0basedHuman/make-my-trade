@@ -39,6 +39,7 @@ type Alpaca interface {
 	PlaceOptionOrder(symbol string, limitPrice float64) (string, error)
 	SellOptionOrder(symbol string, limitPrice float64) (string, error)
 	FetchOptionMidPrice(occSymbol string) (float64, error)
+	FetchLatestQuote(ticker string) (float64, error)
 }
 
 // BuyInput holds all parameters needed to open a paper option position.

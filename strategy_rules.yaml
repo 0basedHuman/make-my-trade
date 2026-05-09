@@ -50,7 +50,7 @@ trade_frequency:
   mode: active_paper                # active_paper | conservative | aggressive
   max_entry_ready_to_confirm: 5     # max candidates sent to Claude for confirmation
   max_new_positions_per_day: 3      # hard cap on new paper positions opened per day
-  min_entry_ready_score: 68         # minimum deterministic score to shortlist
+  min_entry_ready_score: 70         # minimum deterministic score to shortlist
   min_claude_confidence: 0.65       # minimum Claude confidence to create position
   allow_zero_trade_day: true        # no-trade days are valid; never force a trade
 
@@ -79,10 +79,10 @@ trade_frequency:
 # ============================================================
 risk:
   option_lifecycle:
-    dte_min: 14             # minimum DTE; 14+ avoids worst gamma/theta at expiry
-    dte_max: 45             # maximum DTE; captures full swing window without too much extrinsic
-    target_dte: 30          # preferred DTE; 30d theta decay is ~half of 14d for same move
-    avoid_dte_below: 7      # hard floor: never select DTE below this (gamma risk zone)
+    dte_min: 21             # minimum DTE; 21+ avoids gamma/theta burn on short-dated options
+    dte_max: 45             # maximum DTE; captures full swing window without excess extrinsic
+    target_dte: 30          # preferred DTE; 30d theta decay is manageable for 3-7 day holds
+    avoid_dte_below: 21     # hard floor: never select DTE below this
     contracts_per_trade: 1  # always 1 contract per paper trade
 
   # Proxy IV rank gate — do not buy expensive premium.
@@ -104,26 +104,27 @@ risk:
 
   mechanical_exits:
     enabled: true
-    min_hold_days: 2                           # never exit on day 0 or 1 — give the setup room
-    premium_stop_loss_pct: 30                  # exit if premium is down 30% from entry
-    premium_take_profit_pct: 50                # exit if premium is up 50% from entry
-    premium_trailing_start_pct: 10             # arm trailing once premium is up 10% from entry
-    premium_trailing_giveback_pct: 15          # exit if premium gives back 15% from peak after trail starts
-    force_eod_exit_unless_hold_confirmed: true # exit at EOD unless Claude explicitly approves hold
-    max_hold_days_without_reconfirm: 5         # allow Claude to approve hold for up to 5 days
+    premium_stop_loss_pct: 25                  # exit if premium is down 25% from entry
+    premium_take_profit_pct: 70                # exit if premium is up 70% from entry
+    # Trailing stop: arm at +35% option gain, then exit if premium gives back 10% from peak.
+    premium_trailing_start_pct: 35            # arm trailing stop once premium up 35%
+    premium_trailing_giveback_pct: 10         # exit if premium gives back 10% from peak
+    # No forced EOD exit — 21-45 DTE swing positions hold overnight by default.
+    max_hold_days_without_reconfirm: 5         # hard max hold: force exit after 5 days
+    time_stop_days: 2                          # exit if underlying shows no follow-through within 2 days
 
 
 # ============================================================
 # CLAUDE CONFIRMATION — controls Claude's role at opening time.
-# Claude is the final authority after deterministic evidence.
-# ============================================================
+# Claude is NOT used in any trading path. This block is retained for config
+# compatibility but must remain disabled.
 claude_confirmation:
-  enabled: true
-  min_confidence: 0.65                        # below this → decline (REJECT)
-  max_candidates_per_run: 5                   # shortlist cap sent to ConfirmEntry
-  use_deterministic_opening_evidence: true    # pass deterministic signals as evidence
-  deterministic_signals_soft_min: 2           # soft floor (below this → warn Claude)
-  deterministic_auto_reject_is_hard_block: true  # auto_reject fired → hard block (Claude cannot override)
+  enabled: false
+  min_confidence: 0.65
+  max_candidates_per_run: 5
+  use_deterministic_opening_evidence: true
+  deterministic_signals_soft_min: 2
+  deterministic_auto_reject_is_hard_block: true
 
 
 # ============================================================
@@ -133,7 +134,7 @@ claude_confirmation:
 regime:
   hard_blocks:
     vix_max: 24.0         # VIX >= this → all new entries blocked
-    btc_roc20_min: 0.0    # BTC 20d ROC < this → bullish families blocked
+    btc_roc20_min: -999.0 # disabled — BTC regime block removed; never triggers
 
 
 # ============================================================
@@ -149,416 +150,417 @@ penalties:
 
 
 # ============================================================
-# FAMILIES — one complete policy block per setup family.
+# DEPRECATED LEGACY STRATEGY FAMILIES
 #
-# Structure per family:
-#   preconditions   → binary gates; ALL must pass or family is skipped
-#   scoring.weights → 5 dimensions summing to 100
-#   scoring.thresholds → minimum score per lifecycle status
-#   rsi / extension_pct / volume / ema_gap_pct → sub-thresholds
-#                     used by scoring dimension functions
-#   entry_conditions → hard checks that must ALSO pass for entry_ready
-#                      (score threshold alone is insufficient)
-#   options → DTE and delta target bands
-#   hold_window → trade duration guidance (days)
+# The 5-family scoring model (bullish_continuation, bullish_momentum_breakout,
+# bearish_continuation, bearish_exhaustion_reversal, bearish_momentum_breakdown)
+# is superseded by RSVE-O PRO (the rsve: block below).
+#
+# Set enabled: false to ensure engine.go family scoring is unreachable.
+# The families block is kept for reference only — do not re-enable.
 # ============================================================
-families:
+deprecated_legacy_strategy_families:
+  enabled: false
+  warning: "Do not use. Superseded by RSVE-O PRO. engine.go family scoring is disabled when enabled=false."
+  families:
 
-  # ----------------------------------------------------------
-  # BULLISH CONTINUATION
-  # Thesis: established uptrend with all EMAs aligned bullishly.
-  # Safer entry — more confirmation required before triggering.
-  # ----------------------------------------------------------
-  bullish_continuation:
-    direction: bullish
-    option_type: call
-    description: >
-      EMA20 > EMA50 > EMA100 with price above EMA20 and positive MACD.
-      Continuation of an established uptrend. Higher score bar reflects
-      that structure must be unambiguous before entry.
-
-    # All must be true — one false = family skipped, not scored.
-    preconditions:
-      ema20_above_ema50: true
-      ema20_above_ema100: true
-      close_above_ema20: true
-      macd_histogram_positive: true
-      btc_regime_not_negative: true   # BTC ROC >= 0
-
-    scoring:
-      # Weights sum to 100. Engine scores each dimension 0.0-1.0.
-      # Final score = sum(dimension_score × weight).
-      weights:
-        trend_structure: 30      # EMA stack depth and separation quality
-        momentum_alignment: 25   # MACD histogram magnitude + RSI position
-        volume_participation: 20 # relative volume vs thresholds
-        entry_quality: 15        # extension from EMA20 + RSI range tightness
-        pattern_strength: 10     # detected pattern bonus from pattern_scores
-
-      # Minimum score (0-100) to receive each lifecycle status.
-      # A ticker scoring below structural_candidate → rejected.
-      # A ticker scoring below entry_ready OR failing entry_conditions → structural_candidate.
-      thresholds:
-        structural_candidate: 45
-        entry_ready: 65
-
-    # Used by momentum_alignment dimension to score RSI position.
-    # ideal range → 1.0 score; acceptable range → 0.5; outside → 0.0.
-    rsi:
-      ideal_min: 55
-      ideal_max: 68
-      acceptable_min: 50
-      acceptable_max: 74
-
-    # Used by entry_quality dimension.
-    # extension_pct = (close - EMA20) / EMA20 * 100 (positive = above EMA20).
-    extension_pct:
-      ideal_max: 5.0        # <= ideal_max → full entry_quality score
-      acceptable_max: 10.0  # <= acceptable_max → half score
-      hard_reject: 15.0     # > hard_reject → entry_quality = 0
-
-    # Used by volume_participation dimension.
-    volume:
-      strong_min: 1.5       # >= strong → 1.0 score
-      adequate_min: 1.2     # >= adequate → 0.5 score; below → 0.2
-
-    # Used by trend_structure dimension.
-    # ema_gap_pct = (EMA20 - EMA50) / EMA50 * 100 (should be positive).
-    ema_gap_pct:
-      strong_min: 3.0       # >= strong → 1.0 trend score
-      adequate_min: 0.5     # >= adequate → 0.4-0.9 (interpolated)
-
-    # Hard conditions evaluated SEPARATELY from the score.
-    # Even if score >= entry_ready threshold, ALL of these must pass.
-    # Failing any → structural_candidate (never rejected — score still applies).
-    entry_conditions:
-      volume_min: 1.2
-      rsi_min: 50
-      rsi_max: 74
-      extension_max_pct: 10.0
-
-    options:
-      dte_min: 14
-      dte_max: 45
-      delta_min: 0.45
-      delta_max: 0.65
-
-    hold_window:
-      min: 5
-      base: 12
-      max: 20
-
-
-  # ----------------------------------------------------------
-  # BULLISH MOMENTUM BREAKOUT
-  # Thesis: price breaking above EMA20 with slope confirming.
-  # Earlier entry — volume requirement is higher to compensate.
-  # ----------------------------------------------------------
-  bullish_momentum_breakout:
-    direction: bullish
-    option_type: call
-    description: >
-      Price above EMA20 with EMA20 slope rising. No EMA100 required —
-      early-stage or recovering names qualify. Higher entry_ready threshold
-      reflects the increased false-breakout risk without full trend alignment.
-
-    preconditions:
-      close_above_ema20: true
-      ema20_slope_positive: true
-      btc_regime_not_negative: true
-
-    scoring:
-      weights:
-        trend_structure: 20      # lighter — no EMA100 requirement
-        momentum_alignment: 30   # heavier — momentum IS the thesis
-        volume_participation: 25 # breakouts must have volume to be real
-        entry_quality: 15
-        pattern_strength: 10
-      thresholds:
-        structural_candidate: 45
-        entry_ready: 68          # higher bar: momentum setups are riskier
-
-    rsi:
-      ideal_min: 55
-      ideal_max: 72
-      acceptable_min: 45
-      acceptable_max: 80
-
-    extension_pct:
-      ideal_max: 5.0
-      acceptable_max: 12.0      # momentum allows more extension
-      hard_reject: 18.0
-
-    volume:
-      strong_min: 2.0           # breakouts need strong volume
-      adequate_min: 1.5
-
-    ema_gap_pct:                 # not meaningful without EMA50 requirement
-      strong_min: 0.0
-      adequate_min: 0.0
-
-    entry_conditions:
-      volume_min: 1.5            # higher bar for momentum
-      rsi_min: 45
-      rsi_max: 80
-      extension_max_pct: 12.0
-
-    options:
-      dte_min: 14
-      dte_max: 45
-      delta_min: 0.45
-      delta_max: 0.70
-
-    hold_window:
-      min: 2
-      base: 7
-      max: 10
-
-
-  # ----------------------------------------------------------
-  # BEARISH CONTINUATION
-  # Thesis: established downtrend with all EMAs aligned bearishly.
-  # Safer entry — full EMA stack required.
-  # ----------------------------------------------------------
-  bearish_continuation:
-    direction: bearish
-    option_type: put
-    description: >
-      EMA20 < EMA50 < EMA100 with price below EMA20 and negative MACD.
-      Continuation of an established downtrend. BTC regime not required —
-      bearish setups can occur in mixed or negative crypto environments.
-
-    preconditions:
-      ema20_below_ema50: true
-      ema20_below_ema100: true
-      close_below_ema20: true
-      macd_histogram_negative: true
-
-    scoring:
-      weights:
-        trend_structure: 30
-        momentum_alignment: 25
-        volume_participation: 20
-        entry_quality: 15
-        pattern_strength: 10
-      thresholds:
-        structural_candidate: 45
-        entry_ready: 65
-
-    rsi:
-      ideal_min: 32             # bearish: ideal RSI is in the 32-45 range
-      ideal_max: 45
-      acceptable_min: 26
-      acceptable_max: 50
-
-    extension_pct:              # bearish: (EMA20 - close) / EMA20 * 100
-      ideal_max: 5.0
-      acceptable_max: 10.0
-      hard_reject: 15.0
-
-    volume:
-      strong_min: 1.5
-      adequate_min: 1.2
-
-    ema_gap_pct:                # |EMA20 - EMA50| / EMA50 * 100
-      strong_min: 3.0
-      adequate_min: 0.5
-
-    entry_conditions:
-      volume_min: 1.2
-      rsi_min: 26
-      rsi_max: 50
-      extension_max_pct: 10.0
-
-    options:
-      dte_min: 14
-      dte_max: 45
-      delta_min: 0.45
-      delta_max: 0.65
-
-    hold_window:
-      min: 5
-      base: 12
-      max: 20
-
-
-  # ----------------------------------------------------------
-  # BEARISH EXHAUSTION REVERSAL
-  # Thesis: overextended bullish names showing first signs of
-  # rejection after a sustained rally. PUT candidates only.
-  #
-  # IMPORTANT — two-phase lifecycle:
-  #   Phase 1 (daily scan, 6:25 AM):
-  #     Preconditions detect overextension (RSI >= 72, price >= 1.8
-  #     ATR above EMA20). Engine caps output at structural_candidate.
-  #     Never produces entry_ready from overnight bars alone.
-  #
-  #   Phase 2 (opening confirmation / continuation review):
-  #     Activity observes intraday rejection evidence:
-  #       - failed breakout or upper-wick rejection candle
-  #       - first 10/30/60m close below VWAP or OR midpoint
-  #       - relative volume >= 1.3
-  #       - QQQ/SPY not strongly bullish
-  #     If evidence present → promote to entry_ready → Claude confirms.
-  #
-  # Hard rejects at confirmation time (activity enforces):
-  #   - price still holding above VWAP
-  #   - no visible rejection wick
-  #   - QQQ/SPY strong risk-on
-  #   - spread too wide or no valid put contract
-  # ----------------------------------------------------------
-  bearish_exhaustion_reversal:
-    direction: bearish
-    option_type: put
-    description: >
-      Close above EMA20 with RSI >= 72 and price extended >= 1.8 ATR above EMA20.
-      Daily scan produces structural_candidate only. entry_ready requires intraday
-      rejection evidence observed at opening confirmation or continuation review:
-      failed breakout or rejection wick, first 10/30/60m close below VWAP or
-      opening range midpoint, relative volume >= 1.3, and QQQ/SPY not risk-on.
-
-    # max_scan_status caps what the daily engine can assign.
-    # The opening confirmation activity is the only path to entry_ready.
-    max_scan_status: "structural_candidate"
-
-    # Preconditions for daily scan pass (all must be true):
-    #   close_above_ema20     — still above EMA20 (not yet broken down)
-    #   rsi_min_precondition  — RSI must be overextended (new field)
-    #   atr_extension_min     — (close - EMA20) / ATR14 >= this value (new field)
-    preconditions:
-      close_above_ema20: true
-      rsi_min_precondition: 72
-      atr_extension_min: 1.8
-
-    scoring:
-      # trend_structure: ATR extension magnitude (more extended = higher reversal potential)
-      # momentum_alignment: RSI level via rsi bands below (higher = more overbought = better)
-      # entry_quality: inverted extension scoring + upper-wick quality at scan time
-      weights:
-        trend_structure: 30
-        momentum_alignment: 25
-        volume_participation: 15     # prior-day volume in the up-move
-        entry_quality: 20            # overextension quality (inverted: more = better)
-        pattern_strength: 10
-      thresholds:
-        structural_candidate: 40     # lower bar — preconditions already enforce quality
-        entry_ready: 999             # unreachable at scan time; only assigned by activity
-
-    # For this family: higher RSI = more overbought = better PUT setup.
-    # Ideal: 75–85 (classic overbought territory). Acceptable: 72–90.
-    rsi:
-      ideal_min: 75
-      ideal_max: 85
-      acceptable_min: 72
-      acceptable_max: 90
-
-    # extension_pct fields are unused for this family (scoring is inverted via ATR
-    # extension in scoreTrendStructure and scoreEntryQuality). Set to no-op values.
-    extension_pct:
-      ideal_max: 999.0
-      acceptable_max: 999.0
-      hard_reject: 999.0
-
-    volume:
-      strong_min: 1.5
-      adequate_min: 1.0              # elevated buying-volume into the top is expected
-
-    ema_gap_pct:
-      strong_min: 0.0
-      adequate_min: 0.0
-
-    # entry_conditions are evaluated by the opening confirmation activity,
-    # not by the daily scan engine. The max_scan_status cap ensures entry_ready
-    # cannot be set by the engine regardless of these values.
-    entry_conditions:
-      volume_min: 1.3                # intraday relative volume >= 1.3
-      rsi_min: 72                    # already gated by precondition
-      rsi_max: 95                    # allow extreme overbought
-      extension_max_pct: 999.0       # no upper cap on extension
-
-    options:
-      dte_min: 14
-      dte_max: 45
-      delta_min: 0.35                # slightly lower delta — sharp reversal expected
-      delta_max: 0.55
-
-    hold_window:
-      min: 1
-      base: 3
-      max: 7
-
-
-  # ----------------------------------------------------------
-  # BEARISH MOMENTUM BREAKDOWN
-  # Thesis: price breaking below EMA20 with slope confirming.
-  # Earlier entry — higher volume and score requirements.
-  # ----------------------------------------------------------
-  bearish_momentum_breakdown:
-    direction: bearish
-    option_type: put
-    description: >
-      Price below EMA20 with EMA20 slope falling. No EMA100 required.
-      Faster-moving setup with higher false-breakdown risk; higher score
-      threshold required to compensate.
-
-    preconditions:
-      close_below_ema20: true
-      ema20_slope_negative: true
-
-    scoring:
-      weights:
-        trend_structure: 20
-        momentum_alignment: 30
-        volume_participation: 25
-        entry_quality: 15
-        pattern_strength: 10
-      thresholds:
-        structural_candidate: 45
-        entry_ready: 68
-
-    rsi:
-      ideal_min: 28
-      ideal_max: 45
-      acceptable_min: 20
-      acceptable_max: 55
-
-    extension_pct:
-      ideal_max: 5.0
-      acceptable_max: 12.0
-      hard_reject: 18.0
-
-    volume:
-      strong_min: 2.0
-      adequate_min: 1.5
-
-    ema_gap_pct:
-      strong_min: 0.0
-      adequate_min: 0.0
-
-    entry_conditions:
-      volume_min: 1.5
-      rsi_min: 20
-      rsi_max: 55
-      extension_max_pct: 12.0
-
-    options:
-      dte_min: 14
-      dte_max: 45
-      delta_min: 0.45
-      delta_max: 0.70
-
-    hold_window:
-      min: 2
-      base: 7
-      max: 10
-
-
-# ============================================================
-# PATTERN SCORES
-# Integer points per detected pattern; summed by the engine
-# to compute the pattern_strength scoring dimension.
-# Max useful sum ≈ 8 (normalized to 0-1 within the engine).
-# ============================================================
+    # ----------------------------------------------------------
+    # BULLISH CONTINUATION
+    # Thesis: established uptrend with all EMAs aligned bullishly.
+    # Safer entry — more confirmation required before triggering.
+    # ----------------------------------------------------------
+    bullish_continuation:
+      direction: bullish
+      option_type: call
+      description: >
+        EMA20 > EMA50 > EMA100 with price above EMA20 and positive MACD.
+        Continuation of an established uptrend. Higher score bar reflects
+        that structure must be unambiguous before entry.
+  
+      # All must be true — one false = family skipped, not scored.
+      preconditions:
+        ema20_above_ema50: true
+        ema20_above_ema100: true
+        close_above_ema20: true
+        macd_histogram_positive: true
+  
+      scoring:
+        # Weights sum to 100. Engine scores each dimension 0.0-1.0.
+        # Final score = sum(dimension_score × weight).
+        weights:
+          trend_structure: 30      # EMA stack depth and separation quality
+          momentum_alignment: 25   # MACD histogram magnitude + RSI position
+          volume_participation: 20 # relative volume vs thresholds
+          entry_quality: 15        # extension from EMA20 + RSI range tightness
+          pattern_strength: 10     # detected pattern bonus from pattern_scores
+  
+        # Minimum score (0-100) to receive each lifecycle status.
+        # A ticker scoring below structural_candidate → rejected.
+        # A ticker scoring below entry_ready OR failing entry_conditions → structural_candidate.
+        thresholds:
+          structural_candidate: 45
+          entry_ready: 70      # raised from 65; backtest shows stricter bar improves quality
+  
+      # Used by momentum_alignment dimension to score RSI position.
+      # ideal range → 1.0 score; acceptable range → 0.5; outside → 0.0.
+      rsi:
+        ideal_min: 55
+        ideal_max: 68
+        acceptable_min: 50
+        acceptable_max: 74
+  
+      # Used by entry_quality dimension.
+      # extension_pct = (close - EMA20) / EMA20 * 100 (positive = above EMA20).
+      extension_pct:
+        ideal_max: 5.0        # <= ideal_max → full entry_quality score
+        acceptable_max: 10.0  # <= acceptable_max → half score
+        hard_reject: 15.0     # > hard_reject → entry_quality = 0
+  
+      # Used by volume_participation dimension.
+      volume:
+        strong_min: 1.5       # >= strong → 1.0 score
+        adequate_min: 1.2     # >= adequate → 0.5 score; below → 0.2
+  
+      # Used by trend_structure dimension.
+      # ema_gap_pct = (EMA20 - EMA50) / EMA50 * 100 (should be positive).
+      ema_gap_pct:
+        strong_min: 3.0       # >= strong → 1.0 trend score
+        adequate_min: 0.5     # >= adequate → 0.4-0.9 (interpolated)
+  
+      # Hard conditions evaluated SEPARATELY from the score.
+      # Even if score >= entry_ready threshold, ALL of these must pass.
+      # Failing any → structural_candidate (never rejected — score still applies).
+      entry_conditions:
+        volume_min: 1.2
+        rsi_min: 50
+        rsi_max: 74
+        extension_max_pct: 10.0
+  
+      options:
+        dte_min: 14
+        dte_max: 45
+        delta_min: 0.45
+        delta_max: 0.65
+  
+      hold_window:
+        min: 5
+        base: 12
+        max: 20
+  
+  
+    # ----------------------------------------------------------
+    # BULLISH MOMENTUM BREAKOUT
+    # Thesis: price breaking above EMA20 with slope confirming.
+    # Earlier entry — volume requirement is higher to compensate.
+    # ----------------------------------------------------------
+    bullish_momentum_breakout:
+      direction: bullish
+      option_type: call
+      description: >
+        Price above EMA20 with EMA20 slope rising. No EMA100 required —
+        early-stage or recovering names qualify. Higher entry_ready threshold
+        reflects the increased false-breakout risk without full trend alignment.
+  
+      preconditions:
+        close_above_ema20: true
+        ema20_slope_positive: true
+  
+      scoring:
+        weights:
+          trend_structure: 20      # lighter — no EMA100 requirement
+          momentum_alignment: 30   # heavier — momentum IS the thesis
+          volume_participation: 25 # breakouts must have volume to be real
+          entry_quality: 15
+          pattern_strength: 10
+        thresholds:
+          structural_candidate: 45
+          entry_ready: 70          # raised from 68; backtest shows momentum needs quality filter
+  
+      rsi:
+        ideal_min: 55
+        ideal_max: 72
+        acceptable_min: 45
+        acceptable_max: 80
+  
+      extension_pct:
+        ideal_max: 5.0
+        acceptable_max: 12.0      # momentum allows more extension
+        hard_reject: 18.0
+  
+      volume:
+        strong_min: 2.0           # breakouts need strong volume
+        adequate_min: 1.5
+  
+      ema_gap_pct:                 # not meaningful without EMA50 requirement
+        strong_min: 0.0
+        adequate_min: 0.0
+  
+      entry_conditions:
+        volume_min: 1.5            # higher bar for momentum
+        rsi_min: 45
+        rsi_max: 80
+        extension_max_pct: 12.0
+  
+      options:
+        dte_min: 14
+        dte_max: 45
+        delta_min: 0.45
+        delta_max: 0.70
+  
+      hold_window:
+        min: 2
+        base: 5    # tightened from 7; backtest: 12.8% timeout rate means many go flat by day 5
+        max: 7     # tightened from 10; cut losers earlier, keep winners with trailing stop
+  
+  
+    # ----------------------------------------------------------
+    # BEARISH CONTINUATION
+    # Thesis: established downtrend with all EMAs aligned bearishly.
+    # Safer entry — full EMA stack required.
+    # ----------------------------------------------------------
+    bearish_continuation:
+      direction: bearish
+      option_type: put
+      description: >
+        EMA20 < EMA50 < EMA100 with price below EMA20 and negative MACD.
+        Continuation of an established downtrend. BTC regime not required —
+        bearish setups can occur in mixed or negative crypto environments.
+  
+      preconditions:
+        ema20_below_ema50: true
+        ema20_below_ema100: true
+        close_below_ema20: true
+        macd_histogram_negative: true
+  
+      scoring:
+        weights:
+          trend_structure: 30
+          momentum_alignment: 25
+          volume_participation: 20
+          entry_quality: 15
+          pattern_strength: 10
+        thresholds:
+          structural_candidate: 45
+          entry_ready: 72      # raised from 65; bearish setups underperformed in bull regime — need stronger signal
+  
+      rsi:
+        ideal_min: 32             # bearish: ideal RSI is in the 32-45 range
+        ideal_max: 45
+        acceptable_min: 26
+        acceptable_max: 50
+  
+      extension_pct:              # bearish: (EMA20 - close) / EMA20 * 100
+        ideal_max: 5.0
+        acceptable_max: 10.0
+        hard_reject: 15.0
+  
+      volume:
+        strong_min: 1.5
+        adequate_min: 1.2
+  
+      ema_gap_pct:                # |EMA20 - EMA50| / EMA50 * 100
+        strong_min: 3.0
+        adequate_min: 0.5
+  
+      entry_conditions:
+        volume_min: 1.2
+        rsi_min: 26
+        rsi_max: 50
+        extension_max_pct: 10.0
+  
+      options:
+        dte_min: 14
+        dte_max: 45
+        delta_min: 0.45
+        delta_max: 0.65
+  
+      hold_window:
+        min: 5
+        base: 12
+        max: 20
+  
+  
+    # ----------------------------------------------------------
+    # BEARISH EXHAUSTION REVERSAL — DISABLED
+    # Backtest result: 42.1% win rate, -0.7% expectancy, 845 signals 2023-2026.
+    # Fires on overextended names during rallies and loses in bull-market regimes.
+    # Removed from engine familyOrder; kept here for reference only.
+    # ----------------------------------------------------------
+    # Thesis: overextended bullish names showing first signs of
+    # rejection after a sustained rally. PUT candidates only.
+    #
+    # IMPORTANT — two-phase lifecycle:
+    #   Phase 1 (daily scan, 6:25 AM):
+    #     Preconditions detect overextension (RSI >= 72, price >= 1.8
+    #     ATR above EMA20). Engine caps output at structural_candidate.
+    #     Never produces entry_ready from overnight bars alone.
+    #
+    #   Phase 2 (opening confirmation / continuation review):
+    #     Activity observes intraday rejection evidence:
+    #       - failed breakout or upper-wick rejection candle
+    #       - first 10/30/60m close below VWAP or OR midpoint
+    #       - relative volume >= 1.3
+    #       - QQQ/SPY not strongly bullish
+    #     If evidence present → promote to entry_ready → Claude confirms.
+    #
+    # Hard rejects at confirmation time (activity enforces):
+    #   - price still holding above VWAP
+    #   - no visible rejection wick
+    #   - QQQ/SPY strong risk-on
+    #   - spread too wide or no valid put contract
+    # ----------------------------------------------------------
+    bearish_exhaustion_reversal:
+      direction: bearish
+      option_type: put
+      description: >
+        Close above EMA20 with RSI >= 72 and price extended >= 1.8 ATR above EMA20.
+        Daily scan produces structural_candidate only. entry_ready requires intraday
+        rejection evidence observed at opening confirmation or continuation review:
+        failed breakout or rejection wick, first 10/30/60m close below VWAP or
+        opening range midpoint, relative volume >= 1.3, and QQQ/SPY not risk-on.
+  
+      # max_scan_status caps what the daily engine can assign.
+      # The opening confirmation activity is the only path to entry_ready.
+      max_scan_status: "structural_candidate"
+  
+      # Preconditions for daily scan pass (all must be true):
+      #   close_above_ema20     — still above EMA20 (not yet broken down)
+      #   rsi_min_precondition  — RSI must be overextended (new field)
+      #   atr_extension_min     — (close - EMA20) / ATR14 >= this value (new field)
+      preconditions:
+        close_above_ema20: true
+        rsi_min_precondition: 72
+        atr_extension_min: 1.8
+  
+      scoring:
+        # trend_structure: ATR extension magnitude (more extended = higher reversal potential)
+        # momentum_alignment: RSI level via rsi bands below (higher = more overbought = better)
+        # entry_quality: inverted extension scoring + upper-wick quality at scan time
+        weights:
+          trend_structure: 30
+          momentum_alignment: 25
+          volume_participation: 15     # prior-day volume in the up-move
+          entry_quality: 20            # overextension quality (inverted: more = better)
+          pattern_strength: 10
+        thresholds:
+          structural_candidate: 40     # lower bar — preconditions already enforce quality
+          entry_ready: 999             # unreachable at scan time; only assigned by activity
+  
+      # For this family: higher RSI = more overbought = better PUT setup.
+      # Ideal: 75–85 (classic overbought territory). Acceptable: 72–90.
+      rsi:
+        ideal_min: 75
+        ideal_max: 85
+        acceptable_min: 72
+        acceptable_max: 90
+  
+      # extension_pct fields are unused for this family (scoring is inverted via ATR
+      # extension in scoreTrendStructure and scoreEntryQuality). Set to no-op values.
+      extension_pct:
+        ideal_max: 999.0
+        acceptable_max: 999.0
+        hard_reject: 999.0
+  
+      volume:
+        strong_min: 1.5
+        adequate_min: 1.0              # elevated buying-volume into the top is expected
+  
+      ema_gap_pct:
+        strong_min: 0.0
+        adequate_min: 0.0
+  
+      # entry_conditions are evaluated by the opening confirmation activity,
+      # not by the daily scan engine. The max_scan_status cap ensures entry_ready
+      # cannot be set by the engine regardless of these values.
+      entry_conditions:
+        volume_min: 1.3                # intraday relative volume >= 1.3
+        rsi_min: 72                    # already gated by precondition
+        rsi_max: 95                    # allow extreme overbought
+        extension_max_pct: 999.0       # no upper cap on extension
+  
+      options:
+        dte_min: 14
+        dte_max: 45
+        delta_min: 0.35                # slightly lower delta — sharp reversal expected
+        delta_max: 0.55
+  
+      hold_window:
+        min: 1
+        base: 3
+        max: 7
+  
+  
+    # ----------------------------------------------------------
+    # BEARISH MOMENTUM BREAKDOWN
+    # Thesis: price breaking below EMA20 with slope confirming.
+    # Earlier entry — higher volume and score requirements.
+    # ----------------------------------------------------------
+    bearish_momentum_breakdown:
+      direction: bearish
+      option_type: put
+      description: >
+        Price below EMA20 with EMA20 slope falling. No EMA100 required.
+        Faster-moving setup with higher false-breakdown risk; higher score
+        threshold required to compensate.
+  
+      preconditions:
+        close_below_ema20: true
+        ema20_slope_negative: true
+  
+      scoring:
+        weights:
+          trend_structure: 20
+          momentum_alignment: 30
+          volume_participation: 25
+          entry_quality: 15
+          pattern_strength: 10
+        thresholds:
+          structural_candidate: 45
+          entry_ready: 72      # raised from 68; bearish breakdown underperformed — require stronger confirmation
+  
+      rsi:
+        ideal_min: 28
+        ideal_max: 45
+        acceptable_min: 20
+        acceptable_max: 55
+  
+      extension_pct:
+        ideal_max: 5.0
+        acceptable_max: 12.0
+        hard_reject: 18.0
+  
+      volume:
+        strong_min: 2.0
+        adequate_min: 1.5
+  
+      ema_gap_pct:
+        strong_min: 0.0
+        adequate_min: 0.0
+  
+      entry_conditions:
+        volume_min: 1.5
+        rsi_min: 20
+        rsi_max: 55
+        extension_max_pct: 12.0
+  
+      options:
+        dte_min: 14
+        dte_max: 45
+        delta_min: 0.45
+        delta_max: 0.70
+  
+      hold_window:
+        min: 2
+        base: 5    # tightened from 7; cut losers earlier on breakdowns
+        max: 7     # tightened from 10
+  
+  
+  # ============================================================
+  # PATTERN SCORES
+  # Integer points per detected pattern; summed by the engine
+  # to compute the pattern_strength scoring dimension.
+  # Max useful sum ≈ 8 (normalized to 0-1 within the engine).
+  # ============================================================
 pattern_scores:
   bullish:
     bull_flag: 3
@@ -619,9 +621,9 @@ state_rules:
 # ============================================================
 options_translation:
   liquidity_filters:
-    min_open_interest: 100
-    min_option_volume: 10
-    max_bid_ask_spread_pct_of_mid: 10.0
+    min_open_interest: 500
+    min_option_volume: 50
+    max_bid_ask_spread_pct_of_mid: 8.0
   hide_options_for_statuses:
     - rejected
     - structural_candidate
@@ -637,7 +639,12 @@ options_translation:
 open_confirmation:
   enabled: true
   confirmation_window_minutes: 10
-  min_true_signals_to_confirm: 3
+  # required_checks: both must pass or candidate is watch_only.
+  # min_optional_signals: at least this many of the remaining checks must also pass.
+  required_checks:
+    level_holds: true     # breakout_or_reclaim_holds — price must hold above/below key level
+    market_aligned: true  # market_open_alignment — SPY must confirm direction
+  min_optional_signals: 1 # at least 1 of (volume, no_rejection_wick, opening_range_midpoint) must pass
   checks:
     breakout_or_reclaim_holds: true
     opening_range_close_above_midpoint_for_calls: true
@@ -676,3 +683,85 @@ daily_output:
   allow_zero_trade_day: true
   no_trade_day_when_no_confirmed: true
   no_trade_day_message: "No symbols reached confirmed status. Watchlist candidates may still exist."
+
+
+# ============================================================
+# RSVE-O — Relative Strength Volatility Expansion Options
+#
+# Replaces the 5-family scoring model with a single bullish
+# branch and its bearish mirror. All gates are binary — ALL
+# must pass or the ticker is rejected. Score is a RANKING
+# tool for tied candidates, not a gate.
+#
+# 8 logical gate groups (12 binary checks):
+#   1. Regime         — vix_regime + market_direction
+#   2. Event          — no_earnings
+#   3. Rel. Strength  — relative_strength (outperform SPY by rs_min_pct)
+#   4. EMA Structure  — ema_structure (EMA20/EMA50 aligned with direction)
+#   5. Volatility     — vol_squeeze (BB width percentile <= max)
+#   6. Breakout       — breakout_trigger (close breaks prior N-bar pivot)
+#   7. Volume         — volume_expansion (RVOL >= volume_ratio_min)
+#   8. Options        — iv_rank_ok + spread_quality + oi_minimum + option_volume
+#
+# Gates skip (pass) when data is unavailable (-1). Score never gates.
+# ============================================================
+rsve:
+  bullish:
+    vix_max: 24.0                 # calls blocked when VIX >= 24
+    rs_min_pct: 2.0               # stock must outperform SPY by +2% over 20 days
+    breakout_lookback: 20         # highest-high lookback (bars prior to today)
+    bb_width_percentile_max: 0.30 # BB width must be in bottom 30% of 63-day range
+    volume_ratio_min: 1.2         # RVOL must be 1.2× the 20-day average
+    earnings_blackout_days: 5     # block entry if earnings within 5 days
+
+  bearish:
+    vix_max: 32.0                 # puts allowed up to VIX 32 (wider — puts benefit from fear)
+    rs_min_pct: 2.0               # stock must underperform SPY by -2% over 20 days
+    breakout_lookback: 20         # lowest-low lookback
+    bb_width_percentile_max: 0.30
+    volume_ratio_min: 1.2
+    earnings_blackout_days: 5
+
+  options:
+    max_iv_rank: 70.0             # reject if IV rank > 70 (above-median premium = edge-destroyer)
+    max_spread_pct: 8.0           # reject if bid-ask spread > 8% of mid
+    min_open_interest: 500        # minimum OI for the target strike
+    min_option_volume: 50         # minimum daily option volume (contracts)
+    dte_min: 21                   # minimum DTE at entry (21+ avoids gamma/theta burn)
+    dte_max: 45                   # maximum DTE at entry
+    target_dte: 30                # preferred DTE (theta decay manageable for 3-7 day hold)
+    delta_min: 0.40               # near-the-money for meaningful leverage
+    delta_max: 0.65
+    hold_window:
+      min: 5
+      base: 7
+      max: 14
+
+  hold_window:
+    min: 5
+    base: 7
+    max: 14
+
+  # ── Structural pattern analysis ────────────────────────────────────────────
+  # Runs after all stock hard gates pass, before option selection.
+  # Patterns improve ranking quality but are NOT mandatory by default.
+  # Set required_for_trade: true to make at least one pattern mandatory.
+  #
+  # Supported: bull_flag, bear_flag, ascending_triangle, descending_triangle,
+  #            base_breakout, base_breakdown, support_resistance_retest
+  # NOT supported (intentionally excluded): head-and-shoulders, cup-and-handle,
+  #   candlestick patterns, MACD-cross patterns
+  # Note: opening_range_breakout runs in confirmation activity (intraday only)
+  pattern_analysis:
+    enabled: true
+    required_for_trade: false        # if true: at least one pattern required at entry
+    allowed_patterns:
+      - bull_flag
+      - bear_flag
+      - ascending_triangle
+      - descending_triangle
+      - base_breakout
+      - base_breakdown
+      - support_resistance_retest
+    pattern_score_weight: 15         # max points added to ranking score (0-15)
+    minimum_pattern_quality: 0.60    # quality threshold (0.0-1.0) to count as detected

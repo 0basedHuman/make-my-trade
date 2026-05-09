@@ -8,26 +8,25 @@ import (
 )
 
 // testRules returns MechanicalExitsConfig with canonical test values:
-// stop=30%, TP=50%, trail_start=35%, trail_giveback=20%, EOD=true.
+// stop=30%, TP=50%, trail_start=35%, trail_giveback=20%.
 func testRules() strategy.MechanicalExitsConfig {
 	return strategy.MechanicalExitsConfig{
-		Enabled:                         true,
-		PremiumStopLossPct:              30,
-		PremiumTakeProfitPct:            50,
-		PremiumTrailingStartPct:         35,
-		PremiumTrailingGivebackPct:      20,
-		ForceEODExitUnlessHoldConfirmed: true,
-		MaxHoldDaysWithoutReconfirm:     1,
+		Enabled:                     true,
+		PremiumStopLossPct:          30,
+		PremiumTakeProfitPct:        50,
+		PremiumTrailingStartPct:     35,
+		PremiumTrailingGivebackPct:  20,
+		MaxHoldDaysWithoutReconfirm: 1,
 	}
 }
 
-// midday returns a time well inside trading hours (e.g. 10:00 PT) so EOD checks don't fire.
+// midday returns a time well inside trading hours (e.g. 10:00 PT).
 func midday() time.Time {
 	loc, _ := time.LoadLocation("America/Los_Angeles")
 	return time.Date(2026, 4, 24, 10, 0, 0, 0, loc)
 }
 
-// eodTime returns a time at 12:45 PT to trigger EOD checks.
+// eodTime returns a time at 12:45 PT.
 func eodTime() time.Time {
 	loc, _ := time.LoadLocation("America/Los_Angeles")
 	return time.Date(2026, 4, 24, 12, 45, 0, 0, loc)
@@ -162,38 +161,59 @@ func TestTrailingGiveback_PeakUpdated(t *testing.T) {
 	}
 }
 
-// ── EOD exit ──────────────────────────────────────────────────────────────────
+// ── No forced EOD exit — 21-45 DTE swings hold overnight ────────────────────
 
-func TestEODExit_FiresAt1245_NotApproved(t *testing.T) {
+func TestNoEODExit_HoldsOvernightByDefault(t *testing.T) {
+	// Position at +10%: within all rule limits, no exit should fire at EOD.
 	pos := basePos(5.00)
-	pos.HoldOvernightApproved = false
 	dec := EvaluateMechanicalExit(pos, 5.50, testRules(), eodTime())
+	if dec.ShouldExit {
+		t.Fatalf("21-45 DTE swings must hold overnight by default; got exit reason=%s", dec.Reason)
+	}
+}
+
+// ── Same-day hard invalidation fires immediately ──────────────────────────────
+
+func TestSameDayStop_FiresImmediately(t *testing.T) {
+	// DaysHeld=0 (entered today): stop loss must fire when premium drops.
+	// No min-hold protection — same-day hard invalidation is valid.
+	pos := basePos(5.00)
+	pos.DaysHeld = 0
+	dec := EvaluateMechanicalExit(pos, 3.50, testRules(), midday()) // exactly -30%
 	if !dec.ShouldExit {
-		t.Fatalf("EOD exit should fire at 12:45 without hold approval")
+		t.Fatalf("stop loss must fire on day 0 when premium is at stop floor")
 	}
-	if dec.Reason != ExitReasonEODNoHoldApproval {
-		t.Fatalf("want reason %s got %s", ExitReasonEODNoHoldApproval, dec.Reason)
-	}
-}
-
-func TestEODExit_NoFireWhenApproved(t *testing.T) {
-	pos := basePos(5.00)
-	pos.HoldOvernightApproved = true
-	dec := EvaluateMechanicalExit(pos, 5.50, testRules(), eodTime())
-	if dec.ShouldExit {
-		t.Fatalf("EOD exit should NOT fire when hold_overnight_approved=true")
+	if dec.Reason != ExitReasonPremiumStopLoss {
+		t.Fatalf("want PREMIUM_STOP_LOSS got %s", dec.Reason)
 	}
 }
 
-func TestEODExit_NoFireBeforeCutoff(t *testing.T) {
+func TestSameDayTrailing_StillFires(t *testing.T) {
+	// Trail was already active (e.g. entry was yesterday's close, day 0 today).
+	// Trailing giveback must fire regardless of DaysHeld.
 	pos := basePos(5.00)
-	pos.HoldOvernightApproved = false
-	// 12:44 PT — just before EOD cutoff
-	loc, _ := time.LoadLocation("America/Los_Angeles")
-	beforeEOD := time.Date(2026, 4, 24, 12, 44, 59, 0, loc)
-	dec := EvaluateMechanicalExit(pos, 5.50, testRules(), beforeEOD)
+	pos.DaysHeld = 0
+	pos.TrailingActive = true
+	pos.PeakOptionPrice = 8.00
+	dec := EvaluateMechanicalExit(pos, 6.40, testRules(), midday()) // -20% from peak
+	if !dec.ShouldExit {
+		t.Fatalf("trailing giveback must fire on day 0; got ShouldExit=false")
+	}
+	if dec.Reason != ExitReasonPremiumTrailingGiveback {
+		t.Fatalf("want PREMIUM_TRAILING_GIVEBACK got %s", dec.Reason)
+	}
+}
+
+func TestSameDayValidPosition_NoExit(t *testing.T) {
+	// Position is healthy on day 0: no exit should fire.
+	pos := basePos(5.00)
+	pos.DaysHeld = 0
+	rules := testRules()
+	rules.TimeStopDays = 2 // time stop only fires after 2 days
+	rules.MaxHoldDaysWithoutReconfirm = 5
+	dec := EvaluateMechanicalExit(pos, 5.50, rules, midday()) // +10%
 	if dec.ShouldExit {
-		t.Fatalf("EOD exit should not fire before 12:45 PT")
+		t.Fatalf("healthy position on day 0 should not exit; got reason=%s", dec.Reason)
 	}
 }
 
@@ -226,5 +246,74 @@ func TestNoExit_RulesDisabled(t *testing.T) {
 	dec := EvaluateMechanicalExit(pos, 1.00, rules, midday()) // would be -80% stop
 	if dec.ShouldExit {
 		t.Fatalf("no exit should fire when rules are disabled")
+	}
+}
+
+// ── Structure invalidation ────────────────────────────────────────────────────
+
+func TestStructureInvalidation_Bullish_UnderlyingBelowBreakout(t *testing.T) {
+	pos := basePos(5.00)
+	pos.Direction = "bullish"
+	pos.BreakoutLevel = 100.0
+	pos.UnderlyingClose = 98.0 // closed below breakout
+	dec := EvaluateMechanicalExit(pos, 5.10, testRules(), midday()) // option still fine
+	if !dec.ShouldExit {
+		t.Fatal("structure_invalidation must fire when bullish underlying closes below breakout level")
+	}
+	if dec.Reason != ExitReasonStructureInvalidation {
+		t.Fatalf("want STRUCTURE_INVALIDATION got %s", dec.Reason)
+	}
+}
+
+func TestStructureInvalidation_Bearish_UnderlyingAboveBreakdown(t *testing.T) {
+	pos := basePos(5.00)
+	pos.Direction = "bearish"
+	pos.BreakoutLevel = 100.0
+	pos.UnderlyingClose = 102.0 // closed above breakdown level
+	dec := EvaluateMechanicalExit(pos, 5.10, testRules(), midday())
+	if !dec.ShouldExit {
+		t.Fatal("structure_invalidation must fire when bearish underlying closes above breakdown level")
+	}
+	if dec.Reason != ExitReasonStructureInvalidation {
+		t.Fatalf("want STRUCTURE_INVALIDATION got %s", dec.Reason)
+	}
+}
+
+func TestStructureInvalidation_Bullish_HoldsAboveBreakout(t *testing.T) {
+	pos := basePos(5.00)
+	pos.Direction = "bullish"
+	pos.BreakoutLevel = 100.0
+	pos.UnderlyingClose = 101.5 // still above breakout
+	dec := EvaluateMechanicalExit(pos, 5.10, testRules(), midday())
+	if dec.ShouldExit {
+		t.Fatalf("no structure invalidation when underlying holds above breakout; got %s", dec.Reason)
+	}
+}
+
+func TestStructureInvalidation_Skipped_WhenUnderlyingZero(t *testing.T) {
+	// UnderlyingClose = 0 → caller didn't populate it → rule skipped
+	pos := basePos(5.00)
+	pos.Direction = "bullish"
+	pos.BreakoutLevel = 100.0
+	pos.UnderlyingClose = 0 // not populated
+	dec := EvaluateMechanicalExit(pos, 5.10, testRules(), midday())
+	if dec.ShouldExit {
+		t.Fatal("structure_invalidation must be skipped when UnderlyingClose is 0")
+	}
+}
+
+func TestStructureInvalidation_PremiumStopHasPriority(t *testing.T) {
+	// Both stop loss AND structure invalidation triggered — stop loss fires first.
+	pos := basePos(5.00)
+	pos.Direction = "bullish"
+	pos.BreakoutLevel = 100.0
+	pos.UnderlyingClose = 98.0 // below breakout
+	// Premium also at stop floor: 5.00 * 0.70 = 3.50
+	dec := EvaluateMechanicalExit(pos, 3.50, testRules(), midday())
+	if !dec.ShouldExit {
+		t.Fatal("exit must fire")
+	}
+	if dec.Reason != ExitReasonPremiumStopLoss {
+		t.Fatalf("premium stop loss must take priority over structure invalidation; got %s", dec.Reason)
 	}
 }

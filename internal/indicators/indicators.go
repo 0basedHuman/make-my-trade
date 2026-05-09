@@ -597,8 +597,13 @@ func NearestSupport(bars []Bar, currentPrice float64, lookback int) float64 {
 // ATRTargetRange computes structure-based base and stretch price targets from
 // an ATR multiple. This replaces arbitrary percent targets.
 //
-//	Bullish: base = entry + 2.0×ATR,  stretch = entry + 3.5×ATR
-//	Bearish: base = entry − 2.0×ATR,  stretch = entry − 3.5×ATR
+//	Bullish: base = entry + 3.0×ATR,  stretch = entry + 4.5×ATR
+//	Bearish: base = entry − 3.0×ATR,  stretch = entry − 4.5×ATR
+//
+// Multipliers raised from 2.0/3.5 to 3.0/4.5 — backtest showed avg wins of
+// only +3.7% underlying because 2x ATR targets were too close, producing a
+// 0.52:1 R/R that barely cleared break-even at 67% win rate.
+// At 3x ATR base, R/R improves to ~2:1 vs the 1.5x ATR stop.
 //
 // Returns (0, 0, false) when ATR cannot be computed.
 func ATRTargetRange(bars []Bar, period int, entry float64, direction string) (base, stretch float64, ok bool) {
@@ -607,10 +612,10 @@ func ATRTargetRange(bars []Bar, period int, entry float64, direction string) (ba
 		return 0, 0, false
 	}
 	if direction == "bullish" || direction == "call" {
-		return entry + 2.0*atr, entry + 3.5*atr, true
+		return entry + 3.0*atr, entry + 4.5*atr, true
 	}
 	// bearish / put
-	return entry - 2.0*atr, entry - 3.5*atr, true
+	return entry - 3.0*atr, entry - 4.5*atr, true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -812,6 +817,145 @@ func BollingerWidth(closes []float64, period int, numStdDev float64) (float64, b
 // ──────────────────────────────────────────────────────────────────────────────
 // Squeeze Ratio — Keltner Channel vs Bollinger Band compression
 // ──────────────────────────────────────────────────────────────────────────────
+
+// HighestHigh returns the highest bar High value over the last n bars.
+// Includes all n bars up to and including the most recent.
+func HighestHigh(bars []Bar, n int) float64 {
+	if n <= 0 || len(bars) == 0 {
+		return 0
+	}
+	start := len(bars) - n
+	if start < 0 {
+		start = 0
+	}
+	hi := bars[start].High
+	for i := start + 1; i < len(bars); i++ {
+		if bars[i].High > hi {
+			hi = bars[i].High
+		}
+	}
+	return hi
+}
+
+// LowestLow returns the lowest bar Low value over the last n bars.
+// Includes all n bars up to and including the most recent.
+func LowestLow(bars []Bar, n int) float64 {
+	if n <= 0 || len(bars) == 0 {
+		return 0
+	}
+	start := len(bars) - n
+	if start < 0 {
+		start = 0
+	}
+	lo := bars[start].Low
+	for i := start + 1; i < len(bars); i++ {
+		if bars[i].Low < lo {
+			lo = bars[i].Low
+		}
+	}
+	return lo
+}
+
+// AvgDailyVolume returns the simple average volume over the last n bars.
+func AvgDailyVolume(volumes []float64, n int) float64 {
+	if n <= 0 || len(volumes) == 0 {
+		return 0
+	}
+	start := len(volumes) - n
+	if start < 0 {
+		start = 0
+	}
+	count := len(volumes) - start
+	var sum float64
+	for i := start; i < len(volumes); i++ {
+		sum += volumes[i]
+	}
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
+}
+
+// BollingerWidthPercentile returns where the current Bollinger Band width sits
+// within its historical distribution over the prior `lookback` days.
+//
+// Returns a value 0.0-1.0: 0.0 means the current width is at or below the
+// historical minimum (squeeze active); 1.0 means at or above the maximum
+// (maximum expansion). A value < 0.25 indicates a volatility squeeze.
+//
+// Requires len(closes) >= period + lookback.
+func BollingerWidthPercentile(closes []float64, period, lookback int, numStdDev float64) (float64, bool) {
+	n := len(closes)
+	if n < period+lookback {
+		return 0, false
+	}
+
+	// Current BB width (most recent period bars).
+	currentWidth, ok := BollingerWidth(closes, period, numStdDev)
+	if !ok {
+		return 0, false
+	}
+
+	// Historical widths: one per prior day in the lookback window.
+	// Point i uses closes ending at n-lookback+i (excludes today).
+	historicalWidths := make([]float64, lookback)
+	for i := 0; i < lookback; i++ {
+		end := n - lookback + i
+		if end < period {
+			return 0, false
+		}
+		slice := closes[end-period : end]
+		var sum float64
+		for _, v := range slice {
+			sum += v
+		}
+		sma := sum / float64(period)
+		if sma == 0 {
+			return 0, false
+		}
+		var variance float64
+		for _, v := range slice {
+			d := v - sma
+			variance += d * d
+		}
+		stddev := math.Sqrt(variance / float64(period))
+		upper := sma + numStdDev*stddev
+		lower := sma - numStdDev*stddev
+		historicalWidths[i] = (upper - lower) / sma
+	}
+
+	// Percentile rank: fraction of historical widths BELOW the current width.
+	// Low percentile = current width narrower than most of history = squeeze.
+	belowCount := 0
+	for _, w := range historicalWidths {
+		if w < currentWidth {
+			belowCount++
+		}
+	}
+	pct := float64(belowCount) / float64(lookback)
+	if pct < 0 {
+		return 0, true
+	}
+	if pct > 1 {
+		return 1, true
+	}
+	return pct, true
+}
+
+// ATRCompressionExists returns true when the current ATR is at least 10% lower
+// than the ATR computed `lookback` bars ago, indicating a volatility contraction.
+func ATRCompressionExists(bars []Bar, period, lookback int) bool {
+	n := len(bars)
+	if n < period+lookback+1 {
+		return false
+	}
+	currentATR, ok1 := ATRLast(bars, period)
+	pastATR, ok2 := ATRLast(bars[:n-lookback], period)
+	if !ok1 || !ok2 || pastATR == 0 {
+		return false
+	}
+	return currentATR < pastATR*0.90
+}
 
 // SqueezeRatio computes how compressed Bollinger Bands are relative to the
 // Keltner Channel. A ratio < 1.0 indicates the bands are inside the channel —

@@ -25,6 +25,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DeprecatedLegacyFamiliesConfig wraps the old 5-family scoring model.
+// Set enabled: false (YAML default) to ensure the legacy engine path is unreachable.
+type DeprecatedLegacyFamiliesConfig struct {
+	Enabled  bool                    `yaml:"enabled"`
+	Warning  string                  `yaml:"warning"`
+	Families map[string]FamilyConfig `yaml:"families"`
+}
+
 // Rules is the decoded form of strategy_rules.yaml v7.
 type Rules struct {
 	Version int `yaml:"version"`
@@ -33,8 +41,12 @@ type Rules struct {
 	Regime    RegimeConfig    `yaml:"regime"`
 	Penalties PenaltiesConfig `yaml:"penalties"`
 
-	// Per-family complete policy (preconditions + scoring + options + hold).
-	Families map[string]FamilyConfig `yaml:"families"`
+	// Per-family complete policy. Populated from DeprecatedLegacyFamilies only when enabled=true.
+	// Kept in struct for engine.go backward compat; nil/empty when deprecated block is disabled.
+	Families map[string]FamilyConfig `yaml:"-"`
+
+	// Legacy families block — superseded by RSVE-O PRO. Kept for reference; enabled: false.
+	DeprecatedLegacyFamilies DeprecatedLegacyFamiliesConfig `yaml:"deprecated_legacy_strategy_families"`
 
 	PatternScoreConfig PatternScoreConfig `yaml:"pattern_scores"`
 	AntiPatternConfig  AntiPatternConfig  `yaml:"anti_patterns"`
@@ -52,6 +64,60 @@ type Rules struct {
 	ClaudeConfirmation ClaudeConfirmationConfig `yaml:"claude_confirmation"`
 	Schedule           ScheduleConfig           `yaml:"schedule"`
 	Risk               RiskConfig               `yaml:"risk"`
+
+	// RSVE-O strategy: binary gate evaluator replacing the 5-family scoring model.
+	// Lives in strategy_rules.yaml under the "rsve:" key.
+	RSVE RSVEConfig `yaml:"rsve"`
+}
+
+// ── RSVE-O binary gate configuration ─────────────────────────────────────────
+
+// RSVEConfig is the top-level config for the RSVE-O (Relative Strength Volatility
+// Expansion Options) strategy. All gates read their thresholds from here.
+type RSVEConfig struct {
+	Bullish         RSVEBranchConfig      `yaml:"bullish"`
+	Bearish         RSVEBranchConfig      `yaml:"bearish"`
+	Options         RSVEOptionsConfig     `yaml:"options"`
+	HoldWindow      HoldWindow            `yaml:"hold_window"`
+	PatternAnalysis PatternAnalysisConfig `yaml:"pattern_analysis"`
+}
+
+// PatternAnalysisConfig controls structural chart-pattern detection.
+// Patterns run after all stock hard gates pass, before option selection.
+// By default patterns boost ranking score only; set RequiredForTrade to
+// make at least one detected pattern a hard requirement.
+type PatternAnalysisConfig struct {
+	Enabled               bool     `yaml:"enabled"`
+	RequiredForTrade      bool     `yaml:"required_for_trade"`       // if true: no pattern → reject
+	AllowedPatterns       []string `yaml:"allowed_patterns"`          // names of permitted patterns
+	PatternScoreWeight    float64  `yaml:"pattern_score_weight"`      // max points added to rank score
+	MinimumPatternQuality float64  `yaml:"minimum_pattern_quality"`   // quality floor to count as detected
+}
+
+// RSVEBranchConfig holds the gate thresholds for one direction (bullish or bearish).
+// Both branches share the same struct shape; direction-specific semantics are in rsve.go.
+type RSVEBranchConfig struct {
+	VIXMax               float64 `yaml:"vix_max"`                 // regime gate: VIX must be below this
+	RSMinPct             float64 `yaml:"rs_min_pct"`              // relative strength: outperform SPY by at least this %
+	BreakoutLookback     int     `yaml:"breakout_lookback"`       // bars for highest-high / lowest-low pivot
+	BBWidthPercentileMax float64 `yaml:"bb_width_percentile_max"` // squeeze gate: BB width must be below this percentile
+	VolumeRatioMin       float64 `yaml:"volume_ratio_min"`        // relative volume floor
+	EarningsBlackoutDays int     `yaml:"earnings_blackout_days"`  // days before earnings to block entry
+}
+
+// RSVEOptionsConfig holds option chain quality gate thresholds.
+// Gates are skipped (treated as pass) when the field value is 0 or -1 (unavailable data).
+type RSVEOptionsConfig struct {
+	MaxIVRank       float64    `yaml:"max_iv_rank"`        // reject if IV rank > this (0-100)
+	MaxSpreadPct    float64    `yaml:"max_spread_pct"`     // reject if bid-ask spread > this % of mid
+	MinOpenInterest int        `yaml:"min_open_interest"`  // reject if OI < this
+	MinOptionVolume int        `yaml:"min_option_volume"`  // reject if daily option volume < this
+	DTEMin          int        `yaml:"dte_min"`
+	DTEMax          int        `yaml:"dte_max"`
+	TargetDTE       int        `yaml:"target_dte"`
+	DeltaMin        float64    `yaml:"delta_min"`
+	DeltaMax        float64    `yaml:"delta_max"`
+	HoldWindow      HoldWindow `yaml:"hold_window"`
 }
 
 // ── Risk ──────────────────────────────────────────────────────────────────────
@@ -95,16 +161,16 @@ type OptionLifecycleConfig struct {
 }
 
 // MechanicalExitsConfig defines hard exit rules evaluated every risk-check cycle.
-// These are NOT overridable by Claude. Claude can only approve hold_overnight.
+// All exits are deterministic — no Claude override.
+// Positions hold overnight by default (21-45 DTE swing system; no forced EOD exit).
 type MechanicalExitsConfig struct {
-	Enabled                         bool    `yaml:"enabled"`
-	MinHoldDays                     int     `yaml:"min_hold_days"`                        // never exit (EOD or mechanical) before this many days held
-	PremiumStopLossPct              float64 `yaml:"premium_stop_loss_pct"`                // exit if premium down this % from entry
-	PremiumTakeProfitPct            float64 `yaml:"premium_take_profit_pct"`              // exit if premium up this % from entry
-	PremiumTrailingStartPct         float64 `yaml:"premium_trailing_start_pct"`           // activate trail once premium up this %
-	PremiumTrailingGivebackPct      float64 `yaml:"premium_trailing_giveback_pct"`        // exit if gives back this % from peak after trail starts
-	ForceEODExitUnlessHoldConfirmed bool    `yaml:"force_eod_exit_unless_hold_confirmed"` // exit at EOD unless hold_overnight_approved
-	MaxHoldDaysWithoutReconfirm     int     `yaml:"max_hold_days_without_reconfirm"`      // require reconfirm after N hold days
+	Enabled                     bool    `yaml:"enabled"`
+	PremiumStopLossPct          float64 `yaml:"premium_stop_loss_pct"`           // exit if premium down this % from entry
+	PremiumTakeProfitPct        float64 `yaml:"premium_take_profit_pct"`         // exit if premium up this % from entry
+	PremiumTrailingStartPct     float64 `yaml:"premium_trailing_start_pct"`      // activate trail once premium up this %
+	PremiumTrailingGivebackPct  float64 `yaml:"premium_trailing_giveback_pct"`   // exit if gives back this % from peak after trail starts
+	MaxHoldDaysWithoutReconfirm int     `yaml:"max_hold_days_without_reconfirm"` // hard max hold days; force exit after this
+	TimeStopDays                int     `yaml:"time_stop_days"`                  // exit if no follow-through within this many days
 }
 
 // ── Global ────────────────────────────────────────────────────────────────────
@@ -346,11 +412,19 @@ type LiquidityFilters struct {
 
 // OpenConfirmationConfig maps to open_confirmation in strategy_rules.yaml.
 type OpenConfirmationConfig struct {
-	Enabled                   bool               `yaml:"enabled"`
-	ConfirmationWindowMinutes int                `yaml:"confirmation_window_minutes"`
-	MinTrueSignalsToConfirm   int                `yaml:"min_true_signals_to_confirm"`
-	Checks                    ConfirmationChecks `yaml:"checks"`
-	AutoReject                AutoRejectChecks   `yaml:"auto_reject"`
+	Enabled                   bool                        `yaml:"enabled"`
+	ConfirmationWindowMinutes int                         `yaml:"confirmation_window_minutes"`
+	MinTrueSignalsToConfirm   int                         `yaml:"min_true_signals_to_confirm"` // legacy field; ignored when RequiredChecks is set
+	RequiredChecks            ConfirmationRequiredChecks  `yaml:"required_checks"`
+	MinOptionalSignals        int                         `yaml:"min_optional_signals"` // at least this many optional signals must pass
+	Checks                    ConfirmationChecks          `yaml:"checks"`
+	AutoReject                AutoRejectChecks            `yaml:"auto_reject"`
+}
+
+// ConfirmationRequiredChecks names the signals that must ALL pass before optional signals are counted.
+type ConfirmationRequiredChecks struct {
+	LevelHolds    bool `yaml:"level_holds"`    // breakout_or_reclaim_holds must pass
+	MarketAligned bool `yaml:"market_aligned"` // market_open_alignment must pass
 }
 
 // ConfirmationChecks mirrors the checks sub-block.
@@ -431,9 +505,53 @@ type ScheduleConfig struct {
 	WeeklyReviewTime          string `yaml:"weekly_review_time"`          // "07:00"
 }
 
+// DefaultRSVEConfig returns safe RSVE-O thresholds used when YAML is absent.
+func DefaultRSVEConfig() RSVEConfig {
+	return RSVEConfig{
+		Bullish: RSVEBranchConfig{
+			VIXMax:               24.0,
+			RSMinPct:             2.0,
+			BreakoutLookback:     20,
+			BBWidthPercentileMax: 0.30,
+			VolumeRatioMin:       1.2,
+			EarningsBlackoutDays: 5,
+		},
+		Bearish: RSVEBranchConfig{
+			VIXMax:               32.0,
+			RSMinPct:             2.0,
+			BreakoutLookback:     20,
+			BBWidthPercentileMax: 0.30,
+			VolumeRatioMin:       1.2,
+			EarningsBlackoutDays: 5,
+		},
+		Options: RSVEOptionsConfig{
+			MaxIVRank:       70,
+			MaxSpreadPct:    8.0,
+			MinOpenInterest: 500,
+			MinOptionVolume: 50,
+			DTEMin:          21,
+			DTEMax:          45,
+			TargetDTE:       30,
+			DeltaMin:        0.40,
+			DeltaMax:        0.65,
+			HoldWindow:      HoldWindow{Min: 5, Base: 7, Max: 14},
+		},
+		HoldWindow: HoldWindow{Min: 5, Base: 7, Max: 14},
+		PatternAnalysis: PatternAnalysisConfig{
+			Enabled:               true,
+			RequiredForTrade:      false,
+			AllowedPatterns:       []string{"bull_flag", "bear_flag", "ascending_triangle", "descending_triangle", "base_breakout", "base_breakdown"},
+			PatternScoreWeight:    15.0,
+			MinimumPatternQuality: 0.60,
+		},
+	}
+}
+
 // ── Loader ────────────────────────────────────────────────────────────────────
 
 // LoadRules parses strategy_rules.yaml from the given path.
+// Families is only populated when deprecated_legacy_strategy_families.enabled=true;
+// with enabled=false (the default) Families is nil and the legacy engine is unreachable.
 func LoadRules(path string) (*Rules, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -442,6 +560,9 @@ func LoadRules(path string) (*Rules, error) {
 	var r Rules
 	if err := yaml.Unmarshal(data, &r); err != nil {
 		return nil, fmt.Errorf("parse rules: %w", err)
+	}
+	if r.DeprecatedLegacyFamilies.Enabled {
+		r.Families = r.DeprecatedLegacyFamilies.Families
 	}
 	return &r, nil
 }
@@ -673,14 +794,16 @@ func DefaultRules() *Rules {
 		},
 		OptionsTranslation: OptionsTranslationConfig{
 			LiquidityFilters: LiquidityFilters{
-				MinOpenInterest: 100, MinOptionVolume: 10, MaxBidAskSpreadPctOfMid: 10.0,
+				MinOpenInterest: 500, MinOptionVolume: 50, MaxBidAskSpreadPctOfMid: 8.0,
 			},
 			HideOptionsForStatuses: []string{
 				"rejected", "structural_candidate", "entry_ready", "watch_only", "blocked_by_event",
 			},
 		},
 		OpenConfirmation: OpenConfirmationConfig{
-			Enabled: true, ConfirmationWindowMinutes: 10, MinTrueSignalsToConfirm: 3,
+			Enabled: true, ConfirmationWindowMinutes: 10,
+			RequiredChecks:     ConfirmationRequiredChecks{LevelHolds: true, MarketAligned: true},
+			MinOptionalSignals: 1,
 			Checks: ConfirmationChecks{
 				BreakoutOrReclaimHolds: true, OpeningRangeCloseAboveMidpointForCalls: true,
 				OpeningRangeCloseBelowMidpointForPuts: true, NoRejectionWickForCalls: true,
@@ -715,15 +838,16 @@ func DefaultRules() *Rules {
 			DeterministicSignalsSoftMin:        2,
 			DeterministicAutoRejectIsHardBlock: true,
 		},
+		RSVE: DefaultRSVEConfig(),
 		Risk: RiskConfig{
 			OptionLifecycle: OptionLifecycleConfig{
-				DTEMin: 7, DTEMax: 21, TargetDTE: 14,
-				AvoidDTEBelow: 4, ContractsPerTrade: 1,
+				DTEMin: 21, DTEMax: 45, TargetDTE: 30,
+				AvoidDTEBelow: 21, ContractsPerTrade: 1,
 			},
 			IVFilter: IVFilterConfig{
 				Enabled:              true,
-				MaxIVRankPct:         50,
-				IdealIVRankPct:       35,
+				MaxIVRankPct:         70,
+				IdealIVRankPct:       50,
 				LookbackDays:         30,
 				MinSnapshotsRequired: 5,
 			},
@@ -734,14 +858,13 @@ func DefaultRules() *Rules {
 				MaxPremiumPctPortfolio: 5.0,
 			},
 			MechanicalExits: MechanicalExitsConfig{
-				Enabled:                         true,
-				MinHoldDays:                     2,
-				PremiumStopLossPct:              30,
-				PremiumTakeProfitPct:            50,
-				PremiumTrailingStartPct:         10,
-				PremiumTrailingGivebackPct:      15,
-				ForceEODExitUnlessHoldConfirmed: true,
-				MaxHoldDaysWithoutReconfirm:     5,
+				Enabled:                     true,
+				PremiumStopLossPct:          25,
+				PremiumTakeProfitPct:        70,
+				PremiumTrailingStartPct:     35,
+				PremiumTrailingGivebackPct:  10,
+				MaxHoldDaysWithoutReconfirm: 5,
+				TimeStopDays:                2,
 			},
 		},
 	}

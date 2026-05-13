@@ -10,12 +10,14 @@
 include .env
 export
 
-BINARY_SERVER := bin/server
-BINARY_WORKER := bin/worker
-MIGRATIONS_DIR := $(shell pwd)/migrations
-GO_FILES := $(shell find . -name '*.go' -not -path './vendor/*')
+BINARY_SERVER     := bin/server
+BINARY_WORKER     := bin/worker
+BINARY_SUPERVISOR := bin/supervisor
+MIGRATIONS_DIR    := $(shell pwd)/migrations
+GO_FILES          := $(shell find . -name '*.go' -not -path './vendor/*')
 
 .PHONY: help up down down-v logs ps \
+        start stop app-logs \
         dev dev-down \
         server worker build \
         psql redis temporal-ui \
@@ -48,6 +50,23 @@ logs-%: ## Tail logs for a specific service: make logs-postgres
 
 ps: ## Show status of all Docker services
 	docker compose ps
+
+# ── Supervisor: production long-running mode ─────────────────────────────────
+# make start   — builds supervisor + server + worker, then runs in foreground.
+#                Ctrl-C (or: make stop) for clean shutdown.
+# make stop    — sends SIGTERM to supervisor; it stops server + worker first.
+# make app-logs — tail server and worker log files (not Docker logs).
+start: ## Build and start the supervisor (manages server + worker; Ctrl-C to stop)
+	@go build -o $(BINARY_SUPERVISOR) ./cmd/supervisor/
+	@./$(BINARY_SUPERVISOR)
+
+stop: ## Stop the supervisor (and all managed processes)
+	@PID=$$(cat logs/supervisor.pid 2>/dev/null) && \
+	  kill "$$PID" 2>/dev/null && echo "Stopped supervisor (PID $$PID)" || \
+	  echo "Supervisor not running (no logs/supervisor.pid)"
+
+app-logs: ## Tail server and worker log files
+	@tail -f logs/server.log logs/worker.log
 
 # ── Dev: start everything with one command ───────────────────────────────────
 # make dev  — starts Docker services, then runs server + worker in parallel.

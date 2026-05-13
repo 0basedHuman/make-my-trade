@@ -102,6 +102,7 @@ func main() {
 	mux.HandleFunc("/api/force-confirm", h.ForceConfirm)
 	mux.HandleFunc("/api/daily-analysis", h.DailyAnalysis)
 	mux.HandleFunc("/api/paper-positions", h.PaperPositions)
+	mux.HandleFunc("/api/rejection-analytics", h.RejectionAnalytics)
 
 	// Static UI — serve from embedded FS (web/embed.go)
 	staticFS, err := fs.Sub(web.Static, "static")

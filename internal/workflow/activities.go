@@ -230,6 +230,13 @@ func (d *ActivityDeps) RunDailyAnalysisActivity(ctx context.Context) (string, er
 				log.Printf("activity: upsert %s: %v", t, upsertErr)
 			}
 
+			// Sentiment diagnostics — context only, never a gate.
+			sc := market.FetchSentimentContext(t)
+			if sc.Signal != "unavailable" {
+				log.Printf("activity: sentiment_context ticker=%s signal=%s source=%s note=%s",
+					sc.Ticker, sc.Signal, sc.Source, sc.Note)
+			}
+
 			mu.Lock()
 			allResults = append(allResults, symResult{
 				ticker:           t,
@@ -583,14 +590,19 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			continue
 		}
 
-		// Use ask price — mid-price limits sit unfilled in paper trading
-		limitPrice := best.Ask
-		if best.Bid <= 0 {
-			limitPrice = best.Ask
+		// Quote-realistic fill: mid for tight spreads, haircut for wide, reject if too wide.
+		fill := market.ComputeEntryFill(best.Bid, best.Ask)
+		if fill.Rejected {
+			log.Printf("activity: %s → watch_only (fill_rejected=%s bid=%.2f ask=%.2f spread=%.1f%%)",
+				c.Ticker, fill.RejectReason, best.Bid, best.Ask, fill.SpreadPct)
+			_ = store.UpdateCandidateStatus(ctx, d.Pool, c.ID, "watch_only")
+			watchOnlyCount++
+			continue
 		}
+		limitPrice := fill.Price
 
-		log.Printf("activity: contract_selected: ticker=%s family=%s contract=%s strike=%.2f dte=%d dte_range=%d-%d target_dte=%d delta=%.3f mid=%.2f spread=%.1f%% oi=%d vol=%d",
-			c.Ticker, c.SetupFamily, best.Symbol, best.Strike, best.DTE, selOpts.DTEMin, selOpts.DTEMax, selOpts.TargetDTE, best.Delta, limitPrice, best.SpreadPct, best.OpenInterest, best.OptionVolume)
+		log.Printf("activity: contract_selected: ticker=%s family=%s contract=%s strike=%.2f dte=%d dte_range=%d-%d target_dte=%d delta=%.3f fill=%.2f mode=%s spread=%.1f%% quality=%.0f slippage=%.4f oi=%d vol=%d",
+			c.Ticker, c.SetupFamily, best.Symbol, best.Strike, best.DTE, selOpts.DTEMin, selOpts.DTEMax, selOpts.TargetDTE, best.Delta, limitPrice, fill.Mode, fill.SpreadPct, fill.QualityScore, fill.SlippageEst, best.OpenInterest, best.OptionVolume)
 
 		// ── b2. Save daily IV snapshot (best-effort; never blocks entry) ────────────
 		// Proxy IV = ask / (underlying * sqrt(DTE/252)). Used for rolling IV rank.
@@ -717,16 +729,21 @@ func (d *ActivityDeps) RunOpeningConfirmationActivity(ctx context.Context) (stri
 			}
 		}
 
+		// Structure invalidation level: use candidate's stop_loss (underlying-price level
+		// computed during daily analysis from pattern detection or ATR).
+		structureLevel := c.StopLoss
+
 		buyResult, buyErr := execution.BuyOptionPosition(ctx, d.Pool, d.Alpaca, execution.BuyInput{
-			CandidateID:    c.ID,
-			Ticker:         c.Ticker,
-			SetupFamily:    c.SetupFamily,
-			OptionType:     ev.optionType,
-			ContractSymbol: best.Symbol,
-			LimitPrice:     limitPrice,
-			StopLoss:       c.StopLoss,
-			Target1:        c.Target1,
-			Target2:        c.Target2,
+			CandidateID:                c.ID,
+			Ticker:                     c.Ticker,
+			SetupFamily:                c.SetupFamily,
+			OptionType:                 ev.optionType,
+			ContractSymbol:             best.Symbol,
+			LimitPrice:                 limitPrice,
+			StopLoss:                   c.StopLoss,
+			Target1:                    c.Target1,
+			Target2:                    c.Target2,
+			StructureInvalidationLevel: structureLevel,
 		})
 		if buyErr != nil {
 			log.Printf("activity: buy option position %s: %v", c.Ticker, buyErr)
@@ -1122,18 +1139,24 @@ func runMechanicalChecks(ctx context.Context, pool *pgxpool.Pool, alpaca executi
 			direction = "bearish"
 		}
 
+		// Use pattern-derived structure level when available; fall back to entry price as proxy.
+		structureLevel := p.StructureInvalidationLevel
+		if structureLevel <= 0 {
+			structureLevel = p.EntryPrice
+		}
+
 		pos := risk.PositionRiskState{
-			PositionID:      p.ID,
-			Ticker:          p.Ticker,
-			OptionSymbol:    p.OptionSymbol,
-			EntryPremium:    p.OptionPremium,
-			PeakOptionPrice: p.PeakOptionPrice,
-			TrailingActive:  p.TrailingActive,
-			EntryDate:       p.EntryDate,
-			DaysHeld:        int(nowPT.Sub(p.EntryDate).Hours() / 24),
-			Direction:       direction,
-			BreakoutLevel:   p.EntryPrice, // underlying price at entry ≈ breakout level
-			UnderlyingClose: underlyingClose,
+			PositionID:                 p.ID,
+			Ticker:                     p.Ticker,
+			OptionSymbol:               p.OptionSymbol,
+			EntryPremium:               p.OptionPremium,
+			PeakOptionPrice:            p.PeakOptionPrice,
+			TrailingActive:             p.TrailingActive,
+			EntryDate:                  p.EntryDate,
+			DaysHeld:                   int(nowPT.Sub(p.EntryDate).Hours() / 24),
+			Direction:                  direction,
+			StructureInvalidationLevel: structureLevel,
+			UnderlyingClose:            underlyingClose,
 		}
 
 		dec := risk.EvaluateMechanicalExit(pos, currentMid, mexitRules, nowPT)

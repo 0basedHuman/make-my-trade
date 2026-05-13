@@ -254,7 +254,7 @@ func TestNoExit_RulesDisabled(t *testing.T) {
 func TestStructureInvalidation_Bullish_UnderlyingBelowBreakout(t *testing.T) {
 	pos := basePos(5.00)
 	pos.Direction = "bullish"
-	pos.BreakoutLevel = 100.0
+	pos.StructureInvalidationLevel = 100.0
 	pos.UnderlyingClose = 98.0 // closed below breakout
 	dec := EvaluateMechanicalExit(pos, 5.10, testRules(), midday()) // option still fine
 	if !dec.ShouldExit {
@@ -268,7 +268,7 @@ func TestStructureInvalidation_Bullish_UnderlyingBelowBreakout(t *testing.T) {
 func TestStructureInvalidation_Bearish_UnderlyingAboveBreakdown(t *testing.T) {
 	pos := basePos(5.00)
 	pos.Direction = "bearish"
-	pos.BreakoutLevel = 100.0
+	pos.StructureInvalidationLevel = 100.0
 	pos.UnderlyingClose = 102.0 // closed above breakdown level
 	dec := EvaluateMechanicalExit(pos, 5.10, testRules(), midday())
 	if !dec.ShouldExit {
@@ -282,7 +282,7 @@ func TestStructureInvalidation_Bearish_UnderlyingAboveBreakdown(t *testing.T) {
 func TestStructureInvalidation_Bullish_HoldsAboveBreakout(t *testing.T) {
 	pos := basePos(5.00)
 	pos.Direction = "bullish"
-	pos.BreakoutLevel = 100.0
+	pos.StructureInvalidationLevel = 100.0
 	pos.UnderlyingClose = 101.5 // still above breakout
 	dec := EvaluateMechanicalExit(pos, 5.10, testRules(), midday())
 	if dec.ShouldExit {
@@ -294,7 +294,7 @@ func TestStructureInvalidation_Skipped_WhenUnderlyingZero(t *testing.T) {
 	// UnderlyingClose = 0 → caller didn't populate it → rule skipped
 	pos := basePos(5.00)
 	pos.Direction = "bullish"
-	pos.BreakoutLevel = 100.0
+	pos.StructureInvalidationLevel = 100.0
 	pos.UnderlyingClose = 0 // not populated
 	dec := EvaluateMechanicalExit(pos, 5.10, testRules(), midday())
 	if dec.ShouldExit {
@@ -306,7 +306,7 @@ func TestStructureInvalidation_PremiumStopHasPriority(t *testing.T) {
 	// Both stop loss AND structure invalidation triggered — stop loss fires first.
 	pos := basePos(5.00)
 	pos.Direction = "bullish"
-	pos.BreakoutLevel = 100.0
+	pos.StructureInvalidationLevel = 100.0
 	pos.UnderlyingClose = 98.0 // below breakout
 	// Premium also at stop floor: 5.00 * 0.70 = 3.50
 	dec := EvaluateMechanicalExit(pos, 3.50, testRules(), midday())

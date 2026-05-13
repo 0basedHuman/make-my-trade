@@ -1,5 +1,93 @@
 # Current Refactor Status
 
+## Completed: Stale Worker Bug Fix (2026-05-12)
+
+### Problem
+Two orphaned worker processes (PIDs 90119, 89583) from Apr 28 go-run sessions were competing on the same Temporal task queue. The DailyResearchCycle ran on the stale binary (old code), which used `gate_btc` DB column (since renamed to `gate_relative_strength`). All UpsertCandidate calls silently failed, storing 0 rows in trade_candidates. The daily_summaries row was also written to wrong date (May 11 instead of May 12) due to old code.
+
+### Fix
+- Killed PIDs 90119, 89583 via `kill -9`
+- Added `pkill -f "go-build.*worker"` and `pkill -f "tmp.*exe/worker"` to `start.sh` section 4 to kill orphaned go-run workers on every restart
+
+### Verified
+- Only `bin/worker` PID 50270 remains on `makemytrade-main` task queue
+- Tomorrow's scan will use current binary with `gate_relative_strength` and all v14 upgrades
+
+### Root cause of no-trade today
+Market legitimately quiet: yesterday's gate failures were market_downtrend (7 tickers), volume_expansion (8 tickers), relative_strength (6 tickers). VIX=20, spy_trend_ok=NULL (bug: not being written). No position warranted.
+
+---
+
+## Completed: Production Hardening v14 — 6 Upgrades (2026-05-11)
+
+### Objective
+Production hardening: pattern-derived structure invalidation, quote-realistic fill model, walk-forward threshold research, deflated Sharpe reporting, sentiment as context only, rejection analytics endpoint.
+
+### All requirements completed
+
+#### Upgrade 1: Structure Invalidation Level (pattern-derived)
+- `risk/options.go`: renamed `BreakoutLevel` → `StructureInvalidationLevel` in `PositionRiskState`; exit rule #6 uses it
+- `store.go`: added `StructureInvalidationLevel float64` to `PaperPositionInput`; INSERT now includes `structure_invalidation_level` column
+- `execution/options.go`: added `StructureInvalidationLevel float64` to `BuyInput`; wired through to DB
+- `activities.go`: `runMechanicalChecks` uses `p.StructureInvalidationLevel` (fallback to `p.EntryPrice`); buy call passes `c.StopLoss` as proxy level (computed from pattern during daily analysis)
+- `risk/options_test.go`: updated all 5 structure invalidation tests (`BreakoutLevel` → `StructureInvalidationLevel`)
+- `migrations/000010_structure_invalidation.up.sql`: applied — column is live in DB
+
+#### Upgrade 2: Quote-Realistic Fill Model
+- `internal/market/fill.go` (new): `ComputeEntryFill(bid, ask)` — mid/haircut/reject tiers; `ComputeExitFill(bid, ask)` — bid×0.995; `fillQualityScore` with 5 tiers
+- Wired into `RunOpeningConfirmationActivity`: replaces `limitPrice = best.Ask` with `market.ComputeEntryFill`; fill-rejected candidates go to watch_only
+- Log now includes: fill mode, spread%, quality score, slippage estimate
+- `internal/market/fill_test.go` (new): 8 tests (all pass)
+
+#### Upgrade 3: Walk-Forward Threshold Research
+- `internal/research/walkforward.go` (new): `RunWalkForward`, `ThresholdGrid` (4×3×3×3×5=540), `SortByStability`
+- `internal/research/walkforward_test.go` (new): 5 tests (no-leakage, rolling-only, threshold-filters, insufficient-data, stability-score)
+- `cmd/wfresearch/main.go` (new): CLI to run walk-forward from DB; prints ranked results + DSR report
+
+#### Upgrade 4: Deflated Sharpe + FDR Warning
+- `internal/research/sharpe.go` (new): `DeflatedSharpeReport(nTrials, maxSR, oosSR, T, skew, kurt)` — Bailey & Lopez de Prado 2014 formula
+- `internal/research/sharpe_test.go` (new): 7 tests (all pass)
+
+#### Upgrade 5: Sentiment as Context Only
+- `internal/market/sentiment.go` (new): `FetchSentimentContext(ticker)` — returns `SentimentContext{Ticker, Signal, Source, Note}`; always returns "unavailable" (stub)
+- Wired into `RunDailyAnalysisActivity` after upsert: logs `sentiment_context` line; never gates any trade
+
+#### Upgrade 6: Rejection Analytics
+- `store.go`: `GetRejectionAnalytics(ctx, pool, limitDays)` — aggregates `trade_candidates` by reject_reason, direction, VIX bucket
+- `handlers.go`: `RejectionAnalytics` handler with `?days=30` param; added `strconv` import
+- `cmd/server/main.go`: route `/api/rejection-analytics`
+
+### Build / test status
+- `go build ./...` ✅
+- `go test ./internal/risk/... ./internal/market/... ./internal/research/... ./internal/strategy/...` ✅ (all pass)
+- Migration 000010 applied ✅
+
+### Files changed
+- `internal/risk/options.go`
+- `internal/risk/options_test.go`
+- `internal/store/store.go`
+- `internal/execution/options.go`
+- `internal/workflow/activities.go`
+- `internal/api/handlers.go`
+- `cmd/server/main.go`
+- `cmd/wfresearch/main.go` (new)
+- `internal/market/fill.go` (new)
+- `internal/market/fill_test.go` (new)
+- `internal/market/sentiment.go` (new)
+- `internal/research/walkforward.go` (new)
+- `internal/research/walkforward_test.go` (new)
+- `internal/research/sharpe.go` (new)
+- `internal/research/sharpe_test.go` (new)
+- `migrations/000010_structure_invalidation.up.sql` (new, applied)
+- `migrations/000010_structure_invalidation.down.sql` (new)
+
+### Remaining work
+- Start/restart server and worker with new binaries (migration already applied)
+- `cmd/wfresearch` requires a populated DB with closed positions to be useful
+- Sentiment stub always returns "unavailable" — future: wire Finnhub/Reddit API
+
+---
+
 ## Completed: RSVE-O PRO Phase 3 — Claude Removal + Structure Invalidation (2026-05-09)
 
 ### Objective
@@ -221,7 +309,7 @@ Apply all 10 mandatory RSVE-O corrections: remove Claude from all trading paths,
 - `RunEODPositionReviewActivity`: Removed Claude hold approval. Replaced with deterministic: auto-hold if `days_held < max_hold_days (5)`, else force exit.
 - `RunContinuationReviewActivity`: Delegates to RunPositionReviewActivity (inherits fix).
 - `RunOpeningConfirmationActivity`: Already deterministic from previous session.
-- Claude retained only for `RunWeeklyReviewActivity` (offline, not a trading path).
+- `RunWeeklyReviewActivity` is a disabled stub — returns immediately, no Claude call.
 
 #### 2. DTE range: 21-45, target 30
 - `strategy_rules.yaml`: `rsve.options.dte_min=21`, `risk.option_lifecycle.dte_min=21`, `avoid_dte_below=21`

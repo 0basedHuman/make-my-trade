@@ -63,11 +63,11 @@ type PositionRiskState struct {
 
 	// Structure invalidation fields (rule 6).
 	// Direction: "bullish" or "bearish" (derived from option_type).
-	// BreakoutLevel: underlying price at entry — proxy for the RSVE breakout level.
+	// StructureInvalidationLevel: pattern-derived level (bull_flag→flag low, triangle→swing low, etc.)
 	// UnderlyingClose: current underlying mid-price (0 = skip rule).
-	Direction       string
-	BreakoutLevel   float64
-	UnderlyingClose float64
+	Direction                  string
+	StructureInvalidationLevel float64
+	UnderlyingClose            float64
 }
 
 // MechanicalExitDecision is the output of EvaluateMechanicalExit.
@@ -163,18 +163,18 @@ func EvaluateMechanicalExit(pos PositionRiskState, currentPremium float64, rules
 		return dec
 	}
 
-	// 6. Structure invalidation: underlying closes back through breakout/breakdown level.
-	// Only fires when UnderlyingClose is populated by the caller (> 0) and BreakoutLevel is set.
-	if pos.UnderlyingClose > 0 && pos.BreakoutLevel > 0 {
+	// 6. Structure invalidation: underlying closes back through the pattern-derived invalidation level.
+	// Only fires when UnderlyingClose is populated by the caller (> 0) and level is set.
+	if pos.UnderlyingClose > 0 && pos.StructureInvalidationLevel > 0 {
 		switch pos.Direction {
 		case "bullish":
-			if pos.UnderlyingClose < pos.BreakoutLevel {
+			if pos.UnderlyingClose < pos.StructureInvalidationLevel {
 				dec.ShouldExit = true
 				dec.Reason = ExitReasonStructureInvalidation
 				return dec
 			}
 		case "bearish":
-			if pos.UnderlyingClose > pos.BreakoutLevel {
+			if pos.UnderlyingClose > pos.StructureInvalidationLevel {
 				dec.ShouldExit = true
 				dec.Reason = ExitReasonStructureInvalidation
 				return dec

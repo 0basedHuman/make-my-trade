@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1872,6 +1873,27 @@ func mapReviewAction(claudeStatus string) string {
 	default:
 		return "HOLD"
 	}
+}
+
+// RejectionAnalytics returns rejection counts aggregated by gate, direction, and VIX bucket.
+// Query param: ?days=30 (default 30).
+func (h *Handler) RejectionAnalytics(w http.ResponseWriter, r *http.Request) {
+	days := 30
+	if d := r.URL.Query().Get("days"); d != "" {
+		if n, err := strconv.Atoi(d); err == nil && n > 0 {
+			days = n
+		}
+	}
+	rows, err := store.GetRejectionAnalytics(r.Context(), h.pool, days)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "rejection analytics query failed: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{
+		"days":  days,
+		"rows":  rows,
+		"count": len(rows),
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

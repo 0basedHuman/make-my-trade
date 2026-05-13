@@ -55,9 +55,10 @@ type BuyInput struct {
 	LimitPrice     float64 // premium to pay (options, per-share × 100 = total)
 
 	// Risk levels for the position record
-	StopLoss float64
-	Target1  float64
-	Target2  float64
+	StopLoss                   float64
+	Target1                    float64
+	Target2                    float64
+	StructureInvalidationLevel float64 // pattern-derived level; 0 = not set
 }
 
 // BuyResult holds the identifiers created by a successful buy.
@@ -85,16 +86,17 @@ func BuyOptionPosition(ctx context.Context, pool *pgxpool.Pool, alpaca Alpaca, i
 
 	// 2. Create paper position in DB
 	posIn := store.PaperPositionInput{
-		CandidateID: in.CandidateID,
-		Ticker:      in.Ticker,
-		EntryPrice:  in.LimitPrice,
-		EntryDate:   time.Now(),
-		Shares:      1, // always 1 contract
-		StopLoss:    in.StopLoss,
-		Target1:     in.Target1,
-		Target2:     in.Target2,
-		OptionType:  in.OptionType,
-		SetupFamily: in.SetupFamily,
+		CandidateID:                in.CandidateID,
+		Ticker:                     in.Ticker,
+		EntryPrice:                 in.LimitPrice,
+		EntryDate:                  time.Now(),
+		Shares:                     1, // always 1 contract
+		StopLoss:                   in.StopLoss,
+		Target1:                    in.Target1,
+		Target2:                    in.Target2,
+		OptionType:                 in.OptionType,
+		SetupFamily:                in.SetupFamily,
+		StructureInvalidationLevel: in.StructureInvalidationLevel,
 	}
 	positionID, err := store.CreatePaperPosition(ctx, pool, posIn)
 	if err != nil {

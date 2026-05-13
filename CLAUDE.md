@@ -54,21 +54,17 @@ If strategy behavior changes, update YAML first.
 When resuming work:
 - read `docs/current_refactor_status.md`
 
-When working on weekly review, paper-trade performance analysis, or tuning proposals:
-- read `docs/weekly_review_protocol.md`
-
 ## Current architecture mental model
 
 Treat this app as a layered pipeline:
 
 1. deterministic data fetch and preprocessing
-2. deterministic setup classification
-3. option-chain quality filtering
-4. bounded Claude review
-5. lifecycle state persistence
-6. deterministic confirmation promotion
-7. paper position creation and management
-8. weekly review and tuning proposals
+2. deterministic RSVE gate evaluation (13 binary gates)
+3. option-chain quality filtering + quote-realistic fill model
+4. lifecycle state persistence
+5. deterministic confirmation promotion (required + optional signals)
+6. paper position creation and management (auto, no approval needed)
+7. mechanical exit management (stop/TP/trail/time-stop/structure_invalidation)
 
 ## Required lifecycle states
 
@@ -153,18 +149,6 @@ That means the system must support this automated flow:
      - EXIT
      - WATCH_CLOSELY
 
-5. Weekly review
-   - aggregate one week of paper-trade outcomes
-   - summarize:
-     - confirmed trades
-     - exits
-     - false positives
-     - false negatives
-     - regime fit
-     - setup-family performance
-   - propose explicit strategy updates
-   - do not auto-apply them
-
 ## Paper-trade rules
 
 For paper trading:
@@ -187,8 +171,7 @@ Claude may:
 - explain trade rationale
 - explain rejections
 - review open paper positions daily
-- generate weekly review summaries
-- propose explicit tuning ideas
+- propose explicit tuning ideas when asked
 
 Claude must not:
 - invent hard strategy rules outside YAML
@@ -200,12 +183,11 @@ Claude must not:
 
 ## Strategy tuning policy
 
-Use **weekly review**, not autonomous self-learning.
+Manual review only — no autonomous self-learning.
 
 Allowed:
 - summarize performance by setup family
 - propose threshold changes
-- propose target-model adjustments
 - propose confirmation strictness adjustments
 - propose chain-quality threshold adjustments
 
@@ -265,9 +247,8 @@ This phase is done only when:
 - daily analysis runs without manual repo editing
 - confirmation runs without manual approval
 - confirmed setups create paper positions automatically
-- open paper positions are reviewed daily
+- open paper positions are reviewed daily (mechanical exits every 10m + EOD check)
 - new trades for already-open tickers are suppressed
-- weekly review summary is generated
 - one month of autonomous paper trading is operational
 
 ---
@@ -312,19 +293,16 @@ Tests: `internal/strategy/rsve_test.go`
 
 ---
 
-## Daily Workflow Timeline
+## Daily Workflow Timeline (4 active Temporal schedules)
 
 ```
-06:25 PT  DailyResearchCycle         RSVE gates all tickers → entry_ready or rejected
-06:42 PT  OpeningConfirmationCycle   deterministic signals ≥ 3/5 → confirmed; else → watch_only
-07:15 PT  FirstPositionReviewCycle   Claude reviews open positions: HOLD/TIGHTEN/EXIT
-07:45 PT  ContinuationReviewCycle    fresh intraday bars, position tighten/exit
-every 10m MechanicalRiskCycle        stop 0.70x, TP 1.50x, trailing 1.35x/0.80x, EOD exit 12:45
-12:45 PT  DailyPositionReview        Claude EOD hold approval or force exit
-Sun 07:00 WeeklyReviewCycle          performance summary + tuning proposals (NOT auto-applied)
+06:45 PT  DailyResearchCycle         RSVE 13-gate evaluation → entry_ready or rejected
+07:00 PT  OpeningConfirmationCycle   required+optional signals → confirmed or watch_only; auto paper entry
+every 10m MechanicalRiskCycle        stop/TP/trail/time-stop/structure_invalidation
+12:45 PT  DailyPositionReview        EOD mechanical check + overnight hold log
 ```
 
-Confirmation type logged: `rsve_deterministic` (Claude removed from confirmation path 2026-05-06).
+Confirmation type logged: `rsve_deterministic`. No Claude in any trading path.
 
 ---
 
@@ -341,34 +319,50 @@ Confirmation type logged: `rsve_deterministic` (Claude removed from confirmation
 | Daily analysis pipeline | ✅ | `activities.go` → `RunDailyAnalysisActivity` |
 | Opening confirmation | ✅ deterministic | Claude removed 2026-05-06 |
 | Mechanical exits | ✅ | `MechanicalRiskCycle` every 10 min |
-| Position review (daily) | ✅ Claude | `RunDailyPositionReviewActivity` |
-| Weekly review command | ⬜ not yet | `cmd/weeklyreview/` — not written |
+| Position review (EOD) | ✅ mechanical | `RunDailyPositionReviewActivity` — no Claude |
+| Walk-forward research | ✅ | `cmd/wfresearch/main.go` |
 | Backtest | ✅ RSVE-based | `cmd/backtest/main.go` |
 
 ---
 
 ## Context Management
 
-### Files to read on every session start (in order)
-1. `CLAUDE.md` — this file (boundaries, rules, strategy summary)
-2. `docs/checkpoint.md` — what was in progress at last compaction or save
-3. `docs/history.md` — full session history table; see what was built and why
-4. `docs/current_refactor_status.md` — latest completed work and exact next step
+### Files to read on every session start (in order) — MANDATORY
 
-**Do not scan the repo broadly until you have read all four files above.**
+**CRITICAL: Do not do ANY work until all four files have been read. No exceptions.**
 
-### checkpoint.md rules
-- Location: `docs/checkpoint.md`
-- **On each new session start:** overwrite with a clean snapshot of current state before doing any work.
-- Contents: current task, files being changed, build status, exact next step, open questions.
-- **Auto-save at ~70% context:** proactively update `docs/checkpoint.md` mid-session without being asked.
-- **At 95% token exhaustion (hourly or weekly limit):** APPEND to `docs/checkpoint.md` — do NOT overwrite.
-  Use a `---` separator with a timestamp so previous checkpoint is preserved as fallback.
-  This captures the last known-good progress before tokens run out.
+1. `CLAUDE.md` — this file
+2. `docs/checkpoint.md` — what was running and what changed last session
+3. `docs/history.md` — full session log; why things were built
+4. `docs/current_refactor_status.md` — completed work + exact next step
 
-### history.md rules
-- Location: `docs/history.md`
-- **At end of each session:** APPEND a new row to the table — never overwrite existing rows.
-- Compress "User Prompt" to ≤15 words. Keep "Claude Achieved" factual and ≤20 words.
-- This is the project's institutional memory. Read it when you need to understand why something was built.
-- Do not summarize or reformat old rows — only add new ones.
+These files ARE the project's state. Skipping them means working from stale context and breaking things that were already fixed.
+
+### Files to update at every session END — MANDATORY
+
+**CRITICAL: Never end a session without updating all three. This is how future sessions know what happened.**
+
+1. `docs/checkpoint.md` — OVERWRITE entirely with: what is running, what changed, exact next step
+2. `docs/history.md` — APPEND one new row (user prompt ≤15 words, achieved ≤20 words); never rewrite old rows
+3. `docs/current_refactor_status.md` — PREPEND new completed section at top
+
+**Also update at ~70% context** — do not wait for session end.
+
+### What breaks if these rules are skipped
+
+This happened 2026-05-07 to 2026-05-11 (5 sessions with no updates):
+- strategy_rules.yaml accumulated 14k chars of dead deprecated config
+- CLAUDE.md referenced weekly review, removed cycles, wrong timeline
+- weekly_review_protocol.md existed for a feature that was never built
+- Strategy printout was wrong; architecture model was wrong
+- Required a full manual audit to repair
+
+### checkpoint.md format
+- OVERWRITE (not append) at session start and ~70% context
+- Contents: what is running (PIDs, schema version), what changed this session, build status, exact next step, open items
+- At 95% token exhaustion: APPEND with `---` separator to preserve last-known-good state
+
+### history.md format
+- APPEND only — one new row per session
+- Compress "User Prompt" to ≤15 words
+- "Claude Achieved" factual, ≤20 words

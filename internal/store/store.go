@@ -553,10 +553,11 @@ ORDER BY opened_at DESC`)
 // added by migration 000007. Used by RunMechanicalRiskCheckActivity.
 type RiskablePosition struct {
 	ReviewablePosition
-	PeakOptionPrice       float64
-	TrailingActive        bool
-	LastOptionPrice       float64
-	HoldOvernightApproved bool
+	PeakOptionPrice           float64
+	TrailingActive            bool
+	LastOptionPrice           float64
+	HoldOvernightApproved     bool
+	StructureInvalidationLevel float64 // migration 000010; 0 = not set
 }
 
 // GetOpenPositionsForRiskCheck returns open positions with all columns needed
@@ -571,7 +572,8 @@ SELECT id, ticker, status,
        COALESCE(option_type,'call'), COALESCE(setup_family,''),
        COALESCE(option_symbol,''), COALESCE(option_premium,0),
        COALESCE(peak_option_price,0), COALESCE(trailing_active,false),
-       COALESCE(last_option_price,0), COALESCE(hold_overnight_approved,false)
+       COALESCE(last_option_price,0), COALESCE(hold_overnight_approved,false),
+       COALESCE(structure_invalidation_level,0)
 FROM paper_positions WHERE status='open'
 ORDER BY opened_at DESC`)
 	if err != nil {
@@ -592,6 +594,7 @@ ORDER BY opened_at DESC`)
 			&p.OptionSymbol, &p.OptionPremium,
 			&p.PeakOptionPrice, &p.TrailingActive,
 			&p.LastOptionPrice, &p.HoldOvernightApproved,
+			&p.StructureInvalidationLevel,
 		); err != nil {
 			return nil, err
 		}
@@ -633,16 +636,17 @@ func SetHoldOvernightApproved(ctx context.Context, pool *pgxpool.Pool, positionI
 
 // PaperPositionInput holds the values needed to open a new paper position.
 type PaperPositionInput struct {
-	CandidateID string
-	Ticker      string
-	EntryPrice  float64
-	EntryDate   time.Time
-	Shares      float64
-	StopLoss    float64
-	Target1     float64
-	Target2     float64
-	OptionType  string // "call" | "put"
-	SetupFamily string
+	CandidateID                string
+	Ticker                     string
+	EntryPrice                 float64
+	EntryDate                  time.Time
+	Shares                     float64
+	StopLoss                   float64
+	Target1                    float64
+	Target2                    float64
+	OptionType                 string // "call" | "put"
+	SetupFamily                string
+	StructureInvalidationLevel float64 // pattern-derived; 0 = not set
 }
 
 // CreatePaperPosition inserts a new open paper position and returns its ID.
@@ -656,14 +660,16 @@ INSERT INTO paper_positions (
     entry_price, entry_date, shares,
     stop_loss, target1, target2,
     option_type, setup_family,
+    structure_invalidation_level,
     status
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open')
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'open')
 ON CONFLICT (candidate_id) DO UPDATE SET ticker=EXCLUDED.ticker
 RETURNING id`,
 		in.CandidateID, in.Ticker,
 		in.EntryPrice, in.EntryDate, in.Shares,
 		in.StopLoss, in.Target1, in.Target2,
 		in.OptionType, in.SetupFamily,
+		in.StructureInvalidationLevel,
 	).Scan(&id)
 	return id, err
 }
@@ -948,4 +954,51 @@ func GetActiveStrategyPrompt(ctx context.Context, pool *pgxpool.Pool) (string, e
 		`SELECT prompt_text FROM strategy_versions WHERE is_active=TRUE LIMIT 1`,
 	).Scan(&prompt)
 	return prompt, err
+}
+
+// ─── Rejection analytics ─────────────────────────────────────────────────────
+
+// RejectionRow is one row in the rejection analytics aggregation.
+type RejectionRow struct {
+	Gate       string  `json:"gate"`
+	Direction  string  `json:"direction"`
+	VIXBucket  string  `json:"vix_bucket"`
+	Count      int     `json:"count"`
+	AvgVIX     float64 `json:"avg_vix"`
+}
+
+// GetRejectionAnalytics returns rejection counts grouped by gate, direction, and VIX bucket
+// for candidates in the last limitDays trading days.
+func GetRejectionAnalytics(ctx context.Context, pool *pgxpool.Pool, limitDays int) ([]RejectionRow, error) {
+	rows, err := pool.Query(ctx, `
+SELECT
+    COALESCE(reject_reason, 'unknown')                                       AS gate,
+    COALESCE(direction, 'unknown')                                           AS direction,
+    CASE
+        WHEN vix_level < 15 THEN 'low(<15)'
+        WHEN vix_level < 20 THEN 'normal(15-20)'
+        WHEN vix_level < 25 THEN 'elevated(20-25)'
+        ELSE 'high(25+)'
+    END                                                                      AS vix_bucket,
+    COUNT(*)::int                                                            AS count,
+    ROUND(AVG(vix_level)::numeric, 2)::float8                               AS avg_vix
+FROM trade_candidates
+WHERE trade_date >= CURRENT_DATE - ($1 || ' days')::interval
+  AND candidate_status = 'rejected'
+GROUP BY gate, direction, vix_bucket
+ORDER BY count DESC, gate, direction
+`, limitDays)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RejectionRow
+	for rows.Next() {
+		var r RejectionRow
+		if err := rows.Scan(&r.Gate, &r.Direction, &r.VIXBucket, &r.Count, &r.AvgVIX); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
